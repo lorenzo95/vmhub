@@ -691,3 +691,20 @@ rebuild it the disk and `vm.toml` are untouched.
 
 **Nothing is visible in the web console** — the guest must be booted; the
 console renders the guest's framebuffer, it is not a management view.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+vmhub is an independent project. It does not include or modify code from the
+projects it runs; it drives their container images, and credit for those belongs
+to them:
+
+| Project | Role | License |
+|---|---|---|
+| [qemus/qemu](https://github.com/qemus/qemu) | the container every VM runs in | MIT |
+| [dockur/windows](https://github.com/dockur/windows) | same lineage, referenced for Windows behaviour | MIT |
+
+QEMU itself is GPL-2.0, and it is run as a separate process inside the container
+image rather than linked into vmhub. Windows images are not distributed here;
+you supply your own media and are responsible for its licensing.
