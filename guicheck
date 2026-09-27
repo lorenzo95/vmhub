@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""GUI smoke test: exercises every handler, action and widget helper headlessly.
+
+Run with a display available, e.g. under Xvfb:
+    xvfb-run -a ./guicheck
+"""
+
+from __future__ import annotations
+
+import inspect
+import os
+import time
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
+# Never spawn a real client or browser from the handler sweep.
+os.environ["VMHUB_NO_LAUNCH"] = "1"
+
+# Use a distinct bus name. The bus name is per D-Bus session, not per display,
+# so sharing the GUI's id would make this run silently remote and exit at once
+# whenever vmhub is already open.
+os.environ["VMHUB_APP_ID"] = "dev.vmhub.GUI.Check"
+
+if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+    print("guicheck: no DISPLAY or WAYLAND_DISPLAY set; skipping.")
+    print("          run it under Xvfb, e.g.  xvfb-run -a ./guicheck")
+    sys.exit(0)
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk  # noqa: E402
+
+from vmhub import iso as isomod, lifecycle, paths, registry  # noqa: E402
+from vmhub.ui import newvm, widgets  # noqa: E402
+from vmhub.ui.app import VmhubApp  # noqa: E402
+
+VM = "vmhub-guicheck"
+failures: list[tuple[str, str]] = []
+exercised: list[str] = []
+
+
+# Handlers that act on EVERY VM, not just the one under test. Exercising them
+# here would start and stop the user's real machines, which is how this sweep
+# was silently mutating state it had no business touching. Their logic is
+# covered by the backend selftest against throwaway VMs.
+DESTRUCTIVE = {"_on_start_all", "_on_stop_all", "_on_restore", "_on_prune"}
+
+
+def sweep(obj, label: str) -> None:
+    for name in sorted(dir(type(obj))):
+        if not name.startswith("_on") or name in DESTRUCTIVE:
+            continue
+        fn = getattr(obj, name, None)
+        if not callable(fn):
+            continue
+        required = [
+            p
+            for p in inspect.signature(fn).parameters.values()
+            if p.default is inspect.Parameter.empty
+            and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+        args = [
+            (isomod.INSTALL_SLOT if p.name == "slot" else "guicheck-name")
+            if p.name in ("slot", "name")
+            else None
+            for p in required
+        ]
+        signature = f"{label}.{name}({', '.join(p.name for p in required)})"
+        try:
+            fn(*args)
+            exercised.append(signature)
+        except Exception as exc:  # noqa: BLE001
+            failures.append((signature, f"{type(exc).__name__}: {exc}"))
+            print(f"  \033[31mFAIL\033[0m  {signature}\n        {type(exc).__name__}: {exc}")
+
+
+def check(label: str, fn) -> None:
+    try:
+        fn()
+        exercised.append(label)
+    except Exception as exc:  # noqa: BLE001
+        failures.append((label, f"{type(exc).__name__}: {exc}"))
+        print(f"  \033[31mFAIL\033[0m  {label}: {type(exc).__name__}: {exc}")
+
+
+def probe(app) -> bool:
+    try:
+        _probe(app)
+    except Exception as exc:  # noqa: BLE001
+        failures.append(("probe", f"{type(exc).__name__}: {exc}"))
+        print(f"  \033[31mFAIL\033[0m  probe aborted: {type(exc).__name__}: {exc}")
+    finally:
+        try:
+            _cleanup()
+        except Exception as exc:  # noqa: BLE001
+            print(f"  cleanup: {type(exc).__name__}: {exc}")
+        app.quit()
+    return False
+
+
+def pump_until(condition, timeout: float = 8.0) -> bool:
+    """Run the main loop until condition() holds.
+
+    iteration(False) does not reliably dispatch an idle source queued by another
+    thread, which made an earlier version of this check report a false failure.
+    A 25 ms one-shot source bounds each blocking iteration.
+    """
+    main = GLib.MainContext.default()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if condition():
+            return True
+        GLib.timeout_add(25, lambda: False)
+        main.iteration(True)
+    return condition()
+
+
+def _cleanup() -> None:
+    import shutil
+
+    for meta in list(registry.iter_metas()):
+        if not meta.name.startswith("vmhub-guicheck"):
+            continue
+        try:
+            lifecycle.stop(meta.name, force=True)
+        except Exception:
+            pass
+        shutil.rmtree(paths.vm_dir(meta.name), ignore_errors=True)
+    for bundle in paths.backup_dir().glob("*.vmhub.tar.gz"):
+        if bundle.name.startswith("vmhub-guicheck") or bundle.name.startswith("sweepvm"):
+            bundle.unlink(missing_ok=True)
+
+
+def _probe(app) -> None:
+    _cleanup()
+    window = app.window
+
+    def settle() -> None:
+        """Render a snapshot synchronously; the real refresh() is async."""
+        window._apply_statuses(lifecycle.list_vms())
+
+    lifecycle.create(VM, blueprint="alpine")
+    settle()
+    if VM not in window.order:
+        print("  \033[31mFAIL\033[0m  could not create the test VM")
+        app.quit()
+        return False
+    window.select_vm(VM)
+    pane = window.panes[VM]
+
+    sweep(window, "window")
+    sweep(pane, "pane")
+    sweep(newvm.NewVmDialog(window), "newvm")
+
+    for name in ("refresh", "doctor", "restore"):
+        action = window.lookup_action(name)
+        if action is None:
+            failures.append((f"action:{name}", "not registered"))
+            print(f"  \033[31mFAIL\033[0m  action:{name} is not registered")
+            continue
+        check(f"action:{name}", lambda a=action: a.activate(None))
+
+    status = window.statuses[VM]
+    check("filter_store", lambda: widgets.filter_store("x", ["*.iso"]))
+    check("key_value_grid", lambda: widgets.key_value_grid([("a", "b")]))
+    check("section", lambda: widgets.section("h"))
+    check("copy_row", lambda: widgets.copy_row("text"))
+    check("StateDot", lambda: widgets.StateDot("running"))
+    check("VmRow", lambda: widgets.VmRow(status))
+    check("scroll", lambda: widgets.scroll(Gtk.Label(label="x")))
+
+    broken = "vmhub-guicheck-broken"
+    lifecycle.create(broken, blueprint="alpine")
+    paths.spec_path(broken).unlink()
+    settle()
+    if broken in window.order:
+        window.select_vm(broken)
+        for _ in range(3):
+            settle()
+        exercised.append("missing vm.toml does not break the UI")
+        pane = window.panes.get(broken)
+        if pane and not (pane.error_label.get_text() or "").strip():
+            failures.append(("missing vm.toml error is shown", "error label was empty"))
+            print("  \033[31mFAIL\033[0m  missing vm.toml: error label was empty")
+    else:
+        failures.append(("missing vm.toml", "VM vanished from the list"))
+        print("  \033[31mFAIL\033[0m  missing vm.toml: VM vanished from the list")
+    import shutil
+
+    shutil.rmtree(paths.vm_dir(broken), ignore_errors=True)
+    settle()
+    if broken in window.panes:
+        failures.append(("pane not pruned", broken))
+        print(f"  \033[31mFAIL\033[0m  pane for the removed VM {broken!r} was not pruned")
+    else:
+        exercised.append("panes are pruned when a VM disappears")
+        print("  \033[32mPASS\033[0m  pane pruned when the VM disappeared")
+
+    # ---- sidebar context menu and accelerators ----
+    missing_actions = [
+        name for name in ("console", "start", "stop", "clone", "export", "delete")
+        if window.lookup_action(name) is None
+    ]
+    if missing_actions:
+        failures.append(("row actions missing", str(missing_actions)))
+        print(f"  \033[31mFAIL\033[0m  sidebar actions not registered: {missing_actions}")
+    else:
+        exercised.append("sidebar context-menu actions are registered")
+        print("  \033[32mPASS\033[0m  sidebar context-menu actions registered")
+
+    accels = set(window.get_application().get_accels_for_action("app.new-vm"))
+    # GTK reports <primary> back as <Control> on Linux.
+    bound = {"<primary>n", "<Control>n"} & accels
+    if not bound:
+        failures.append(("Ctrl+N not bound", str(accels)))
+        print(f"  \033[31mFAIL\033[0m  Ctrl+N is not bound for app.new-vm ({accels})")
+    else:
+        exercised.append("Ctrl+N is bound")
+        print("  \033[32mPASS\033[0m  Ctrl+N is bound to New VM")
+
+    # ---- progress messages must actually be shown ----
+    strip = window.status_strip
+    seen: list[str] = []
+    original_push = strip.push
+
+    def recording_push(message: str, **kwargs) -> None:
+        seen.append(message)
+        original_push(message, **kwargs)
+
+    strip.push = recording_push  # type: ignore[method-assign]
+    try:
+        widgets.run_task(
+            window,
+            lambda progress: (progress("halfway through"), True)[1],
+            label="test task",
+        )
+        pump_until(lambda: "halfway through" in seen)
+    finally:
+        strip.push = original_push  # type: ignore[method-assign]
+
+    if "halfway through" not in seen:
+        failures.append(("progress not displayed", str(seen)))
+        print(f"  \033[31mFAIL\033[0m  run_task progress never reached the strip: {seen}")
+    else:
+        exercised.append("run_task progress reaches the status strip")
+        print("  \033[32mPASS\033[0m  run_task progress reaches the status strip")
+
+    # ---- refresh must not block the main loop ----
+    started = time.time()
+    window.refresh()
+    blocked = (time.time() - started) * 1000
+    if blocked > 250:
+        failures.append(("refresh blocks", f"{blocked:.0f} ms"))
+        print(f"  \033[31mFAIL\033[0m  refresh() blocked for {blocked:.0f} ms")
+    else:
+        exercised.append("refresh is non-blocking")
+        print(f"  \033[32mPASS\033[0m  refresh() returned in {blocked:.0f} ms")
+
+    window.refresh()
+    window.refresh()
+    if window._refreshing and not window._refresh_pending:
+        failures.append(("refresh stacking", "overlap not coalesced"))
+        print("  \033[31mFAIL\033[0m  overlapping refresh was not coalesced")
+    else:
+        exercised.append("refresh coalesces overlap")
+        print("  \033[32mPASS\033[0m  overlapping refresh is coalesced")
+
+    # Pump the main loop so the worker's idle callback actually runs.
+    pump_until(lambda: bool(getattr(window, "statuses", {})))
+    if not getattr(window, "statuses", {}):
+        failures.append(("async refresh", "statuses never populated"))
+        print("  \033[31mFAIL\033[0m  async refresh never populated statuses")
+    else:
+        exercised.append("async refresh populates statuses")
+        print(
+            f"  \033[32mPASS\033[0m  async refresh populated {len(window.statuses)} VMs"
+        )
+
+    typed: list[str] = []
+    prompt = widgets.TextPrompt(window, "H", "B", default="d", on_accept=typed.append)
+    prompt.entry.set_text("guicheck")
+    prompt.accept_button.emit("clicked")
+    check("TextPrompt returns the typed text", lambda: _assert(typed == ["guicheck"], typed))
+
+    lifecycle.stop(VM, force=True)
+    lifecycle.remove(VM)
+
+    print()
+    if failures:
+        print(f"\033[31m{len(failures)} check(s) failed:\033[0m")
+        for label, err in failures:
+            print(f"    - {label}: {err}")
+    else:
+        print(f"\033[32mall {len(exercised)} GUI checks passed\033[0m")
+
+
+def _assert(condition: bool, value: object) -> None:
+    if not condition:
+        raise AssertionError(f"got {value!r}")
+
+
+if __name__ == "__main__":
+    app = VmhubApp()
+    ran = []
+
+    def guarded_probe() -> bool:
+        ran.append(True)
+        if app.window is None:
+            print("  \033[31mFAIL\033[0m  the application never created a window")
+            failures.append(("no window", "run() returned before activation"))
+            app.quit()
+            return False
+        probe(app)
+        return False
+
+    GLib.timeout_add(1200, guarded_probe)
+    app.run([])
+    if not ran:
+        print("  \033[31mFAIL\033[0m  the probe never ran — the main loop exited first")
+        failures.append(("probe", "main loop ended before the probe fired"))
+    sys.exit(1 if failures else 0)

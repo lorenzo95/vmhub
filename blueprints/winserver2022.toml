@@ -1,0 +1,30 @@
+title = "Windows Server 2022"
+description = "Server 2022, more stable under virtualization than desktop Windows."
+icon = "computer-symbolic"
+os = "windows"
+notes = """
+Same manual-install flow as win11: supply your own ISO, install with IDE,
+then install virtio drivers from storage/drivers.iso and switch to scsi.
+
+Sysprep before marking as a template, same as win11.
+
+Useful for server workloads: it is far happier with virtio-scsi and
+headless operation than desktop Windows.
+"""
+rdp_user = "Administrator"
+
+[spec.resources]
+cpus = 4
+ram = "8G"
+disk = "128G"
+disk_type = "ide"
+
+[spec.network]
+mode = "user"
+guest_ports = [3389]
+
+[spec.boot]
+mode = "windows"
+
+[spec.features]
+hv = true

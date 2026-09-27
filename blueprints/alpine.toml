@@ -1,0 +1,31 @@
+title = "Alpine Linux"
+description = "Tiny 60 MB image. The fastest way to smoke-test vmhub end to end."
+icon = "linux"
+os = "linux"
+notes = """
+Alpine boots to a login prompt on tty1. Log in as root (no password),
+then bring up networking and SSH:
+
+    ip link set eth0 up
+    udhcpc -i eth0
+    apk add openssh
+    rc-service sshd start
+    rc-update add sshd default
+
+Then connect from the host with the ssh command shown in the Hardware tab.
+"""
+ssh_user = "root"
+
+[spec.resources]
+cpus = 1
+ram = "1G"
+disk = "8G"
+disk_type = "scsi"
+
+[spec.network]
+mode = "user"
+guest_ports = [22]
+
+[spec.boot]
+mode = "uefi"
+iso = "alpine"

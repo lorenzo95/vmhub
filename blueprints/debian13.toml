@@ -1,0 +1,35 @@
+title = "Debian 13"
+description = "General-purpose Debian install. Good candidate for a clonable template."
+icon = "linux"
+os = "linux"
+notes = """
+Install Debian 13 in the browser console. A reasonable partitioning for a
+template:
+
+    /       32G   ext4
+    /home   rest   ext4
+
+Leave the ISO in place while installing, then run:
+
+    vmctl finish-install <vm>
+
+which clears the boot ISO so the VM boots from disk on subsequent starts.
+
+Before marking a VM as a template, clean it up: remove build caches, clear
+bash history, and delete any machine-specific keys under /etc/ssh/.
+"""
+ssh_user = "debian"
+
+[spec.resources]
+cpus = 4
+ram = "8G"
+disk = "64G"
+disk_type = "scsi"
+
+[spec.network]
+mode = "user"
+guest_ports = [22]
+
+[spec.boot]
+mode = "uefi"
+iso = "debian"

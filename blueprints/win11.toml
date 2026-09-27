@@ -1,0 +1,61 @@
+title = "Windows 11"
+description = "Windows 11 on IDE during install, then switched to virtio-scsi once drivers are in."
+icon = "computer-symbolic"
+os = "windows"
+notes = """
+This blueprint does NOT auto-install Windows: qemus/qemu has no unattended
+install mechanism. You supply an ISO and click through setup.
+
+Step 1 - put the ISO in the VM's storage directory:
+
+    ~/vms/<vm>/storage/boot.iso
+
+and point the spec at it:
+
+    [boot]
+    iso = "https://example.com/your-windows11.iso"
+
+or use a local file by leaving iso empty and setting BOOT via vm.toml.
+
+Step 2 - install with IDE so no drivers are needed. This blueprint already
+uses disk_type = "ide". Windows Setup sees the disk immediately.
+
+Step 3 - install virtio drivers. Drop virtio-win.iso into:
+
+    ~/vms/<vm>/storage/drivers.iso
+
+The container auto-attaches it as a second CD-ROM. In Windows, run
+virtio-win-guest-tools\\virtio-win-guest-install.bat and reboot.
+
+Step 4 - switch the finished template to virtio-scsi for performance:
+
+    vmctl set-disk-type <vm> scsi
+
+Step 5 - before marking as a template, run sysprep with the generalize
+option so clones get a fresh SID and MachineGuid. Without this every clone
+shares the same Windows identity, which breaks domain joins and can
+collide on activation.
+
+RDP: connect with the host port shown in the Hardware tab. The web console
+is for installation only; it has no clipboard or drag-and-drop.
+"""
+
+# No unattended install, so there is no known account name. vmhub asks for it
+# before launching a client, and you can set it with:
+#   vmctl set <vm> media.rdp_user=YourName
+
+[spec.resources]
+cpus = 6
+ram = "8G"
+disk = "128G"
+disk_type = "ide"
+
+[spec.network]
+mode = "user"
+guest_ports = [3389]
+
+[spec.boot]
+mode = "windows"
+
+[spec.features]
+hv = true

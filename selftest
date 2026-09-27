@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+"""End-to-end self test. Creates a throwaway VM and exercises the full lifecycle."""
+
+from __future__ import annotations
+
+import sys
+import time
+import configparser
+import json
+import os
+import shutil
+import tarfile
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
+from vmhub import disk, export, iso as isomod, libvirt, lifecycle, paths, podman, ports, qga, rdp, registry, spec  # noqa: E402
+from vmhub.errors import VmhubError  # noqa: E402
+
+VM = "vmhub-selftest"
+BLUEPRINT = "alpine"
+
+passed = 0
+failed: list[str] = []
+
+
+def check(label: str, condition: bool, detail: str = "") -> None:
+    global passed
+    if condition:
+        passed += 1
+        print(f"  \033[32mPASS\033[0m  {label}")
+    else:
+        failed.append(label)
+        print(f"  \033[31mFAIL\033[0m  {label}" + (f"  — {detail}" if detail else ""))
+
+
+def section(title: str) -> None:
+    print(f"\n\033[1m{title}\033[0m")
+
+
+def _fake_guest_agent(path: str, *, fail: str | None = None) -> None:
+    """A minimal QGA server, so the client protocol can be tested without a guest."""
+    import socket as _socket
+    import threading
+
+    def serve() -> None:
+        srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen(1)
+        conn, _ = srv.accept()
+        buf = b""
+        conn.sendall(b'{"event":"GUEST_EXEC_STATUS","data":1}\n')  # stale buffered data
+        while True:
+            while b"\n" not in buf:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    conn.close()
+                    srv.close()
+                    return
+                buf += chunk
+            line, _, buf = buf.partition(b"\n")
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            command = request.get("execute")
+            if fail and command == fail:
+                conn.sendall(b'{"error":{"class":"GenericError","desc":"nope"}}\n')
+            elif command == "guest-sync-delimited":
+                ident = request["arguments"]["id"]
+                conn.sendall(b"\xff" + json.dumps({"return": ident}).encode() + b"\n")
+            elif command == "guest-ping":
+                conn.sendall(b'{"return":{}}\n')
+            elif command == "guest-get-osinfo":
+                conn.sendall(b'{"return":{"hostname":"testhost","pretty-name":"TestOS"}}\n')
+            elif command == "guest-network-get-interfaces":
+                conn.sendall(json.dumps({"return": [
+                    {"name": "lo", "ip-addresses": [
+                        {"ip-address": "127.0.0.1", "ip-address-type": "ipv4"}]},
+                    {"name": "eth0", "ip-addresses": [
+                        {"ip-address": "fe80::1", "ip-address-type": "ipv6"},
+                        {"ip-address": "10.0.0.5", "ip-address-type": "ipv4"}]},
+                ]}).encode() + b"\n")
+
+    threading.Thread(target=serve, daemon=True).start()
+
+
+def _wait_for_socket(path: str, timeout: float = 3.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _profile_roundtrip(vm: str) -> bool:
+    """Write a Remmina profile for a VM, then confirm removal clears it."""
+    from vmhub import rdp
+
+    profile = rdp.profile_path(vm)
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    profile.write_text("[remmina]\nname=x\n")
+    temp = f"{vm}-profilecheck"
+    lifecycle.create(temp, blueprint="alpine")
+    rdp.write_profile(temp) if rdp.target(temp).available else None
+    lifecycle.remove(temp)
+    removed = not rdp.profile_path(temp).is_file()
+    profile.unlink(missing_ok=True)
+    return removed
+
+
+def _write_test_data(disk_file: Path) -> None:
+    """Write 512 bytes of guest data into a throwaway disk.
+
+    Lets the install-state check run against a disk that looks installed,
+    without needing a real guest to be installed into it.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        raw = Path(tmp) / "raw"
+        raw.write_bytes(os.urandom(4096))
+        source = Path(tmp) / "source.qcow2"
+        disk.run(["convert", "-f", "raw", "-O", "qcow2", str(raw), str(source)])
+        disk.run(
+            ["dd", "-f", "qcow2", "-O", "qcow2", "bs=512", "count=1",
+             f"if={source}", f"of={disk_file}"]
+        )
+
+
+def _make_fixture_iso(path: Path) -> Path:
+    with open(path, "wb") as handle:
+        handle.truncate(20 * 1024 * 1024)
+        handle.seek(0x8000)
+        handle.write(b"\x01CD001\x01" + b"\x00" * 0x26)
+        handle.seek(0x8027)
+        handle.write(b"VMHUBTST".ljust(32))
+        handle.seek(0x8800)
+        handle.write(b"\x00CD001\x01" + b"\x00" * 0x1E)
+        handle.seek(0x8827)
+        handle.write((0).to_bytes(4, "little"))
+    return path
+
+
+def main() -> int:
+    leftovers = [m for m in registry.iter_metas() if m.name.startswith(VM)]
+    leftovers.sort(key=lambda m: (m.is_template, m.template_source is not None, m.name))
+    for meta in leftovers:
+        try:
+            lifecycle.stop(meta.name, force=True)
+        except VmhubError:
+            pass
+        try:
+            lifecycle.remove(meta.name)
+        except VmhubError as exc:
+            print(f"  (could not remove leftover {meta.name}: {exc})")
+
+    section("environment")
+    check("podman is rootless", podman.is_rootless())
+    check("oci runtime is crun", podman.oci_runtime() == "crun", podman.oci_runtime())
+    check("host /dev/kvm is accessible", podman.host_has_kvm())
+
+    section("create")
+    lifecycle.create(VM, blueprint=BLUEPRINT)
+    disk_file = paths.disk_path(VM)
+    check("disk created outside the container's storage", disk_file.is_file())
+    check("disk is qcow2", disk_file.is_file() and disk.format_of(disk_file) == "qcow2")
+    check("disk is sparse", disk_file.is_file() and disk.actual_size(disk_file) < 1 << 30)
+    check("spec round-trips", registry.load_spec(VM).name == VM)
+    status = lifecycle.status(VM)
+    check("viewer port assigned", status.viewer_port > 0, str(status.viewer_port))
+    check(
+        "ssh port assigned",
+        any(guest == 22 for guest in status.ports.values()),
+        str(status.ports),
+    )
+
+    section("start")
+    lifecycle.start(VM)
+    state = podman.state(VM)
+    check("container is running", state == "running", state)
+    for _ in range(60):
+        if paths.qmp_path(VM).exists():
+            break
+        time.sleep(1)
+    check("qmp socket present in host storage", paths.qmp_path(VM).exists())
+    check(
+        "no stray container-created disk",
+        not list(paths.storage_dir(VM).glob(f"*/{paths.DISK_NAME}")),
+    )
+
+    section("snapshots")
+    lifecycle.take_snapshot(VM, "clean")
+    names = disk.snapshot_names(disk_file)
+    check("snapshot recorded in the qcow2", "clean" in names, str(names))
+    lifecycle.take_snapshot(VM, "later")
+    lifecycle.revert(VM, "clean", restart=True)
+    names = disk.snapshot_names(disk_file)
+    check("revert discarded newer snapshots", names == ["clean"], str(names))
+    lifecycle.take_snapshot(VM, "clean2")
+    lifecycle.delete_snapshot(VM, "clean2")
+    check("live snapshot delete works", "clean2" not in disk.snapshot_names(disk_file))
+
+    section("template and clone")
+    lifecycle.stop(VM)
+    lifecycle.mark_template(VM)
+    check("marked as template", registry.load_meta(VM).is_template)
+    lifecycle.clone(f"{VM}-clone", VM)
+    clone_disk = paths.disk_path(f"{VM}-clone")
+    check("clone disk exists", clone_disk.is_file())
+    backing = disk.backing_file(clone_disk)
+    check("clone is a backing-file overlay", bool(backing), str(backing))
+    check(
+        "clone is far smaller than the template",
+        disk.actual_size(clone_disk) < 1 << 22,
+        spec.format_size(disk.actual_size(clone_disk)),
+    )
+    check("ports are distinct between template and clone",
+          lifecycle.status(VM).viewer_port != lifecycle.status(f"{VM}-clone").viewer_port)
+
+    section("template guard")
+    lifecycle.start(f"{VM}-clone")
+    try:
+        lifecycle.start(VM)
+        check("template cannot run while a clone is running", False, "start was allowed")
+    except VmhubError:
+        check("template cannot run while a clone is running", True)
+
+    section("concurrency")
+    lifecycle.clone(f"{VM}-clone2", VM)
+    lifecycle.start(f"{VM}-clone2")
+    running = [s.name for s in lifecycle.list_vms() if s.powered]
+    check("two clones run at once", len(running) >= 2, str(running))
+
+    section("flatten")
+    lifecycle.stop(f"{VM}-clone")
+    lifecycle.flatten(f"{VM}-clone")
+    check("backing chain resolved", disk.backing_file(paths.disk_path(f"{VM}-clone")) is None)
+    check("no longer marked as a clone", registry.load_meta(f"{VM}-clone").template_source is None)
+
+    section("export and import")
+    archive = export.export_vm(f"{VM}-clone")
+    check("bundle written", archive.is_file(), str(archive))
+    manifest = export.read_manifest(archive)
+    check("manifest has a checksum", bool(manifest.get("disk", {}).get("sha256")))
+    check("manifest pins the image", manifest.get("image", "").startswith("docker.io/qemux/qemu"))
+    imported = export.import_bundle(archive, name=f"{VM}-imported")
+    check("bundle imported", registry.exists(imported))
+    original = registry.load_meta(f"{VM}-clone")
+    copy = registry.load_meta(imported)
+    check("imported VM got a fresh identity", original.uuid != copy.uuid)
+    check("imported disk is standalone", disk.backing_file(paths.disk_path(imported)) is None)
+    lifecycle.start(imported)
+    check("imported VM boots", podman.state(imported) == "running")
+    lifecycle.stop(imported)
+
+    section("install media")
+    fixture = Path(__file__).resolve().parent / "selftest.iso"
+    _make_fixture_iso(fixture)
+    info = isomod.probe(fixture)
+    check("synthetic ISO recognised", info.is_iso, info.reason)
+    check("ISO label read", info.label == "VMHUBTST", repr(info.label))
+    junk = fixture.with_suffix(".bin")
+    junk.write_bytes(b"\x00" * 2_000_000)
+    check("non-ISO rejected", not isomod.probe(junk).is_iso)
+    try:
+        isomod.validate(junk)
+        check("validate() raises on non-ISO", False)
+    except Exception:
+        check("validate() raises on non-ISO", True)
+
+    vm_spec_boot = registry.load_spec(VM)
+    vm_spec_boot.boot.iso = "debian"
+    registry.save_spec(vm_spec_boot)
+    lifecycle.attach_iso(VM, isomod.INSTALL_SLOT, fixture)
+    check("install ISO recorded in the spec",
+          registry.load_spec(VM).media.install == str(fixture.resolve()))
+    check("attaching an ISO clears the blueprint boot.iso",
+          registry.load_spec(VM).boot.iso == "",
+          repr(registry.load_spec(VM).boot.iso))
+    env = registry.load_spec(VM).env(
+        uuid=registry.load_meta(VM).uuid, mac=registry.load_meta(VM).mac
+    )
+    check("BOOT is not an auto-download keyword", env.get("BOOT", "") != "debian")
+    entries = {e["slot"]: e for e in lifecycle.iso_status(VM)}
+    check("install slot reports attached", entries[isomod.INSTALL_SLOT]["attached"])
+    check("drivers slot reports empty", not entries[isomod.DRIVERS_SLOT]["attached"])
+    argv = podman.run_argv(
+        registry.load_spec(VM), registry.load_meta(VM).uuid,
+        registry.load_meta(VM).mac, None,
+    )
+    check("install ISO bind-mounted read-only",
+          any(a.endswith(":/start.iso:ro") for a in argv), "no /start.iso:ro mount")
+    check("disk shadow-mounted so the container sees it",
+          any(a.endswith(":/storage/data.qcow2") for a in argv), "no disk shadow mount")
+
+    lifecycle.attach_iso(VM, isomod.DRIVERS_SLOT, fixture)
+    argv = podman.run_argv(
+        registry.load_spec(VM), registry.load_meta(VM).uuid,
+        registry.load_meta(VM).mac, None,
+    )
+    check("drivers ISO bind-mounted read-only",
+          any(a.endswith(":/drivers.iso:ro") for a in argv), "no /drivers.iso:ro mount")
+
+    fixture.unlink()
+    try:
+        podman.run_argv(
+            registry.load_spec(VM), registry.load_meta(VM).uuid,
+            registry.load_meta(VM).mac, None,
+        )
+        check("missing ISO is a hard error", False, "startup would fail obscurely")
+    except VmhubError as exc:
+        check("missing ISO is a hard error", "missing" in str(exc), str(exc)[:60])
+
+    lifecycle.detach_iso(VM, isomod.INSTALL_SLOT)
+    lifecycle.detach_iso(VM, isomod.DRIVERS_SLOT)
+    check("ISOs detached", registry.load_spec(VM).media.install == "")
+
+    conflicting = registry.load_spec(VM)
+    conflicting.boot.iso = "debian"
+    registry.save_spec(conflicting)
+    lifecycle.attach_iso(VM, isomod.INSTALL_SLOT, _make_fixture_iso(fixture))
+    conflicting = registry.load_spec(VM)
+    conflicting.boot.iso = "debian"
+    registry.save_spec(conflicting)
+    notices = lifecycle.status(VM).notices
+    check("conflict between ISO and boot.iso is reported",
+          any("boot.iso" in n for n in notices), str(notices))
+    check("empty-disk fallback is reported",
+          any("60 MB" in n for n in notices), str(notices))
+    lifecycle.detach_iso(VM, isomod.INSTALL_SLOT)
+    fixture.unlink(missing_ok=True)
+    junk.unlink(missing_ok=True)
+
+    section("rdp")
+    spec_rdp = registry.load_spec(VM)
+    spec_rdp.network.guest_ports = [3389]
+    spec_rdp.network.host_rdp = 13389
+    registry.save_spec(spec_rdp)
+    tgt = rdp.target(VM)
+    check("rdp target resolved", tgt.port == 13389)
+    check("rdp uri well formed", tgt.uri().startswith("rdp://"), tgt.uri())
+    check("rdp uri never embeds the password",
+          not tgt.password or tgt.password not in tgt.uri(), tgt.uri())
+    check("rdp uri with a password is opt-in",
+          "admin" in rdp.RdpTarget("h", 1, "u", "admin").uri(include_password=True))
+    check("rdp user is a placeholder, not a guessed account",
+          tgt.user in {"", "Administrator"}, repr(tgt.user))
+    check("no password without a known account", not tgt.password or bool(tgt.user))
+    check("freerdp argv has the port", "13389" in " ".join(tgt.freerdp_argv()))
+    profile = rdp.write_profile(VM)
+    parsed = configparser.ConfigParser()
+    parsed.read(profile)
+    profile_section = parsed["remmina"]
+    check("remmina profile embeds the port in server",
+          profile_section["server"].endswith(":13389"), profile_section["server"])
+    check("remmina profile also sets port",
+          profile_section["port"] == "13389", profile_section["port"])
+    check("remmina profile points at the bind address",
+          profile_section["server"] == f"{tgt.host}:13389", profile_section["server"])
+    check("remmina profile carries no password", profile_section["password"] == "")
+    rdp.remove_profile(VM)
+    no_rdp_spec = registry.load_spec(VM)
+    saved = no_rdp_spec.network.host_rdp
+    no_rdp_spec.network.host_rdp = 0
+    registry.save_spec(no_rdp_spec)
+    ok_flag, ok_msg = rdp.probe(VM)
+    check("probe refuses a VM with no rdp port", not ok_flag and "no RDP port" in ok_msg, ok_msg)
+    no_rdp_spec.network.host_rdp = saved
+    registry.save_spec(no_rdp_spec)
+    check("probe reports the negotiated protocol",
+          "RDP 5.0+" in rdp.RDP_PROTOCOLS.get(2, ""), rdp.RDP_PROTOCOLS.get(2, ""))
+    spec_rdp.network.host_rdp = 0
+    registry.save_spec(spec_rdp)
+    check("no rdp port means unavailable", not rdp.target(VM).available)
+
+    section("clone modes")
+    for name in registry.dependents_of(VM):
+        if podman.is_running(name):
+            lifecycle.stop(name, force=True)
+    full_clone = f"{VM}-full"
+    lifecycle.clone(full_clone, VM, mode="full", progress=None)
+    full_status = lifecycle.status(full_clone)
+    check("full clone is standalone", full_status.backing is None, str(full_status.backing))
+    check("full clone is not linked to the template",
+          registry.load_meta(full_clone).template_source is None)
+    check("full clone is not a dependent", full_clone not in registry.dependents_of(VM))
+    check("full clone inherits the virtual size",
+          full_status.disk_size == registry.load_spec(VM).resources.disk)
+    lifecycle.start(full_clone)
+    lifecycle.start(VM)
+    check("template runs alongside a full clone", podman.is_running(VM))
+    lifecycle.stop(VM)
+    lifecycle.stop(full_clone)
+
+    linked_clone = f"{VM}-linked"
+    lifecycle.clone(linked_clone, VM, mode="linked", progress=None)
+    check("linked clone has a backing file",
+          bool(lifecycle.status(linked_clone).backing))
+    check("linked clone is registered as a dependent",
+          linked_clone in registry.dependents_of(VM))
+    lifecycle.start(linked_clone)
+    try:
+        lifecycle.start(VM)
+        check("template is blocked while a linked clone runs", False, "start was allowed")
+    except VmhubError as exc:
+        check("template is blocked while a linked clone runs", "cannot run" in str(exc))
+    lifecycle.stop(linked_clone)
+    lifecycle.start(VM)
+    try:
+        lifecycle.start(f"{VM}-clone2")
+        check("linked clone is blocked while its template runs", False, "start was allowed")
+    except VmhubError as exc:
+        check("linked clone is blocked while its template runs", "linked clone" in str(exc))
+    lifecycle.stop(VM)
+    lifecycle.remove(full_clone)
+    lifecycle.remove(linked_clone)
+
+    section("finish install and live media")
+    lifecycle.start(VM)
+    check("running VM exposes live media", isinstance(lifecycle.live_media(VM), list))
+    check("running VM is not drifted when just started", not lifecycle.status(VM).drifted)
+    vm_spec_iso = registry.load_spec(VM)
+    vm_spec_iso.media.install = str(fixture)
+    registry.save_spec(vm_spec_iso)
+    check("editing the spec is detected as drift", lifecycle.status(VM).drifted)
+    check("drift is reported as a notice",
+          any("restart" in n for n in lifecycle.status(VM).notices),
+          str(lifecycle.status(VM).notices))
+    lifecycle.stop(VM, mode="force")
+    cached = paths.storage_dir(VM) / "boot.iso"
+    cached.write_bytes(b"\x00" * 1024)
+
+    actions = lifecycle.finish_install(VM)
+    check("finish-install detaches the install ISO",
+          registry.load_spec(VM).media.install == "", str(actions))
+    check("finish-install clears boot.iso", registry.load_spec(VM).boot.iso == "")
+    check("finish-install keeps the fallback while the disk is empty", cached.exists())
+    check("empty disk is reported as not installed", not lifecycle.disk_has_data(VM))
+
+    _write_test_data(paths.disk_path(VM))
+    check("disk reports data once written", lifecycle.disk_has_data(VM))
+    lifecycle.finish_install(VM)
+    check("finish-install removes the cached fallback once installed", not cached.exists())
+    check("finish-install is idempotent", lifecycle.finish_install(VM) == [])
+    fixture.unlink(missing_ok=True)
+    junk.unlink(missing_ok=True)
+
+    section("identity follows the directory")
+    renamed = f"{VM}-renamed"
+    target = paths.project_root() / "renamed-check"
+    if registry.exists("renamed-check"):
+        lifecycle.remove("renamed-check", progress=None)
+    lifecycle.create(renamed, blueprint="alpine")
+    paths.vm_dir(renamed).rename(target)
+    check("renamed directory is still discovered",
+          "renamed-check" in registry.all_names())
+    check("meta reports the directory name",
+          any(m.name == "renamed-check" for m in registry.iter_metas()))
+    check("spec reports the directory name",
+          registry.load_spec("renamed-check").name == "renamed-check")
+    check("no name is persisted in meta.json",
+          "name" not in json.loads(paths.meta_path("renamed-check").read_text()))
+    check("no name is persisted in vm.toml",
+          not any(line.strip().startswith("name")
+                  for line in paths.spec_path("renamed-check").read_text().splitlines()))
+    lifecycle.start("renamed-check", progress=None)
+    check("a renamed VM starts", podman.state("renamed-check") == "running")
+    lifecycle.stop("renamed-check", mode="force", progress=None)
+    lifecycle.remove("renamed-check", progress=None)
+    check("a renamed VM removes cleanly", not registry.exists("renamed-check"))
+
+    section("export of a linked clone is self-contained")
+    linked_name = f"{VM}-clone2"
+    check("clone2 is still a linked clone",
+          bool(lifecycle.status(linked_name).backing),
+          str(lifecycle.status(linked_name).backing))
+    linked_archive = export.export_vm(linked_name)
+    check("export reports it resolved a backing chain",
+          export.read_manifest(linked_archive).get("resolved_backing_chain") is True)
+    with tempfile.TemporaryDirectory() as staging:
+        with tarfile.open(linked_archive, "r:*") as tar:
+            tar.extractall(staging, filter="data")
+        root = Path(staging) / "bundle"
+        if not (root / "manifest.json").is_file():
+            root = Path(staging)
+        exported_disk = root / "disk" / paths.DISK_NAME
+        check("exported disk has no backing reference",
+              disk.backing_file(exported_disk) is None,
+              str(disk.backing_file(exported_disk)))
+        check("exported disk is qcow2", disk.format_of(exported_disk) == "qcow2")
+    linked_import = export.import_bundle(linked_archive, name=f"{VM}-linked-import")
+    check("linked-clone bundle imports",
+          disk.backing_file(paths.disk_path(linked_import)) is None)
+    lifecycle.start(linked_import)
+    check("imported linked-clone bundle boots", podman.state(linked_import) == "running")
+    lifecycle.stop(linked_import, mode="force")
+    check("removing a VM clears its remmina profile", _profile_roundtrip(VM))
+
+    section("keep-disk leaves a usable VM")
+    keeper = f"{VM}-keeper"
+    lifecycle.create(keeper, blueprint="alpine")
+    lifecycle.start(keeper)
+    lifecycle.stop(keeper, mode="force")
+    lifecycle.remove(keeper, keep_disk=True)
+    check("keep-disk leaves the VM registered", registry.exists(keeper))
+    check("keep-disk leaves the VM discoverable", keeper in registry.all_names())
+    check("keep-disk left no container", not podman.exists(keeper))
+    lifecycle.start(keeper)
+    check("keep-disk VM is still startable", podman.state(keeper) == "running")
+    lifecycle.stop(keeper, mode="force")
+    lifecycle.remove(keeper)
+
+    section("diagnostics are honest")
+    raw = paths.project_root() / "vmhub-rawcheck.img"
+    raw.write_bytes(b"\x00" * (2 << 20))
+    check("format_of detects a raw file", disk.format_of(raw) == "raw", disk.format_of(raw))
+    check("raw cannot take internal snapshots",
+          not disk.supports_internal_snapshots(raw))
+    raw.unlink()
+
+    bad = f"{VM}-badmeta"
+    bad_dir = paths.vm_dir(bad)
+    (bad_dir / "disk").mkdir(parents=True, exist_ok=True)
+    (bad_dir / "meta.json").write_text("{ this is not json")
+    found = [m for m in registry.iter_metas() if m.name == bad]
+    check("a corrupt meta.json is still discovered", len(found) == 1)
+    check("a corrupt meta.json invents no identity",
+          found and found[0].uuid == "" and found[0].mac == "",
+          found[0].uuid if found else "missing")
+    check("a corrupt meta.json is flagged", bool(found and found[0].broken))
+    check("broken_metas reports it", any(n == bad for n, _ in registry.broken_metas()))
+    check("the broken flag is never persisted",
+          found and "broken" not in json.dumps(found[0].to_dict()))
+    try:
+        lifecycle.status(bad)
+        check("loading a corrupt VM raises a VmhubError", False, "no error")
+    except VmhubError:
+        check("loading a corrupt VM raises a VmhubError", True)
+    check("a corrupt VM is reported by list_vms",
+          any(not s.exists and s.name == bad for s in lifecycle.list_vms()))
+    shutil.rmtree(bad_dir, ignore_errors=True)
+
+    section("guest agent protocol")
+    check("guest_agent reaches the container env",
+          registry.load_spec(VM).env(uuid="u", mac="m").get("QGA") == "/storage/qga.sock")
+    off = registry.load_spec(VM)
+    off.features.guest_agent = False
+    check("guest_agent can be disabled",
+          "QGA" not in off.env(uuid="u", mac="m"))
+    off.features.guest_agent = True
+    registry.save_spec(off)
+
+    with tempfile.TemporaryDirectory() as agents:
+        sock = os.path.join(agents, "qga.sock")
+        _fake_guest_agent(sock)
+        check("the agent socket appears", _wait_for_socket(sock))
+        with qga.Qga(sock) as client:
+            check("guest-ping answers", client.execute("guest-ping") == {})
+            osinfo = client.execute("guest-get-osinfo")
+            check("guest-get-osinfo is decoded",
+                  osinfo.get("hostname") == "testhost", str(osinfo))
+            interfaces = client.execute("guest-network-get-interfaces")
+        check("pick_ip skips loopback and ipv6",
+              qga.pick_ip(interfaces) == "10.0.0.5", str(qga.pick_ip(interfaces)))
+
+        sock2 = os.path.join(agents, "qga2.sock")
+        _fake_guest_agent(sock2, fail="guest-get-osinfo")
+        _wait_for_socket(sock2)
+        try:
+            with qga.Qga(sock2) as client:
+                client.execute("guest-get-osinfo")
+            check("an agent error raises QgaError", False, "no error")
+        except VmhubError:
+            check("an agent error raises QgaError", True)
+
+    check("guest mode is offered for stop", "guest" in lifecycle.STOP_MODES)
+
+    section("libvirt import")
+    sample_xml = """<domain type='kvm'>
+      <name>sample</name>
+      <memory unit='KiB'>8388608</memory>
+      <vcpu placement='static'>4</vcpu>
+      <devices>
+        <disk type='file' device='disk'>
+          <source file='/var/lib/libvirt/images/sample.qcow2'/>
+        </disk>
+        <disk type='file' device='cdrom'>
+          <source file='/iso/installer.iso'/>
+        </disk>
+      </devices>
+    </domain>"""
+    dom = libvirt.parse_domain(sample_xml, name="sample", state="shut off")
+    check("libvirt xml: name", dom.name == "sample")
+    check("libvirt xml: memory", dom.ram == "8G", dom.ram)
+    check("libvirt xml: vcpus", dom.vcpus == 4)
+    check("libvirt xml: only disk devices", dom.disks == ["/var/lib/libvirt/images/sample.qcow2"],
+          str(dom.disks))
+    try:
+        libvirt.parse_domain("<domain", name="broken")
+        check("libvirt xml: bad xml is rejected", False)
+    except VmhubError:
+        check("libvirt xml: bad xml is rejected", True)
+
+    with tempfile.TemporaryDirectory() as source_dir:
+        fake_disk = Path(source_dir) / "domain.img"
+        fake_disk.write_bytes((b"\x00" * 510) + b"\x55\xaa" + (b"\x00" * (4 << 20)))
+        libvirt_vm = libvirt.materialize(
+            libvirt.Domain(name="libvirt_vm-demo", state="shut off",
+                           memory_kib=4 * 1024 * 1024, vcpus=3, disks=[str(fake_disk)]),
+            new_name=f"{VM}-libvirt",
+        )
+        spec_libvirt_vm = registry.load_spec(libvirt_vm)
+        check("libvirt import: ram carried over", spec_libvirt_vm.resources.ram == "4G",
+              spec_libvirt_vm.resources.ram)
+        check("libvirt import: cpus carried over", spec_libvirt_vm.resources.cpus == 3)
+        check("libvirt import: disk is qcow2",
+              disk.format_of(paths.disk_path(libvirt_vm)) == "qcow2")
+        check("libvirt import: firmware left to auto-detect",
+              spec_libvirt_vm.boot.mode == "auto")
+        check("libvirt import: widest-compatible disk bus",
+              spec_libvirt_vm.resources.disk_type == "ide")
+        check("libvirt import: source left intact", fake_disk.is_file())
+        try:
+            libvirt.materialize(
+                libvirt.Domain(name="dup", state="shut off", disks=[str(fake_disk)]),
+                new_name=libvirt_vm,
+            )
+            check("libvirt import: duplicate refused", False)
+        except VmhubError:
+            check("libvirt import: duplicate refused", True)
+        try:
+            libvirt.materialize(
+                libvirt.Domain(name="busy", state="running", disks=[str(fake_disk)]),
+                new_name=f"{VM}-libvirt-busy",
+            )
+            check("libvirt import: running domain refused", False)
+        except VmhubError:
+            check("libvirt import: running domain refused", True)
+        lifecycle.remove(libvirt_vm)
+    check("libvirt import: auto boot mode omits BOOT_MODE",
+          "BOOT_MODE" not in spec.VmSpec(name="x", boot=spec.Boot(mode="auto")).env(uuid="u", mac="m"))
+
+    section("ports and orphans")
+    rival = f"{VM}-rival"
+    lifecycle.create(rival, blueprint="alpine")
+    mine = registry.load_spec(VM)
+    theirs = registry.load_spec(rival)
+    theirs.network.host_web = mine.network.host_web
+    theirs.network.host_ssh = mine.network.host_ssh
+    registry.save_spec(theirs)
+    check("a forced clash is detected", bool(ports.collisions()))
+    lifecycle.start(rival, progress=None)
+    check("starting the VM repairs its own ports",
+          not ports.collisions(), str(ports.collisions()))
+    check("the repaired VM kept working",
+          podman.state(rival) == "running", podman.state(rival))
+    lifecycle.stop(rival, mode="force", progress=None)
+    lifecycle.remove(rival, progress=None)
+
+    stale = f"{VM}-stale"
+    lifecycle.create(stale, blueprint="alpine")
+    lifecycle.start(stale, progress=None)
+    paths.vm_dir(stale).rename(paths.project_root() / f"{stale}-gone")
+    check("a renamed-away VM leaves an orphan",
+          any(o["container"] == f"vmhub-{stale}" for o in podman.orphans()),
+          str(podman.orphans()))
+    check("prune reports the removal",
+          any(f"vmhub-{stale}" in line for line in podman.prune_orphans()),
+          str(podman.prune_orphans()))
+    check("the container is really gone",
+          not podman.container_exists(f"vmhub-{stale}"))
+    shutil.rmtree(paths.project_root() / f"{stale}-gone", ignore_errors=True)
+
+    section("stop modes")
+    stopper = f"{VM}-stop"
+    lifecycle.create(stopper, blueprint="alpine")
+    stop_spec = registry.load_spec(stopper)
+    stop_spec.shutdown.timeout = 5
+    registry.save_spec(stop_spec)
+    check("shutdown timeout is configurable",
+          registry.load_spec(stopper).shutdown.timeout == 5)
+    check("timeout reaches the container env",
+          registry.load_spec(stopper).env(uuid="u", mac="m")["TIMEOUT"] == "5")
+    for mode in ("graceful", "power", "force"):
+        lifecycle.start(stopper)
+        check(f"started for {mode} stop", podman.state(stopper) == "running")
+        used = lifecycle.stop(stopper, mode=mode)
+        check(f"{mode} stop reports its mode", used == mode)
+        check(f"{mode} stop leaves the container stopped",
+              podman.state(stopper) in {"exited", "absent"}, podman.state(stopper))
+    try:
+        lifecycle.stop(stopper, mode="nonsense")
+        check("unknown stop mode rejected", False)
+    except Exception:
+        check("unknown stop mode rejected", True)
+    check("stopping an already-stopped VM is a no-op",
+          lifecycle.stop(stopper, mode="force") == "force")
+    lifecycle.remove(stopper)
+
+    section("resource changes")
+    vm_spec = registry.load_spec(f"{VM}-clone")
+    vm_spec.resources.ram = "2G"
+    registry.save_spec(vm_spec)
+    before = disk.virtual_size(paths.disk_path(f"{VM}-clone"))
+    lifecycle.resize(f"{VM}-clone", "12G")
+    after = disk.virtual_size(paths.disk_path(f"{VM}-clone"))
+    check("disk grew", after > before, f"{before} -> {after}")
+    try:
+        lifecycle.resize(f"{VM}-clone", "1G")
+        check("shrink is refused", False, "shrink was allowed")
+    except VmhubError:
+        check("shrink is refused", True)
+
+    section("cleanup")
+    for name in (
+        f"{VM}-stop", f"{VM}-rival", f"{VM}-stale", f"{VM}-clone2",
+        f"{VM}-clone", f"{VM}-linked-import", f"{VM}-libvirt", imported, VM,
+    ):
+        if not registry.exists(name):
+            continue
+        try:
+            lifecycle.stop(name, force=True)
+        except VmhubError as exc:
+            print(f"  (stop {name}: {exc})")
+        lifecycle.remove(name)
+    check("all test VMs removed", not registry.exists(VM))
+    stale = [
+        b for b in paths.backup_dir().glob("*.vmhub.tar.gz")
+        if b.name.startswith(VM) or b.name.startswith("sweepvm")
+    ]
+    for bundle in stale:
+        bundle.unlink(missing_ok=True)
+    check("test bundles cleaned up",
+          not [b for b in paths.backup_dir().glob("*.vmhub.tar.gz")
+               if b.name.startswith(VM) or b.name.startswith("sweepvm")],
+          str([b.name for b in stale]))
+    leftovers = [m.name for m in registry.iter_metas() if m.name.startswith("vmhub-selftest")]
+    check("no leftovers on disk", not leftovers, str(leftovers))
+
+    print()
+    if failed:
+        print(f"\033[31m{len(failed)} check(s) failed:\033[0m " + ", ".join(failed))
+        return 1
+    print(f"\033[32mall {passed} checks passed\033[0m")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

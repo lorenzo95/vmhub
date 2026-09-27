@@ -1,0 +1,23 @@
+# This project lives inside its own VM root (~/vms), alongside VM data. Rather
+# than list every VM by name, ignore the whole tree and un-ignore the project
+# itself. VM directories, backups and any future storage can never be committed
+# by accident.
+/*
+
+!/src/
+!/blueprints/
+!/systemd/
+!/sysvinit/
+!/README.md
+!/SKILL.md
+!/vmctl
+!/vmhub
+!/selftest
+!/guicheck
+!/.gitignore
+
+# ...and drop the noise inside the directories we keep.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
