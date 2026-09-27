@@ -9,8 +9,8 @@ clones, portable export/import — all working on a stock Debian 13 host.
 ```
 ~/vms/vmhub     # the GUI
 ~/vms/vmctl     # the CLI
-~/vms/selftest  # 154-check end-to-end test of the backend
-~/vms/guicheck  # 47-check headless test of every GUI handler
+~/vms/selftest  # 164-check end-to-end test of the backend
+~/vms/guicheck  # 50-check headless test of every GUI handler
 ```
 
 ## What it does
@@ -89,8 +89,8 @@ firmware, SeaBIOS and noVNC.
 
 ```bash
 ./vmctl doctor                 # environment: podman, rootless, crun, kvm, init
-./selftest                     # 154-check backend lifecycle (creates throwaway VMs)
-xvfb-run -a ./guicheck         # 47-check GUI sweep, touches no existing VMs
+./selftest                     # 164-check backend lifecycle (creates throwaway VMs)
+xvfb-run -a ./guicheck         # 50-check GUI sweep, touches no existing VMs
 ```
 
 `doctor` is the one to run first; it checks every item above and names anything
@@ -282,26 +282,35 @@ A clone is a qcow2 overlay whose backing file is the template's disk:
 
 The clone dialog offers both, and they differ in more than cost:
 
-| | `--mode linked` (default) | `--mode full` |
+| | `--mode linked` | `--mode full` |
 |---|---|---|
-| Disk | copy-on-write overlay on the template | standalone copy |
+| Disk | copy-on-write overlay on the source | standalone copy |
 | Cost | instant, ~200 KB | copies the used data |
-| Runs **alongside** its template | no — lock conflict | **yes** |
-| Template can be deleted first | no | yes |
+| **Source must be a template** | **yes** | no — any stopped VM |
+| Runs **alongside** its source | no — lock conflict | **yes** |
+| Source can be deleted first | no | yes |
 | Needs flattening before export | yes | no |
 
-Use **linked** for many throwaway VMs off one golden image. Use **full** when
-the clone must live independently — a machine you will keep, patch and re-clone,
-or one you intend to move to another host.
+`--mode` defaults to linked when the source is a template, and full otherwise.
+
+Use **linked** for many throwaway VMs off one golden image. Use **full** for a
+one-off copy of any machine, or when the clone must live independently — one you
+will keep, patch and re-clone, or move to another host.
 
 ```bash
-./vmctl clone web-01 golden --mode linked    # instant
-./vmctl clone build-01 golden --mode full    # independent, copies data
+./vmctl clone web-01 golden --mode linked    # instant; golden is a template
+./vmctl clone build-01 some-vm              # full; copies a VM that isn't one
 ```
+
+The source must be **stopped** either way: cloning reads its disk, and a running
+VM holds it locked. In the GUI the Clone… button is disabled while the VM runs,
+and the linked option is greyed out with the reason when the source is not a
+template.
 
 Both directions are guarded: starting a template while a linked clone runs, and
 starting a linked clone while its template runs, fail immediately with an
-explanation instead of a QEMU lock error.
+explanation instead of a QEMU lock error. Cloning a *running* source is refused
+too, since its disk is locked.
 
 Because the overlay is a *reference*, the template's absolute path is recorded
 in the clone's header and bind-mounted read-only into the clone's container at
@@ -543,7 +552,7 @@ vmctl revert <vm> <name> [-y]     revert, discarding later snapshots
 vmctl snapshot-rm <vm> <name>     delete a snapshot
 
 vmctl template ls|mark|unmark     manage templates
-vmctl clone <vm> <template>       instant copy-on-write clone
+vmctl clone <new> <source>        linked (template) or full (any stopped VM)
 vmctl flatten <vm>                resolve the backing chain
 vmctl rebase <template>           repoint all clones
 

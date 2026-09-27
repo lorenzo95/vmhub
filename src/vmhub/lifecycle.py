@@ -232,22 +232,22 @@ CLONE_MODES = ("linked", "full")
 
 def clone(
     name: str,
-    template: str,
+    source: str,
     *,
     mode: str = "linked",
     cpus: int | None = None,
     ram: str | None = None,
     progress: Progress = _noop,
 ) -> registry.VmMeta:
-    """Clone a template.
+    """Clone a VM.
 
-    linked  The clone's disk is a copy-on-write overlay on the template, so it is
-            created instantly and costs only the blocks it writes. It shares
-            storage with the template, cannot run at the same time as it, and
-            must be flattened before the template can be deleted.
-    full    The template's disk is converted into a standalone image. Slower and
-            it copies real data, but the clone is completely independent and can
-            run, move and be exported on its own.
+    linked  A copy-on-write overlay on the source disk: created instantly, costing
+            only the blocks the clone writes. It references the source, so the
+            source must be a template — it cannot run while a clone does, and it
+            cannot be deleted until the clone is flattened.
+    full    A standalone copy of the source disk. Slower and it copies real data,
+            but the clone is completely independent: it can run alongside the
+            source, be exported, and outlive it. Any stopped VM can be the source.
     """
     progress = progress or _noop
     if mode not in CLONE_MODES:
@@ -257,20 +257,24 @@ def clone(
     spec.validate_name(name)
     if registry.exists(name):
         raise AlreadyExists(f"VM already exists: {name}")
-    source_meta = registry.load_meta(template)
-    if not source_meta.is_template:
-        raise LifecycleError(f"{template} is not marked as a template")
-    if podman.is_running(template):
-        raise TemplateInUse(
-            f"template {template} is running — stop it before cloning, "
-            "its disk is locked while it is being read"
+    source_meta = registry.load_meta(source)
+    if mode == "linked" and not source_meta.is_template:
+        raise LifecycleError(
+            f"{source} is not a template, and a linked clone references its disk. "
+            f"Either mark it first (vmctl template mark {source}) or copy it "
+            f"instead: vmctl clone {name} {source} --mode full"
         )
-    source_disk = paths.disk_path(template)
+    if podman.is_running(source):
+        raise TemplateInUse(
+            f"{source} is running — stop it before cloning, its disk is locked "
+            "while it is being read"
+        )
+    source_disk = paths.disk_path(source)
     if not disk.exists(source_disk):
-        raise NotFound(f"template has no disk: {source_disk}")
+        raise NotFound(f"{source} has no disk: {source_disk}")
 
-    progress(f"Reading template {template}...")
-    vm_spec = registry.load_spec(template)
+    progress(f"Reading {source}...")
+    vm_spec = registry.load_spec(source)
     vm_spec.name = name
     vm_spec.blueprint = source_meta.blueprint
     vm_spec.boot.iso = ""
@@ -290,9 +294,9 @@ def clone(
     paths.storage_dir(name).mkdir(parents=True, exist_ok=True)
     paths.disk_dir(name).mkdir(parents=True, exist_ok=True)
     if mode == "full":
-        used = disk.actual_size(source_disk)
+        used = disk.chain_used(source_disk)
         progress(
-            f"Copying the template's disk ({spec.format_size(used)} in use); "
+            f"Copying {source}'s disk ({spec.format_size(used)} in use); "
             f"this reads the whole image and takes a while..."
         )
         disk.convert(source_disk.resolve(), clone_disk, "qcow2", compress=False)
@@ -306,15 +310,15 @@ def clone(
         name,
         blueprint=source_meta.blueprint,
         image=source_meta.image,
-        template_source=None if mode == "full" else template,
+        template_source=None if mode == "full" else source,
     )
     if mode == "linked":
-        registry.register_dependent(name, template)
-        note = "shares storage with the template"
+        registry.register_dependent(name, source)
+        note = f"shares storage with {source}"
     else:
-        note = "fully independent of the template"
+        note = "fully independent of the source"
     progress(
-        f"Cloned {template} -> {name} ({mode}, "
+        f"Cloned {source} -> {name} ({mode}, "
         f"{spec.format_size(disk.actual_size(clone_disk))} on disk, {note})"
     )
     return meta

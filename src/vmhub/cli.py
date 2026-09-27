@@ -338,11 +338,18 @@ def cmd_template(args: argparse.Namespace, out: Out) -> int:
     return 2
 
 
+def _is_template(name: str) -> bool:
+    try:
+        return registry.load_meta(name).is_template
+    except VmhubError:
+        return False
+
+
 def cmd_clone(args: argparse.Namespace, out: Out) -> int:
     lifecycle.clone(
         args.name,
-        args.template,
-        mode=args.mode or "linked",
+        args.source,
+        mode=args.mode or ("linked" if _is_template(args.source) else "full"),
         cpus=args.cpus,
         ram=args.ram,
         progress=out.step,
@@ -948,15 +955,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?")
     p.set_defaults(func=cmd_template)
 
-    p = sub.add_parser("clone", help="clone from a template")
-    p.add_argument("name")
-    p.add_argument("template")
+    p = sub.add_parser("clone", help="clone an existing VM")
+    p.add_argument("name", help="name for the new clone")
+    p.add_argument("source", help="VM to clone (a template for --mode linked)")
     p.add_argument(
         "--mode",
         choices=list(lifecycle.CLONE_MODES),
         help=(
-            "linked: instant copy-on-write overlay sharing the template's disk; "
-            "full: standalone copy, independent but copies real data"
+            "linked: instant copy-on-write overlay on the source disk, which must "
+            "be a template; full: standalone copy, independent but copies real "
+            "data. Defaults to linked for a template, full otherwise"
         ),
     )
     p.add_argument("--cpus", type=int)

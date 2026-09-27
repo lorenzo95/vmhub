@@ -335,17 +335,6 @@ class VmPane(Gtk.Box):
             self._launch_remmina()
             return
 
-        prompt = widgets.TextPrompt(
-            self.window,
-            "RDP account name",
-            "NLA is enabled on the Windows guest, so a real account is required before "
-            "the session opens. Enter the account you created during Windows setup - "
-            "for a clone it is the same account as the template. Remmina will ask for "
-            "the password and can save it.",
-            placeholder="e.g. gero",
-            accept_label="Connect",
-        )
-
         def accept(user: str) -> None:
             def work(progress):
                 fresh = registry.load_spec(self.vm)
@@ -358,7 +347,17 @@ class VmPane(Gtk.Box):
                 self.window, work, label=f"Connecting to {self.vm} over RDP"
             )
 
-        prompt.on_accept = accept
+        widgets.prompt_text(
+            self.window,
+            "RDP account name",
+            "NLA is enabled on the Windows guest, so a real account is required before "
+            "the session opens. Enter the account you created during Windows setup - "
+            "for a clone it is the same account as the source. Remmina will ask for "
+            "the password and can save it.",
+            placeholder="e.g. gero",
+            accept_label="Connect",
+            on_accept=accept,
+        )
 
     def _launch_remmina(self) -> None:
         def work(progress):
@@ -367,41 +366,6 @@ class VmPane(Gtk.Box):
         widgets.run_task(
             self.window, work, label=f"Connecting to {self.vm} over RDP"
         )
-
-    def _on_test_rdp(self, _button: object = None) -> None:
-        def work(_progress):
-            return rdp.probe(self.vm)
-
-        def done(result) -> bool:
-            ok, message = result
-            self.window.report(("connected: " if ok else "not reachable: ") + message)
-            return False
-
-        widgets.run_task(self.window, work, on_done=done, label="Testing RDP")
-
-    def _on_enable_rdp(self, _button: object = None) -> None:
-        def work(progress):
-            from .. import ports as ports_mod
-
-            vm_spec = registry.load_spec(self.vm)
-            if 3389 not in vm_spec.network.guest_ports:
-                vm_spec.network.guest_ports = [*vm_spec.network.guest_ports, 3389]
-            if not vm_spec.network.host_rdp:
-                vm_spec.network.host_rdp = ports_mod.allocate("rdp")
-            if not vm_spec.media.rdp_user:
-                vm_spec.media.rdp_user = "user"
-            vm_spec.validate()
-            registry.save_spec(vm_spec)
-            progress(f"RDP will be published on port {vm_spec.network.host_rdp} after the next start")
-            return True
-
-        widgets.run_task(self.window, work, label="Publishing an RDP port")
-
-    def _on_remmina(self, _button) -> None:
-        def work(_progress):
-            return rdp.launch(self.vm)
-
-        widgets.run_task(self.window, work, label="Launching Remmina")
 
     def _build_hardware_tab(self) -> None:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -506,15 +470,16 @@ class VmPane(Gtk.Box):
         tmpl_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.template_button = Gtk.Button(label="Mark as template")
         self.template_button.connect("clicked", self._on_toggle_template)
-        clone_button = Gtk.Button(label="Clone…")
-        clone_button.connect("clicked", self._on_clone)
+        self.clone_button = Gtk.Button(label="Clone…")
+        self.clone_button.set_tooltip_text("Clone this VM (uses its disk as the source)")
+        self.clone_button.connect("clicked", self._on_clone)
         rebase_button = Gtk.Button(label="Rebase clones")
         rebase_button.set_tooltip_text(
             "Repoint every clone of this template at the template's current disk"
         )
         rebase_button.connect("clicked", self._on_rebase)
         tmpl_row.append(self.template_button)
-        tmpl_row.append(clone_button)
+        tmpl_row.append(self.clone_button)
         tmpl_row.append(rebase_button)
         tmpl_row.set_halign(Gtk.Align.START)
         box.append(tmpl_row)
@@ -649,6 +614,13 @@ class VmPane(Gtk.Box):
         self.power_button.remove_css_class("destructive-action")
         self.power_button.add_css_class("destructive-action" if running else "suggested-action")
         self.force_button.set_visible(running)
+        # Cloning reads the source disk, which a running VM holds locked.
+        self.clone_button.set_sensitive(not running)
+        self.clone_button.set_tooltip_text(
+            "Stop the VM first — its disk is locked while running"
+            if running
+            else "Clone this VM (uses its disk as the source)"
+        )
         self.guest_button.set_visible(running)
         self.snapshot_button.set_sensitive(running)
         self.snapshot_button.set_tooltip_text(
@@ -980,24 +952,38 @@ class VmPane(Gtk.Box):
         if self.status is None:
             return
         source = self.vm
+        can_link = bool(self.status.is_template)
 
-        linked = Gtk.CheckButton(label="Linked clone (instant, shares storage)")
-        linked.set_active(True)
-        full = Gtk.CheckButton(label="Full clone (independent, copies the disk)")
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        box.set_margin_top(8)
-        box.append(linked)
-        box.append(full)
-
-        prompt = widgets.TextPrompt(
-            self.window,
-            f"Clone {source}",
-            "Name the clone.",
-            default=f"{source}-copy",
-            placeholder="clone name",
-            accept_label="Clone",
-            extra=box,
+        linked = Gtk.CheckButton(
+            label="Linked clone — instant, shares the source's storage"
         )
+        full = Gtk.CheckButton(
+            label="Full clone — independent copy, takes time and real disk"
+        )
+        # Mutually exclusive: two plain CheckButtons would let both be ticked.
+        full.set_group(linked)
+        if can_link:
+            linked.set_active(True)
+        else:
+            full.set_active(True)
+            linked.set_sensitive(False)
+            linked.set_tooltip_text(
+                "A linked clone references the source disk, so the source must be a "
+                "template. Mark it with 'Mark as template' to enable this."
+            )
+
+        choice = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        choice.set_margin_top(8)
+        choice.append(linked)
+        choice.append(full)
+        if not can_link:
+            hint = Gtk.Label(
+                label="Only full clones are available because this VM is not a template."
+            )
+            hint.add_css_class("hint")
+            hint.set_wrap(True)
+            hint.set_xalign(0.0)
+            choice.append(hint)
 
         def accept(target: str) -> None:
             mode = "full" if full.get_active() else "linked"
@@ -1010,7 +996,16 @@ class VmPane(Gtk.Box):
                 on_done=lambda _r: self.window.select_vm(target),
             )
 
-        prompt.on_accept = accept
+        widgets.prompt_text(
+            self.window,
+            f"Clone {source}",
+            "Name the clone.",
+            default=f"{source}-copy",
+            placeholder="clone name",
+            accept_label="Clone",
+            extra=choice,
+            on_accept=accept,
+        )
 
     def _on_rebase(self, _button) -> None:
         widgets.run_task(

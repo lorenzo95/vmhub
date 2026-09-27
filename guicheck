@@ -33,7 +33,7 @@ import gi  # noqa: E402
 gi.require_version("Gtk", "4.0")
 from gi.repository import GLib, Gtk  # noqa: E402
 
-from vmhub import iso as isomod, lifecycle, paths, registry  # noqa: E402
+from vmhub import iso as isomod, lifecycle, paths, ports, registry  # noqa: E402
 from vmhub.ui import newvm, widgets  # noqa: E402
 from vmhub.ui.app import VmhubApp  # noqa: E402
 
@@ -220,6 +220,63 @@ def _probe(app) -> None:
     else:
         exercised.append("Ctrl+N is bound")
         print("  \033[32mPASS\033[0m  Ctrl+N is bound to New VM")
+
+    # ---- dialogs that were once constructed and never shown ----
+    opened: list = []
+    original_present = widgets.TextPrompt.present
+    widgets.TextPrompt.present = lambda self: (opened.append(self), original_present(self))[1]
+    try:
+        window.select_vm(VM)
+        before = len(opened)
+        window.panes[VM]._on_clone(None)
+        clone_opened = len(opened) > before
+
+        # give the VM an RDP port but no account, so _on_remmina takes the prompt path
+        rdp_spec = registry.load_spec(VM)
+        rdp_spec.network.guest_ports = [22, 3389]
+        rdp_spec.network.host_rdp = ports.allocate("rdp")
+        rdp_spec.media.rdp_user = ""
+        registry.save_spec(rdp_spec)
+        settle()
+        window.select_vm(VM)
+        before = len(opened)
+        window.panes[VM]._on_remmina(None)
+        remmina_opened = len(opened) > before
+    finally:
+        widgets.TextPrompt.present = original_present
+        for dialog in opened:
+            dialog.close()
+
+    if not clone_opened:
+        failures.append(("clone dialog not shown", "the Clone button does nothing"))
+        print("  \033[31mFAIL\033[0m  Clone… did not open a dialog")
+    else:
+        exercised.append("the Clone dialog is shown")
+        print("  \033[32mPASS\033[0m  Clone… opens its dialog")
+
+    if not remmina_opened:
+        failures.append(("remmina prompt not shown", "the account prompt does nothing"))
+        print("  \033[31mFAIL\033[0m  Connect with Remmina did not open the account prompt")
+    else:
+        exercised.append("the Remmina account prompt is shown")
+        print("  \033[32mPASS\033[0m  Connect with Remmina opens the account prompt")
+
+    # a running VM's disk is locked, so cloning it must be disabled
+    live = "vmhub-guicheck-live"
+    lifecycle.create(live, blueprint="alpine")
+    lifecycle.start(live)
+    settle()
+    window.select_vm(live)
+    sensitive = window.panes[live].clone_button.get_sensitive()
+    lifecycle.stop(live, mode="force")
+    lifecycle.remove(live)
+    settle()
+    if sensitive:
+        failures.append(("clone enabled while running", "disk is locked"))
+        print("  \033[31mFAIL\033[0m  Clone… was enabled on a running VM")
+    else:
+        exercised.append("Clone is disabled while the VM runs")
+        print("  \033[32mPASS\033[0m  Clone… is disabled while the VM runs")
 
     # ---- progress messages must actually be shown ----
     strip = window.status_strip

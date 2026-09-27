@@ -8,6 +8,7 @@ from typing import Callable
 import gi
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from .. import blueprints, lifecycle, paths, registry, spec  # noqa: E402
@@ -198,27 +199,6 @@ def filter_store(name: str, patterns: list[str]) -> Gio.ListStore:
     return store
 
 
-def confirm(parent: Gtk.Window, heading: str, body: str, *, destructive: bool = True) -> Callable[[], None] | None:
-    dialog = Gtk.AlertDialog(
-        message=heading,
-        detail=body,
-        buttons=["Cancel", "Confirm"],
-        cancel_button=0,
-        default_button=1,
-    )
-
-    def on_choice(_dialog, result) -> None:
-        try:
-            choice = dialog.choose_finish(result)
-        except Exception:
-            return
-        if choice == 1:
-            run_task(parent, lambda _p: None, lambda _r: None)
-
-    dialog.choose(parent, None, on_choice)
-    return None
-
-
 class TextPrompt(Gtk.Window):
     def __init__(
         self,
@@ -277,6 +257,10 @@ class TextPrompt(Gtk.Window):
         root.append(buttons)
 
         self.set_child(root)
+        # A prompt exists only to be shown. Presenting here rather than leaving it
+        # to the caller removes the failure mode where a dialog is constructed,
+        # never displayed, and silently does nothing.
+        self.present()
 
     def _on_accept_clicked(self, _widget: object) -> None:
         text = self.entry.get_text().strip()
@@ -297,7 +281,7 @@ def prompt_text(
     accept_label: str = "OK",
     extra: Gtk.Widget | None = None,
 ) -> TextPrompt:
-    window = TextPrompt(
+    return TextPrompt(
         parent,
         heading,
         body,
@@ -307,8 +291,6 @@ def prompt_text(
         extra=extra,
         on_accept=on_accept,
     )
-    window.present()
-    return window
 
 
 def report_error(parent: Gtk.Window, exc: BaseException) -> None:

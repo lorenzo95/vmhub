@@ -128,6 +128,13 @@ to ISOs and are validated at start.
 
 ### Clone modes
 
+`linked` requires the source to be a **template** and stopped; `full` works from
+any stopped VM. Both read the source disk, so a running source is refused. The CLI
+defaults to linked for a template and full otherwise; the GUI offers radios, with
+linked greyed out for a non-template.
+
+### Clone modes (details)
+
 | | `--mode linked` (default) | `--mode full` |
 |---|---|---|
 | Disk | copy-on-write overlay on the template | standalone copy |

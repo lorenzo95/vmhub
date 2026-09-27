@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import sys
 import time
+import ast
 import configparser
 import json
 import os
+import re
 import shutil
 import tarfile
 import tempfile
@@ -416,6 +418,37 @@ def main() -> int:
     lifecycle.remove(full_clone)
     lifecycle.remove(linked_clone)
 
+    section("cloning a VM that is not a template")
+    plain = f"{VM}-plain"
+    lifecycle.create(plain, blueprint="alpine")
+
+    try:
+        lifecycle.clone(f"{VM}-linked-from-plain", plain, mode="linked")
+        check("linked clone from a non-template is refused", False, "it was allowed")
+    except VmhubError as exc:
+        check("linked clone from a non-template is refused", "not a template" in str(exc))
+        check("the refusal points at --mode full", "--mode full" in str(exc), str(exc))
+
+    full_from_plain = f"{VM}-full-from-plain"
+    lifecycle.clone(full_from_plain, plain, mode="full")
+    check("full clone from a non-template succeeds", registry.exists(full_from_plain))
+    check("full clone of a non-template is standalone",
+          lifecycle.status(full_from_plain).backing is None)
+    check("full clone records no template relationship",
+          registry.load_meta(full_from_plain).template_source is None)
+    check("the non-template gains no dependents",
+          registry.dependents_of(plain) == [], str(registry.dependents_of(plain)))
+
+    lifecycle.start(plain)
+    try:
+        lifecycle.clone(f"{VM}-from-running", plain, mode="full")
+        check("cloning a running VM is refused", False, "it was allowed")
+    except VmhubError as exc:
+        check("cloning a running VM is refused", "running" in str(exc), str(exc))
+    lifecycle.stop(plain, mode="force")
+    for name in (full_from_plain, plain):
+        lifecycle.remove(name)
+
     section("finish install and live media")
     lifecycle.start(VM)
     check("running VM exposes live media", isinstance(lifecycle.live_media(VM), list))
@@ -641,6 +674,58 @@ def main() -> int:
     check("libvirt import: auto boot mode omits BOOT_MODE",
           "BOOT_MODE" not in spec.VmSpec(name="x", boot=spec.Boot(mode="auto")).env(uuid="u", mac="m"))
 
+    section("gui source invariants")
+    ui_dir = paths.project_root() / "src" / "vmhub" / "ui"
+
+    def gui_methods(path: Path):
+        text = path.read_text()
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                for sub in node.body:
+                    if isinstance(sub, ast.FunctionDef):
+                        yield node.name, sub.name, ast.get_source_segment(text, sub) or ""
+
+    # A duplicate method silently shadows the earlier one, and a handler sweep only
+    # ever calls the survivor. This is how a dead Clone button hid for so long.
+    duplicates: list[str] = []
+    for path in sorted(ui_dir.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            seen: dict[str, list[int]] = {}
+            for sub in node.body:
+                if isinstance(sub, ast.FunctionDef):
+                    seen.setdefault(sub.name, []).append(sub.lineno)
+            for name, lines in seen.items():
+                if len(lines) > 1:
+                    duplicates.append(f"{path.name}:{node.name}.{name}@{lines}")
+    check("no duplicate GUI method definitions", not duplicates, str(duplicates))
+
+    # A handler that builds a dialog directly (rather than via prompt_text) must
+    # also show it; TextPrompt does not present itself any more, but this catches
+    # any future dialog that gets constructed and dropped.
+    unshown: list[str] = []
+    for path in sorted(ui_dir.glob("*.py")):
+        for cls, name, body in gui_methods(path):
+            if not name.startswith("_on"):
+                continue
+            builds = "TextPrompt(" in body or "AlertDialog(" in body
+            if not builds or "prompt_text(" in body:
+                continue
+            if not any(call in body for call in (".present(", ".choose(", ".show(")):
+                unshown.append(f"{path.name}:{cls}.{name}")
+    check("every dialog-building handler can show its dialog", not unshown, str(unshown))
+
+    # Every button that opens a dialog must be reachable: a handler defined but
+    # never connected is another way a button silently does nothing.
+    pane_src = (ui_dir / "pane.py").read_text()
+    defined = {name for _cls, name, _b in gui_methods(ui_dir / "pane.py") if name.startswith("_on")}
+    # Handlers are connected directly or wrapped in a lambda supplying an argument,
+    # so look for any self.<name> reference rather than only `connect(..., self.x)`.
+    unused_handlers = sorted(n for n in defined if f"self.{n}" not in pane_src)
+    check("no orphaned click handlers in the pane", not unused_handlers, str(unused_handlers))
+
     section("ports and orphans")
     rival = f"{VM}-rival"
     lifecycle.create(rival, blueprint="alpine")
@@ -715,7 +800,8 @@ def main() -> int:
     section("cleanup")
     for name in (
         f"{VM}-stop", f"{VM}-rival", f"{VM}-stale", f"{VM}-clone2",
-        f"{VM}-clone", f"{VM}-linked-import", f"{VM}-libvirt", imported, VM,
+        f"{VM}-clone", f"{VM}-linked-import", f"{VM}-libvirt",
+        f"{VM}-plain", f"{VM}-full-from-plain", imported, VM,
     ):
         if not registry.exists(name):
             continue
