@@ -72,6 +72,9 @@ class VmhubWindow(Gtk.ApplicationWindow):
         self.rows: dict[str, Gtk.ListBoxRow] = {}
         self.order: list[str] = []
         self.current: str | None = None
+        # The tab new panes open on. Console at startup, then whatever the
+        # user is looking at -- see remember_tab().
+        self._tab = 0
         self._refresh_tag = 0
         self._syncing = False
         self._refreshing = False
@@ -390,6 +393,15 @@ class VmhubWindow(Gtk.ApplicationWindow):
         # comes back when the VM is selected again. Closing it here stopped
         # its log timer, and nothing ever started another, so a VM's log
         # froze for the rest of the session after the first switch away.
+        #
+        # The tab is carried over on the way out, by reading it off the pane
+        # being left rather than by listening for a change: Gtk.Notebook
+        # emits neither notify::current-page nor switch-page for a
+        # set_current_page() done in code, so a listener would only ever fire
+        # for a click, and miss every programmatic move.
+        leaving = self.panes.get(self.current) if self.current else None
+        if leaving is not None:
+            self._tab = leaving.notebook.get_current_page()
         self.current = name
         if not name:
             self.content.set_visible_child_name("empty")
@@ -398,13 +410,21 @@ class VmhubWindow(Gtk.ApplicationWindow):
             return
         pane = self.panes.get(name)
         if pane is None:
-            pane = VmPane(self, name)
+            pane = VmPane(self, name, self._tab)
             self.panes[name] = pane
             self.content.add_named(pane, name)
+        else:
+            # An open pane is moved to the remembered tab too, so the tab is
+            # the same whichever VM is on screen -- going back to a VM you
+            # left on a different tab should not be a jump.
+            pane.notebook.set_current_page(
+                max(0, min(self._tab, pane.notebook.get_n_pages() - 1))
+            )
         self.content.set_visible_child_name(name)
         self.sidebar_empty.set_visible(False)
         self._sync_selection()
         self._update_pane(name)
+
 
     def _update_pane(self, name: str) -> None:
         status = getattr(self, "statuses", {}).get(name)

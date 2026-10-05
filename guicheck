@@ -479,6 +479,47 @@ def _probe(app) -> None:
             )
         settle()
 
+    # ---- the tab you are on carries over to a VM you have not opened ----
+    # Every new pane used to open on the Console, so comparing two machines
+    # meant clicking back to the same tab every time you switched.
+    window.select_vm(VM)
+    if window._tab == 0:
+        exercised.append("the app opens on the Console tab")
+        print("  \033[32mPASS\033[0m  the app opens on the Console tab")
+    else:
+        failures.append(("startup tab", f"opened on page {window._tab}, not 0"))
+        print(f"  \033[31mFAIL\033[0m  the app did not open on the Console (page {window._tab})")
+
+    if other is None:
+        print("  \033[33mSKIP\033[0m  only one VM exists; cannot test the tab carrying over")
+    else:
+        pages = window.panes[VM].notebook.get_n_pages()
+        target = 3 if pages > 3 else pages - 1
+        window.panes[VM].notebook.set_current_page(target)
+        settle()
+        rebuild_pane(window, other)
+        window.select_vm(other)
+        landed = window.panes[other].notebook.get_current_page()
+        if landed == target:
+            exercised.append("a new VM opens on the tab you were using")
+            print("  \033[32mPASS\033[0m  a new VM opens on the tab you were using")
+        else:
+            failures.append((
+                "tab not carried over",
+                f"was on page {target}, the new pane opened on {landed}",
+            ))
+            print(
+                "  \033[31mFAIL\033[0m  a new VM ignored the tab you were on "
+                f"({target} -> {landed})"
+            )
+        # Put everything back on the Console so the checks below start where the
+        # probe expects to, and a failure above cannot cascade.
+        window.panes[VM].notebook.set_current_page(0)
+        settle()
+        window.select_vm(other)
+        window.select_vm(VM)
+        settle()
+
     # ---- adding a custom forward, pressed the way a user presses it ----
     # Calling the handler with no arguments is not enough: GTK hands the
     # button to "clicked", so a zero-argument handler dies on the press and

@@ -25,7 +25,7 @@ ROLE_ROWS = {
 
 
 class VmPane(Gtk.Box):
-    def __init__(self, window: Gtk.Window, vm_name: str) -> None:
+    def __init__(self, window: Gtk.Window, vm_name: str, page: int = 0) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.window = window
         self.vm = vm_name
@@ -50,6 +50,13 @@ class VmPane(Gtk.Box):
         self._build_info_tab()
         self._build_snapshots_tab()
         self._build_logs_tab()
+
+        # Open on the tab the window asks for. Every VM has the same tabs, so
+        # this cannot land out of range in practice, but a pane built before
+        # the last tab existed should not raise over it.
+        self.notebook.set_current_page(
+            max(0, min(page, self.notebook.get_n_pages() - 1))
+        )
 
     def _build_header(self) -> None:
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
