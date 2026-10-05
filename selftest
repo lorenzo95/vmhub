@@ -887,39 +887,38 @@ def main() -> int:
     check("every directly connected handler takes the widget",
           not bad_arity, str(bad_arity))
 
-    section("signal handlers accept the widget they are given")
-    # GTK hands the emitting widget to "clicked". A handler wired straight to
-    # a signal has to take it: a zero-argument method connected directly
-    # raises TypeError the moment anyone presses the button, and the only
-    # symptom is a control that looks fine and does nothing. The guicheck
-    # sweep cannot catch this, because it calls handlers with no arguments.
-    ui_dir = paths.project_root() / "src" / "vmhub" / "ui"
-    bad_arity: list[str] = []
+    # A worker runs on a thread, where touching a widget is not safe, and it
+    # reads whatever the value happens to be at that moment rather than the
+    # one the user set. Read the controls before dispatching the work.
+    worker_touches: list[str] = []
+    widget_calls = {
+        "set_text", "get_text", "set_visible", "get_visible", "set_sensitive",
+        "set_active", "get_active", "set_label", "get_label", "set_value",
+        "get_value", "set_tooltip_text", "emit", "get_clipboard",
+        "get_selected", "get_first_child", "get_next_sibling", "queue_draw",
+        "set_markup", "push", "pop", "report",
+    }
+
+    def _rooted_at_self(node) -> bool:
+        while isinstance(node, ast.Attribute):
+            node = node.value
+        return isinstance(node, ast.Name) and node.id == "self"
+
     for ui_path in sorted(ui_dir.glob("*.py")):
         tree = ast.parse(ui_path.read_text())
-        connected: set[str] = set()
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "connect"
-                and len(node.args) >= 2
-                and isinstance(node.args[1], ast.Attribute)
-                and isinstance(node.args[1].value, ast.Name)
-                and node.args[1].value.id == "self"
-            ):
-                connected.add(node.args[1].attr)
-        for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
-            for fn in cls.body:
-                if not isinstance(fn, ast.FunctionDef):
-                    continue
-                if fn.name not in connected and f"{cls.name}.{fn.name}" not in connected:
-                    continue
-                takes = fn.args.posonlyargs + fn.args.args
-                if len(takes) < 2 and not fn.args.vararg:
-                    bad_arity.append(f"{ui_path.name}:{fn.lineno} {fn.name}")
-    check("every directly connected handler takes the widget",
-          not bad_arity, str(bad_arity))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef) or fn.name != "work":
+                continue
+            for sub in ast.walk(fn):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr in widget_calls
+                    and _rooted_at_self(sub.func.value)
+                ):
+                    worker_touches.append(f"{ui_path.name}:{sub.lineno} {sub.func.attr}")
+    check("no worker touches a widget from its own thread",
+          not worker_touches, str(worker_touches))
 
     section("ports and orphans")
     rival = f"{VM}-rival"

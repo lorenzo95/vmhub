@@ -152,9 +152,14 @@ def copy_row(text: str, label: str = "Copy", *, tooltip: str = "") -> Gtk.Widget
     button.set_tooltip_text(full)
 
     def on_copy(_button) -> None:
+        # Copy what the row says now, not the string this button was built
+        # with. set_copy_text() replaces the text as the VM's state changes,
+        # and a button still holding the original always copied "" -- which
+        # is every Copy button on the Console tab, since they are all
+        # created empty and filled in afterwards.
         display = Gdk.Display.get_default()
         if display is not None:
-            display.get_clipboard().set(text)
+            display.get_clipboard().set(entry.get_text())
         button.set_label("Copied")
         GLib.timeout_add_seconds(2, lambda: (button.set_label(label), False)[1])
 

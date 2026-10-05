@@ -33,11 +33,17 @@ class StatusStrip(Gtk.Box):
         They used to be stashed into a set and never displayed, so a clone or an
         export showed nothing at all between "starting" and "done".
         """
-        self._active += 1
         self.label.set_text(message)
         self._history.append(message)
         del self._history[:-8]
         self.label.set_tooltip_text("\n".join(self._history))
+        if transient:
+            # Incremental progress from a task that is already counted as
+            # active. Counting these too leaked one per message, so the
+            # count never returned to zero and the spinner kept turning long
+            # after the work was finished.
+            return
+        self._active += 1
         self.spinner.set_visible(True)
         self.spinner.start()
 
@@ -380,10 +386,10 @@ class VmhubWindow(Gtk.ApplicationWindow):
         self._on_row_selected(_list_box, row)
 
     def select_vm(self, name: str | None) -> None:
-        if self.current and self.current != name:
-            existing = self.panes.get(self.current)
-            if existing is not None:
-                existing.close()
+        # Switching away does not tear the pane down: it stays cached and
+        # comes back when the VM is selected again. Closing it here stopped
+        # its log timer, and nothing ever started another, so a VM's log
+        # froze for the rest of the session after the first switch away.
         self.current = name
         if not name:
             self.content.set_visible_child_name("empty")

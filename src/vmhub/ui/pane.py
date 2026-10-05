@@ -33,6 +33,10 @@ class VmPane(Gtk.Box):
         self._snap_signature: tuple[str, ...] = ()
         self._log_tag = 0
         self._log_source = 0
+        # Whether the user has an unapplied edit in the hardware controls,
+        # and whether we are the ones writing into them right now.
+        self._dirty = False
+        self._loading = False
 
         self.add_css_class("vmpane")
         self.set_vexpand(True)
@@ -802,6 +806,14 @@ class VmPane(Gtk.Box):
             control.set_halign(Gtk.Align.START)
             grid.attach(lbl, 0, row, 1, 1)
             grid.attach(control, 1, row, 1, 1)
+        for _label_text, control in _hw_rows:
+            # A DropDown has no "changed" signal at all -- connecting one
+            # raises while the pane is being built, which takes the whole
+            # window down with it. It notifies on its property instead.
+            if isinstance(control, Gtk.DropDown):
+                control.connect("notify::selected", self._on_hardware_changed)
+            else:
+                control.connect("changed", self._on_hardware_changed)
         grid.attach(apply_button, 1, len(_hw_rows), 1, 1)
         box.append(grid)
         self.guest_button = Gtk.Button(label="Query guest agent")
@@ -943,8 +955,14 @@ class VmPane(Gtk.Box):
         self._log_tag = GLib.timeout_add_seconds(2, self._poll_logs, source)
 
     def _poll_logs(self, source: int) -> bool:
-        if source != self._log_source or not self.is_visible():
+        if source != self._log_source:
             return False
+        if not self.is_visible():
+            # Returning False here removes the timeout, and only building
+            # the pane again would start another. Being hidden -- another
+            # tab, or a minimised window -- is not a reason to stop
+            # watching, so keep the timer and do nothing this time round.
+            return True
         if not self._follow or not podman.exists(self.vm):
             return True
         try:
@@ -1028,24 +1046,29 @@ class VmPane(Gtk.Box):
             else "Snapshot the disk as it is, with the VM powered off"
         )
 
-        if self.cpu_spin.get_value() != status.cpus:
-            self.cpu_spin.set_value(status.cpus)
-        if not self.ram_entry.has_focus():
-            self.ram_entry.set_text(status.ram)
-        if not self.disk_entry.has_focus():
-            self.disk_entry.set_text(status.disk_size)
-        try:
-            current = registry.load_spec(status.name).shutdown.timeout
-            if abs(self.timeout_spin.get_value() - current) > 0.5:
-                self.timeout_spin.set_value(current)
-        except Exception:
-            pass
-        if not self.disk_type_drop.get_selected():
-            pass
-        selected_type = self.disk_type_drop.get_selected()
-        if 0 <= selected_type < len(DISK_TYPES) and DISK_TYPES[selected_type] != status.disk_type:
-            if status.disk_type in DISK_TYPES:
-                self.disk_type_drop.set_selected(DISK_TYPES.index(status.disk_type))
+        # Write the VM's current values into the controls only while the
+        # user has no unsaved edit in them. They used to be overwritten on
+        # every four-second poll regardless, so a half-typed value vanished
+        # before Apply could be pressed. The two entries were exempt, but
+        # only for as long as they happened to hold focus -- tab away and
+        # the edit was discarded.
+        if not self._dirty:
+            self._loading = True
+            try:
+                if self.cpu_spin.get_value() != status.cpus:
+                    self.cpu_spin.set_value(status.cpus)
+                self.ram_entry.set_text(status.ram)
+                self.disk_entry.set_text(status.disk_size)
+                try:
+                    current = registry.load_spec(status.name).shutdown.timeout
+                    if abs(self.timeout_spin.get_value() - current) > 0.5:
+                        self.timeout_spin.set_value(current)
+                except Exception:
+                    pass
+                if status.disk_type in DISK_TYPES:
+                    self.disk_type_drop.set_selected(DISK_TYPES.index(status.disk_type))
+            finally:
+                self._loading = False
 
         url = status.console_url
         self.console_row.set_visible(bool(url))
@@ -1284,25 +1307,70 @@ class VmPane(Gtk.Box):
 
         widgets.run_task(self.window, work, on_done=done, label="Querying guest agent")
 
+    def _on_hardware_changed(self, *_args: object) -> None:
+        if not self._loading:
+            self._dirty = True
+
     def _on_apply_resources(self, _button) -> None:
+        # Read every control here, on the main loop. The worker runs on a
+        # thread, where touching a widget is not safe -- and on a busy main
+        # loop it can also read a value the user has already changed.
+        cpus = int(self.cpu_spin.get_value())
+        ram = self.ram_entry.get_text().strip()
+        selected = self.disk_type_drop.get_selected()
+        disk_type = DISK_TYPES[selected] if 0 <= selected < len(DISK_TYPES) else ""
+        timeout = int(self.timeout_spin.get_value())
+        requested = self.disk_entry.get_text().strip()
+
+        try:
+            grow_to = spec.parse_size(requested) if requested else 0
+        except spec.SpecError as exc:
+            self.window.report(f"{requested!r} is not a disk size: {exc}")
+            return
+
+        # Growing the disk of a running VM is the one failure that can be
+        # reported before anything is touched. Say so and apply the rest,
+        # rather than failing the whole edit for one field.
+        skipped = ""
+        if grow_to:
+            try:
+                current = registry.load_spec(self.vm).resources.disk_bytes
+                if grow_to > current and podman.is_running(self.vm):
+                    skipped = (
+                        f"; left the disk at {spec.format_size(current)} because "
+                        f"{self.vm} is running — stop it and apply again"
+                    )
+                    grow_to = 0
+            except Exception as exc:  # noqa: BLE001
+                skipped = f"; left the disk alone: {exc}"
+                grow_to = 0
+
         def work(progress):
-            vm_spec = registry.load_spec(self.vm)
-            before = (vm_spec.resources.cpus, vm_spec.resources.disk_bytes)
-            vm_spec.resources.cpus = int(self.cpu_spin.get_value())
-            vm_spec.resources.ram = self.ram_entry.get_text().strip()
-            selected = self.disk_type_drop.get_selected()
-            if 0 <= selected < len(DISK_TYPES):
-                vm_spec.resources.disk_type = DISK_TYPES[selected]
-            vm_spec.shutdown.timeout = int(self.timeout_spin.get_value())
-            requested = self.disk_entry.get_text().strip()
-            vm_spec.validate()
-            registry.save_spec(vm_spec)
-            if requested and spec.parse_size(requested) > before[1]:
+            if grow_to:
+                # resize() saves the spec itself, so it has to happen before
+                # the copy below is loaded, or the size it just wrote gets
+                # clobbered by this edit.
                 progress(f"growing disk to {requested}…")
                 lifecycle.resize(self.vm, requested, progress=progress)
+            vm_spec = registry.load_spec(self.vm)
+            vm_spec.resources.cpus = cpus
+            vm_spec.resources.ram = ram
+            if disk_type:
+                vm_spec.resources.disk_type = disk_type
+            vm_spec.shutdown.timeout = timeout
+            vm_spec.validate()
+            registry.save_spec(vm_spec)
             return True
 
-        widgets.run_task(self.window, work, label="Applying resource changes")
+        def done(_result) -> bool:
+            self._dirty = False
+            if skipped:
+                self.window.report(f"Applied to {self.vm}{skipped}")
+            return False
+
+        widgets.run_task(
+            self.window, work, on_done=done, label="Applying resource changes"
+        )
 
     def _on_toggle_template(self, _button) -> None:
         if self.status is None:

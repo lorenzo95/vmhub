@@ -31,11 +31,12 @@ if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
 import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import GLib, Gtk  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 from vmhub import iso as isomod, lifecycle, paths, ports, registry, spec  # noqa: E402
 from vmhub.ui import newvm, widgets  # noqa: E402
 from vmhub.ui.app import VmhubApp  # noqa: E402
+from vmhub.ui.pane import VmPane  # noqa: E402
 
 VM = "vmhub-guicheck"
 failures: list[tuple[str, str]] = []
@@ -48,10 +49,16 @@ exercised: list[str] = []
 # covered by the backend selftest against throwaway VMs.
 DESTRUCTIVE = {"_on_start_all", "_on_stop_all", "_on_restore", "_on_prune"}
 
+# Handlers that wreck the window itself rather than a VM. Swept in name order,
+# _on_close stops every pane's log timer and latches window._closing, which
+# quietly switched off the async refresh handling for the rest of the run. It
+# is exercised once, explicitly, at the end of the probe instead.
+WINDOW_FATAL = {"_on_close"}
+
 
 def sweep(obj, label: str) -> None:
     for name in sorted(dir(type(obj))):
-        if not name.startswith("_on") or name in DESTRUCTIVE:
+        if not name.startswith("_on") or name in DESTRUCTIVE or name in WINDOW_FATAL:
             continue
         fn = getattr(obj, name, None)
         if not callable(fn):
@@ -138,6 +145,21 @@ def _cleanup() -> None:
     for bundle in paths.backup_dir().glob("*.vmhub.tar.gz"):
         if bundle.name.startswith("vmhub-guicheck") or bundle.name.startswith("sweepvm"):
             bundle.unlink(missing_ok=True)
+
+
+def rebuild_pane(window, name: str) -> None:
+    """Drop a cached pane so the next select_vm builds a fresh one.
+
+    A pane built once and kept for the whole run is not a fair subject for the
+    log-timer check: anything earlier that closed it leaves it looking exactly
+    like a pane whose timer was stopped by switching away.
+    """
+    old = window.panes.pop(name, None)
+    if old is not None:
+        old.close()
+        child = window.content.get_child_by_name(name)
+        if child is not None:
+            window.content.remove(child)
 
 
 def _probe(app) -> None:
@@ -357,6 +379,106 @@ def _probe(app) -> None:
         exercised.append("the port table is drawn")
         print("  \033[32mPASS\033[0m  the port table is drawn")
 
+    # ---- a Copy button must copy what the row says now ----
+    # It used to copy the string the button was built with. Every Console
+    # row is created empty and filled in later, so all three of them put an
+    # empty string on the clipboard no matter what they displayed.
+    row = widgets.copy_row("before")
+    widgets.set_copy_text(row, "after")
+    row.get_first_child().get_next_sibling().emit("clicked")
+    # Read it back through Gdk's async API. Asking another process for the
+    # clipboard deadlocks here: xclip waits for the owner to answer, and the
+    # owner is this process, whose main loop is busy waiting for xclip.
+    clipboard = Gdk.Display.get_default().get_clipboard()
+    pasted: list[str] = []
+    clipboard.read_text_async(
+        None, lambda _cb, res: pasted.append(clipboard.read_text_finish(res) or "")
+    )
+    pump_until(lambda: bool(pasted), timeout=4.0)
+    got = pasted[0] if pasted else "<nothing came back>"
+    if got == "after":
+        exercised.append("a Copy button copies the row's current text")
+        print("  \033[32mPASS\033[0m  a Copy button copies the row's current text")
+    else:
+        failures.append(("copy row", f"clipboard held {got!r}, expected 'after'"))
+        print(f"  \033[31mFAIL\033[0m  Copy put {got!r} on the clipboard, expected 'after'")
+
+    # ---- an unapplied edit must survive the status poll ----
+    # The poll used to write the VM's values back into the controls every
+    # four seconds, so a half-typed value was gone before Apply was pressed.
+    pane.cpu_spin.set_value(7)
+    settle()
+    if pane.cpu_spin.get_value() == 7:
+        exercised.append("an unapplied edit survives the poll")
+        print("  \033[32mPASS\033[0m  an unapplied edit survives the poll")
+    else:
+        failures.append((
+            "poll reverted an edit",
+            f"vCPUs went back to {pane.cpu_spin.get_value()}",
+        ))
+        print(f"  \033[31mFAIL\033[0m  the poll reverted the edit to {pane.cpu_spin.get_value()}")
+
+    # ---- progress messages must not keep the spinner alive ----
+    strip = window.status_strip
+    strip._active = 0
+    strip.push("step one", transient=True)
+    strip.push("step two", transient=True)
+    strip.pop()
+    if strip._active == 0 and not strip.spinner.get_visible():
+        exercised.append("progress messages do not leak the spinner")
+        print("  \033[32mPASS\033[0m  progress messages do not leak the spinner")
+    else:
+        failures.append((
+            "spinner leaked",
+            f"_active is {strip._active}, visible {strip.spinner.get_visible()}",
+        ))
+        print(f"  \033[31mFAIL\033[0m  the spinner leaked (_active {strip._active})")
+
+    # ---- a hidden pane must keep watching ----
+    # Returning False from the poll removes the timeout it is running in, and
+    # only building the pane again would start another. So the log froze for
+    # good the first time another tab was on screen -- which is every time.
+    # This pane is deliberately not in the window, so it is never visible.
+    hidden_pane = VmPane(window, VM)
+    hidden_pane.set_visible(False)
+    hidden = not hidden_pane.is_visible()
+    keeps_timer = hidden_pane._poll_logs(hidden_pane._log_source)
+    hidden_pane.close()
+    if hidden and keeps_timer:
+        exercised.append("a hidden pane keeps its log timer")
+        print("  \033[32mPASS\033[0m  a hidden pane keeps its log timer")
+    else:
+        failures.append((
+            "hidden log poll",
+            f"pane visible {not hidden}, poll kept its timer {keeps_timer}",
+        ))
+        print(
+            "  \033[31mFAIL\033[0m  a hidden pane stopped watching its log"
+        )
+
+    # ---- switching away must not stop the log for good ----
+    other = next((n for n in window.order if n != VM), None)
+    if other:
+        rebuild_pane(window, VM)
+        window.select_vm(VM)
+        before = window.panes[VM]._log_tag
+        window.select_vm(other)
+        window.select_vm(VM)
+        tag = window.panes[VM]._log_tag
+        if before and tag == before:
+            exercised.append("the log timer survives switching away and back")
+            print("  \033[32mPASS\033[0m  the log timer survives switching away and back")
+        else:
+            failures.append((
+                "log timer",
+                f"timer {before} before switching, {tag} after",
+            ))
+            print(
+                "  \033[31mFAIL\033[0m  the log timer did not survive switching "
+                f"away and back ({before} -> {tag})"
+            )
+        settle()
+
     # ---- adding a custom forward, pressed the way a user presses it ----
     # Calling the handler with no arguments is not enough: GTK hands the
     # button to "clicked", so a zero-argument handler dies on the press and
@@ -558,6 +680,26 @@ def _probe(app) -> None:
     prompt.entry.set_text("guicheck")
     prompt.accept_button.emit("clicked")
     check("TextPrompt returns the typed text", lambda: _assert(typed == ["guicheck"], typed))
+
+    # ---- closing the window is the one thing that does stop a log timer ----
+    # Kept out of the sweep above, and asserted here on a pane that is known to
+    # be watching: a timer left running past app shutdown keeps the VM name and
+    # its callback alive for nothing.
+    watching = [n for n, p in window.panes.items() if p._log_tag]
+    window._on_close(None)
+    still_watching = [n for n, p in window.panes.items() if p._log_tag]
+    if watching and not still_watching:
+        exercised.append("closing the window stops every log timer")
+        print("  \033[32mPASS\033[0m  closing the window stops every log timer")
+    else:
+        failures.append((
+            "log timers outlived the window",
+            f"watching {watching} before close, {still_watching} after",
+        ))
+        print(
+            "  \033[31mFAIL\033[0m  log timers outlived the window close "
+            f"({watching} -> {still_watching})"
+        )
 
     lifecycle.stop(VM, force=True)
     lifecycle.remove(VM)
