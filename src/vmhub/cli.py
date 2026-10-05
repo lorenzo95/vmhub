@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import autostart, blueprints, disk, export, iso as isomod, lifecycle, paths, podman, ports, rdp, registry, spec
-from .errors import VmhubError
+from .errors import ProjectRootError, VmhubError
 
 DIM = "\033[2m"
 BOLD = "\033[1m"
@@ -783,8 +783,16 @@ def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
         m for m in ("gi", "gi.repository.Gtk")
         if importlib.util.find_spec(m) is None
     ]
+    # doctor exists to report a broken environment, so it must survive the one
+    # condition it is here to diagnose: resolve the root once, then degrade.
+    root_problem = ""
+    try:
+        root = paths.project_root()
+    except ProjectRootError as exc:
+        root = None
+        root_problem = str(exc)
     checks = [
-        ("project root", str(paths.project_root())),
+        ("project root", "NOT FOUND: " + root_problem if root_problem else str(root)),
         ("podman", podman.version() if shutil.which("podman") else "NOT FOUND"),
         ("podman rootless", "yes" if podman.is_rootless() else "NO - containers run as root"),
         ("oci runtime", runtime_note),
@@ -793,9 +801,9 @@ def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
         ("qemu-img", disk.binary_version()),
         ("host /dev/kvm", "readable" if podman.host_has_kvm() else "NOT ACCESSIBLE"),
         ("python gi/gtk", "importable" if not gui_missing else f"MISSING: {', '.join(gui_missing)}"),
-        ("free space", spec.format_size(os.statvfs(paths.project_root()).f_bavail * os.statvfs(paths.project_root()).f_frsize)),
+        ("free space", spec.format_size(os.statvfs(root).f_bavail * os.statvfs(root).f_frsize) if root else ""),
         ("init system", autostart.detect_init()),
-        ("vms", str(len(registry.all_names()))),
+        ("vms", str(len(registry.all_names())) if root else ""),
     ]
     for label, value in checks:
         bad = "NOT" in str(value) or str(value) == "no" or "MISSING" in str(value)
@@ -805,6 +813,12 @@ def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
         out.say(out.dim(
             "                   --group-add keep-groups needs crun: apt-get install crun"
         ))
+    if root_problem:
+        # Every check below enumerates VMs through the project root, so running
+        # them would only repeat this same failure. Report and exit non-zero.
+        out.say()
+        out.say(out.bad(f"{problems} problem(s)"))
+        return 1
     for entry in podman.orphans():
         problems += 1
         out.say(

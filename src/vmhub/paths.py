@@ -3,12 +3,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .errors import ProjectRootError
+
 ENV_HOME = "VMHUB_HOME"
 DEFAULT_HOME = "~/vms"
 
 BLUEPRINTS_DIR = "blueprints"
-SYSTEMD_DIR = "systemd"
-SYSVINIT_DIR = "sysvinit"
 DISK_SUBDIR = "disk"
 STORAGE_SUBDIR = "storage"
 SPEC_FILE = "vm.toml"
@@ -23,7 +23,17 @@ NVRAM_STEM = "uefi"
 DRIVERS_ISO = "drivers.iso"
 START_ISO = "start.iso"
 
-PROJECT_MARKERS = ("systemd", "sysvinit", "blueprints")
+# Detection is by content, not by directory name: both markers are tracked in
+# git, so a fresh clone resolves. The empty systemd/ and sysvinit/ directories
+# never survive a clone, so depending on them broke every command.
+PROJECT_MARKER_DIRS = (BLUEPRINTS_DIR,)
+PROJECT_MARKER_FILES = ("vmctl",)
+
+
+def _is_project_root(path: Path) -> bool:
+    return all((path / name).is_dir() for name in PROJECT_MARKER_DIRS) and all(
+        (path / name).is_file() for name in PROJECT_MARKER_FILES
+    )
 
 
 def project_root() -> Path:
@@ -32,20 +42,26 @@ def project_root() -> Path:
         root = Path(env).expanduser().resolve()
     else:
         root = _discover(Path.cwd())
-    if not (root / SYSTEMD_DIR).is_dir():
-        raise FileNotFoundError(f"not a vmhub project root: {root}")
+    if not _is_project_root(root):
+        raise ProjectRootError(
+            f"not a vmhub project root: {root} "
+            f"(expected a directory containing blueprints/ and vmctl)"
+        )
     return root
 
 
 def _discover(start: Path) -> Path:
-    candidate = start
     for candidate in (start, *start.parents):
-        if all((candidate / marker).is_dir() for marker in PROJECT_MARKERS):
+        if _is_project_root(candidate):
             return candidate
+    # ~/vms is the documented convention, not a requirement, but honour it so a
+    # user running vmctl from an unrelated directory still finds the checkout.
     fallback = Path(DEFAULT_HOME).expanduser()
-    if (fallback / SYSTEMD_DIR).is_dir():
+    if _is_project_root(fallback):
         return fallback
-    return candidate
+    # Return where the user actually was: the filesystem root is a far more
+    # confusing thing to report back than the directory they ran the command in.
+    return start
 
 
 def vm_dir(vm: str) -> Path:

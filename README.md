@@ -100,6 +100,8 @@ VMs — they never touch VMs you have created.
 
 ## Quick start
 
+The checkout can live anywhere and its name does not matter: vmhub locates itself by walking up from the current directory until it finds `blueprints/` and `vmctl`, or from `$VMHUB_HOME` if you set it.
+
 ```bash
 cd ~/vms
 

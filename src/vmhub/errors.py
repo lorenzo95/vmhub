@@ -48,3 +48,7 @@ class AlreadyExists(VmhubError):
 
 class NotFound(VmhubError):
     pass
+
+
+class ProjectRootError(VmhubError):
+    pass

@@ -4,6 +4,9 @@
 # by accident.
 /*
 
+# systemd/ and sysvinit/ hold the autostart templates and stay un-ignored on
+# purpose. Project-root detection no longer depends on them: it keys off
+# blueprints/ and vmctl, because empty directories never survive a clone.
 !/src/
 !/blueprints/
 !/systemd/
