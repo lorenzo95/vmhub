@@ -289,6 +289,13 @@ def _probe(app) -> None:
             exercised.append(label)
             print(f"  \033[32mPASS\033[0m  {label}")
 
+    def _walk(widget):
+        yield widget
+        child = widget.get_first_child()
+        while child is not None:
+            yield from _walk(child)
+            child = child.get_next_sibling()
+
     # The ports table and the details grid moved off Hardware and Console
     # onto an Info tab of their own.
     pane = window.panes[VM]
@@ -302,6 +309,47 @@ def _probe(app) -> None:
     else:
         exercised.append("the Info tab exists")
         print("  \033[32mPASS\033[0m  the Info tab exists")
+    # The Actions tab is gone; what it held now lives where it is used.
+    if "Actions" in titles:
+        failures.append(("Actions tab still there", str(titles)))
+        print("  \033[31mFAIL\033[0m  the Actions tab is still present")
+    else:
+        exercised.append("the Actions tab is gone")
+        print("  \033[32mPASS\033[0m  the Actions tab is gone")
+    hardware = (
+        {
+            w.get_label()
+            for w in _walk(pane.notebook.get_nth_page(titles.index("Hardware")))
+            if isinstance(w, Gtk.Button)
+        }
+        if "Hardware" in titles
+        else set()
+    )
+    missing = {"Clone\u2026", "Mark as template", "Export bundle\u2026"} - hardware
+    if missing:
+        failures.append((
+            "Hardware lost a button",
+            f"missing {sorted(missing)}, found {sorted(hardware)}",
+        ))
+        print(f"  \033[31mFAIL\033[0m  Hardware is missing {sorted(missing)}")
+    else:
+        exercised.append("Clone, template and Export live on Hardware")
+        print("  \033[32mPASS\033[0m  Clone, template and Export live on Hardware")
+
+    # A notice is a row of its own, and its action sits on that row rather
+    # than in a paragraph somewhere above it.
+    plain = pane._notice_row(lifecycle.Notice("just so you know"))
+    actioned = pane._notice_row(lifecycle.Notice("fixable", action="finish-install"))
+    if plain.get_first_child().get_next_sibling() is not None:
+        failures.append(("notice row", "a notice with no action grew a button"))
+        print("  \033[31mFAIL\033[0m  a notice with no action grew a button")
+    elif actioned.get_first_child().get_next_sibling() is None:
+        failures.append(("notice row", "the actionable notice has no button"))
+        print("  \033[31mFAIL\033[0m  the actionable notice has no button")
+    else:
+        exercised.append("a notice carries its own action")
+        print("  \033[32mPASS\033[0m  a notice carries its own action")
+
     if not pane.ports_box.get_first_child() and not pane.roles_box.get_first_child():
         failures.append(("ports table empty", "the Info tab drew no port rows"))
         print("  \033[31mFAIL\033[0m  the Info tab drew no port rows")

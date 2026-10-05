@@ -570,6 +570,13 @@ def main() -> int:
     lifecycle.remove(linked_kid)
 
     section("finish install and live media")
+    check("a Notice is still a plain string, so the CLI and the tests are unchanged",
+          isinstance(lifecycle.Notice("plain"), str)
+          and lifecycle.Notice("plain") == "plain"
+          and lifecycle.Notice("plain", action="x") == "plain")
+    check("and it carries an action only when one is given",
+          lifecycle.Notice("plain").action == ""
+          and lifecycle.Notice("x", action="finish-install").action == "finish-install")
     lifecycle.start(VM)
     check("running VM exposes live media", isinstance(lifecycle.live_media(VM), list))
     check("running VM is not drifted when just started", not lifecycle.status(VM).drifted)
@@ -1095,6 +1102,10 @@ def main() -> int:
     check("and the advice is shown in the same refresh",
           any("install ISO" in n for n in lifecycle.status(fi).notices),
           str(lifecycle.status(fi).notices))
+    check("and the GUI is told which action resolves it",
+          any(getattr(n, "action", "") == "finish-install"
+              for n in lifecycle.status(fi).notices),
+          str([getattr(n, "action", "") for n in lifecycle.status(fi).notices]))
     fi_spec = registry.load_spec(fi)
     fi_spec.media.install = ""
     registry.save_spec(fi_spec)

@@ -27,6 +27,22 @@ def _noop(message: str) -> None:
     pass
 
 
+class Notice(str):
+    """A status note, and the action that resolves it where one exists.
+
+    Subclasses str so it keeps printing and comparing exactly as the plain
+    strings it replaces -- the CLI prints these and the tests match on
+    substrings -- while carrying what the GUI can offer inline.
+    """
+
+    action: str
+
+    def __new__(cls, text: str, action: str = "") -> "Notice":
+        obj = super().__new__(cls, text)
+        obj.action = action
+        return obj
+
+
 @dataclass
 class VmStatus:
     name: str
@@ -59,7 +75,7 @@ class VmStatus:
     live_media: list[str] = field(default_factory=list)
     drifted: bool = False
     finish_install_needed: bool = False
-    notices: list[str] = field(default_factory=list)
+    notices: list[Notice] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -734,16 +750,18 @@ def status(vm: str, *, ctx: Ctx | None = None) -> VmStatus:
         )
     if "install ISO" in result.live_media:
         where = "the RUNNING VM" if result.powered else "vm.toml"
-        result.notices.append(
+        result.notices.append(Notice(
             f"an install ISO is attached in {where} and boots before the disk; "
             f"run: vmctl finish-install {vm}"
-            + (" then restart it" if result.powered else "")
-        )
+            + (" then restart it" if result.powered else ""),
+            action="finish-install",
+        ))
     if vm_spec.media.install and "install ISO" not in result.live_media:
-        result.notices.append(
+        result.notices.append(Notice(
             "an install ISO is attached and will boot before the disk; "
-            f"run vmctl finish-install {vm} once the guest is installed"
-        )
+            f"run vmctl finish-install {vm} once the guest is installed",
+            action="finish-install",
+        ))
     if vm_spec.media.install and vm_spec.boot.iso:
         result.notices.append(
             f"both an attached ISO and boot.iso={vm_spec.boot.iso!r} are set — "
@@ -753,10 +771,11 @@ def status(vm: str, *, ctx: Ctx | None = None) -> VmStatus:
         paths.storage_dir(vm) / "boot.iso"
     ).is_file()
     if cached_fallback:
-        result.notices.append(
+        result.notices.append(Notice(
             "a cached fallback image is still attached as the last boot device; "
-            f"finish-install it below (or vmctl finish-install {vm}) to remove it"
-        )
+            f"finish-install it below (or vmctl finish-install {vm}) to remove it",
+            action="finish-install",
+        ))
     # Same conditions as the notices above, so the GUI button and the
     # advice never disagree. A fresh alpine VM sets boot.iso on purpose
     # and has nothing to detach, so it is deliberately not offered.

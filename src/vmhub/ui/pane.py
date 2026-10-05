@@ -45,7 +45,6 @@ class VmPane(Gtk.Box):
         self._build_hardware_tab()
         self._build_info_tab()
         self._build_snapshots_tab()
-        self._build_actions_tab()
         self._build_logs_tab()
 
     def _build_header(self) -> None:
@@ -177,21 +176,8 @@ class VmPane(Gtk.Box):
         media_hint.set_xalign(0.0)
         box.append(media_hint)
 
-        self.media_notice = Gtk.Label()
-        self.media_notice.add_css_class("hint")
-        self.media_notice.set_wrap(True)
-        self.media_notice.set_xalign(0.0)
-        box.append(self.media_notice)
-        self.finish_install_button = Gtk.Button(label="Finish install")
-        self.finish_install_button.add_css_class("suggested-action")
-        self.finish_install_button.set_halign(Gtk.Align.START)
-        self.finish_install_button.set_tooltip_text(
-            "Detach any install ISO and drop the cached fallback image, so this "
-            "VM boots from its disk and nothing else"
-        )
-        self.finish_install_button.set_visible(False)
-        self.finish_install_button.connect("clicked", self._on_finish_install)
-        box.append(self.finish_install_button)
+        self.notice_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.append(self.notice_box)
 
         self.iso_rows: dict[str, dict[str, object]] = {}
         for slot in (isomod.INSTALL_SLOT, isomod.DRIVERS_SLOT):
@@ -317,6 +303,39 @@ class VmPane(Gtk.Box):
             return False
 
         widgets.run_task(self.window, work, on_done=done, label="Testing RDP")
+
+    def _refresh_notices(self, notices: list) -> None:
+        """One row per notice, with the action that resolves it on the row.
+
+        A wall of text said something was wrong and then, further down,
+        offered the fix. Putting the button on the line that says what is
+        wrong puts the two together, and a notice with no action still
+        gets a row of its own instead of a line in a paragraph.
+        """
+        self._clear_box(self.notice_box)
+        for note in notices:
+            self.notice_box.append(self._notice_row(note))
+        self.notice_box.set_visible(bool(notices))
+
+    def _notice_row(self, note) -> Gtk.Widget:
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        text = Gtk.Label(label=str(note))
+        text.add_css_class("hint")
+        text.set_wrap(True)
+        text.set_xalign(0.0)
+        text.set_hexpand(True)
+        row.append(text)
+        if getattr(note, "action", "") == "finish-install":
+            button = Gtk.Button(label="Finish install")
+            button.add_css_class("suggested-action")
+            button.set_tooltip_text(
+                "Detach any install ISO and drop the cached fallback image, so this "
+                "VM boots from its disk and nothing else"
+            )
+            button.set_valign(Gtk.Align.START)
+            button.connect("clicked", self._on_finish_install)
+            row.append(button)
+        return row
 
     @staticmethod
     def _clear_box(box: Gtk.Box) -> None:
@@ -808,6 +827,30 @@ class VmPane(Gtk.Box):
         apply_hint.set_xalign(0.0)
         box.append(apply_hint)
 
+        box.append(widgets.section("Copies of this VM"))
+        self.template_hint = Gtk.Label()
+        self.template_hint.set_wrap(True)
+        self.template_hint.set_xalign(0.0)
+        self.template_hint.add_css_class("hint")
+        box.append(self.template_hint)
+        share_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.clone_button = Gtk.Button(label="Clone…")
+        self.clone_button.set_tooltip_text("Clone this VM (uses its disk as the source)")
+        self.clone_button.connect("clicked", self._on_clone)
+        self.template_button = Gtk.Button(label="Mark as template")
+        self.template_button.connect("clicked", self._on_toggle_template)
+        export_button = Gtk.Button(label="Export bundle…")
+        export_button.set_tooltip_text(
+            "Write a self-contained bundle -- standalone disk, manifest, checksums "
+            "-- that another machine can import"
+        )
+        export_button.connect("clicked", self._on_export)
+        share_row.append(self.clone_button)
+        share_row.append(self.template_button)
+        share_row.append(export_button)
+        share_row.set_halign(Gtk.Align.START)
+        box.append(share_row)
+
         self._add_tab("Hardware", widgets.scroll(box))
 
     def _build_info_tab(self) -> None:
@@ -869,71 +912,6 @@ class VmPane(Gtk.Box):
         self.snapshot_list.add_css_class("vmlist")
         box.append(widgets.scroll(self.snapshot_list))
         self._add_tab("Snapshots", box)
-
-    def _build_actions_tab(self) -> None:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        box.set_margin_top(14)
-        box.set_margin_bottom(14)
-        box.set_margin_start(14)
-        box.set_margin_end(14)
-
-        box.append(widgets.section("Template"))
-        self.template_hint = Gtk.Label()
-        self.template_hint.set_wrap(True)
-        self.template_hint.set_xalign(0.0)
-        self.template_hint.add_css_class("hint")
-        box.append(self.template_hint)
-        tmpl_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.template_button = Gtk.Button(label="Mark as template")
-        self.template_button.connect("clicked", self._on_toggle_template)
-        self.clone_button = Gtk.Button(label="Clone…")
-        self.clone_button.set_tooltip_text("Clone this VM (uses its disk as the source)")
-        self.clone_button.connect("clicked", self._on_clone)
-        rebase_button = Gtk.Button(label="Rebase clones")
-        rebase_button.set_tooltip_text(
-            "Repoint every clone of this template at the template's current disk"
-        )
-        rebase_button.connect("clicked", self._on_rebase)
-        tmpl_row.append(self.template_button)
-        tmpl_row.append(self.clone_button)
-        tmpl_row.append(rebase_button)
-        tmpl_row.set_halign(Gtk.Align.START)
-        box.append(tmpl_row)
-
-        box.append(widgets.section("Portability"))
-        port_hint = Gtk.Label(
-            label="Export writes a self-contained bundle (standalone disk, manifest, "
-            "checksums) that can be imported on another machine. Flatten resolves a "
-            "clone's backing chain in place so it no longer depends on its template."
-        )
-        port_hint.set_wrap(True)
-        port_hint.set_xalign(0.0)
-        port_hint.add_css_class("hint")
-        box.append(port_hint)
-        port_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        export_button = Gtk.Button(label="Export bundle…")
-        export_button.connect("clicked", self._on_export)
-        flatten_button = Gtk.Button(label="Make portable (flatten)")
-        flatten_button.connect("clicked", self._on_flatten)
-        import_button = Gtk.Button(label="Import bundle…")
-        import_button.connect("clicked", self._on_import)
-        for button in (export_button, flatten_button, import_button):
-            port_row.append(button)
-        port_row.set_halign(Gtk.Align.START)
-        box.append(port_row)
-
-        box.append(widgets.section("Danger zone"))
-        self.danger_hint = Gtk.Label()
-        self.danger_hint.set_wrap(True)
-        self.danger_hint.set_xalign(0.0)
-        self.danger_hint.add_css_class("hint")
-        box.append(self.danger_hint)
-        delete_button = Gtk.Button(label="Delete VM…")
-        delete_button.add_css_class("destructive-action")
-        delete_button.set_halign(Gtk.Align.START)
-        delete_button.connect("clicked", self._on_delete)
-        box.append(delete_button)
-        self._add_tab("Actions", widgets.scroll(box))
 
     def _build_logs_tab(self) -> None:
         self.log_view = Gtk.TextView()
@@ -1013,8 +991,7 @@ class VmPane(Gtk.Box):
             detail = row["detail"]
             detail.set_text("unknown")
             row["detach"].set_sensitive(False)
-        self.media_notice.set_visible(False)
-        self.finish_install_button.set_visible(False)
+        self._clear_box(self.notice_box)
         _replace_grid(self.details_grid, [])
         self._clear_box(self.roles_box)
         self._clear_box(self.ports_box)
@@ -1105,12 +1082,7 @@ class VmPane(Gtk.Box):
             )
 
         self._refresh_iso_rows()
-        notices = list(getattr(status, "notices", []))
-        self.media_notice.set_text("\n".join(notices))
-        self.media_notice.set_visible(bool(notices))
-        self.finish_install_button.set_visible(
-            bool(getattr(status, "finish_install_needed", False))
-        )
+        self._refresh_notices(list(getattr(status, "notices", [])))
 
         self._refresh_ports()
 
@@ -1165,20 +1137,17 @@ class VmPane(Gtk.Box):
             self.template_button.set_label("Mark as template")
             if status.template_source:
                 self.template_hint.set_text(
-                    f"This VM is a clone of {status.template_source}. Flatten it to become "
-                    "independent, or delete it — the template disk is shared until then."
+                    f"This VM is a linked clone of {status.template_source}, and shares its "
+                    f"disk until that one is deleted — deleting {status.template_source} "
+                    "makes this clone standalone rather than breaking it."
                 )
             else:
                 self.template_hint.set_text(
-                    "Mark this VM as a template to make instant, copy-on-write clones from it. "
-                    "Stop it first."
+                    "Mark this VM as a template to make instant, copy-on-write clones from "
+                    "it. Stop it first. A linked clone shares this disk, so this VM cannot "
+                    "run while one does."
                 )
 
-        self.danger_hint.set_text(
-            f"Deleting removes the VM, its container and its disk. "
-            f"A clone costs almost nothing on disk, so deleting a clone never touches the "
-            f"template."
-        )
         self.error_label.set_text("  ".join(status.errors))
         self.error_label.set_visible(bool(status.errors))
 
@@ -1432,25 +1401,6 @@ class VmPane(Gtk.Box):
             on_accept=accept,
         )
 
-    def _on_rebase(self, _button) -> None:
-        widgets.run_task(
-            self.window,
-            lambda progress: lifecycle.rebase_all(self.vm, progress=progress),
-            label="Rebasing clones",
-            on_done=lambda updated: self.window.report(
-                f"Rebased {len(updated)} clone(s) onto {self.vm}"
-                if updated
-                else "No clones to rebase"
-            ),
-        )
-
-    def _on_flatten(self, _button) -> None:
-        widgets.run_task(
-            self.window,
-            lambda progress: lifecycle.flatten(self.vm, progress=progress),
-            label="Flattening",
-        )
-
     def _on_finish_install(self, _button) -> None:
         widgets.run_task(
             self.window,
@@ -1470,28 +1420,6 @@ class VmPane(Gtk.Box):
             label="Exporting bundle",
             on_done=lambda path: self.window.report(f"Exported to {path}"),
         )
-
-    def _on_import(self, _button) -> None:
-        chooser = Gtk.FileDialog()
-        chooser.set_title("Import a vmhub bundle")
-        chooser.set_filters(
-            widgets.filter_store("vmhub bundles", ["*.vmhub.tar.gz"])
-        )
-
-        def on_open(source, result) -> None:
-            try:
-                selected = chooser.open_finish(result)
-            except Exception:
-                return
-            path = selected.get_path()
-            widgets.run_task(
-                self.window,
-                lambda progress: export.import_bundle(path, progress=progress),
-                label="Importing bundle",
-                on_done=lambda name: self.window.select_vm(name),
-            )
-
-        chooser.open(self.window, None, on_open)
 
     def _on_delete(self, _button) -> None:
         dialog = Gtk.AlertDialog(
