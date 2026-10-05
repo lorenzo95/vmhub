@@ -218,6 +218,57 @@ def main() -> int:
     lifecycle.delete_snapshot(VM, "clean2")
     check("live snapshot delete works", "clean2" not in disk.snapshot_names(disk_file))
 
+    section("snapshots remember their power state")
+    power_vm = f"{VM}-power"
+    lifecycle.create(power_vm, blueprint="alpine")
+    power_disk = paths.disk_path(power_vm)
+
+    # Powered off. This used to raise VmNotRunning outright.
+    lifecycle.take_snapshot(power_vm, "off")
+    check("a stopped VM can be snapshotted",
+          "off" in disk.snapshot_names(power_disk),
+          str(disk.snapshot_names(power_disk)))
+    check("its power state is recorded as off",
+          registry.load_meta(power_vm).snapshot_power.get("off") is False,
+          str(registry.load_meta(power_vm).snapshot_power))
+
+    # Powered on.
+    lifecycle.start(power_vm)
+    lifecycle.take_snapshot(power_vm, "on")
+    check("a running VM records its power state as on",
+          registry.load_meta(power_vm).snapshot_power.get("on") is True,
+          str(registry.load_meta(power_vm).snapshot_power))
+    lifecycle.stop(power_vm)
+
+    # Reverting to the 'on' snapshot from a stopped VM powers it back up.
+    lifecycle.revert(power_vm, "on")
+    check("reverting to a running snapshot powers the VM back on",
+          podman.state(power_vm) == "running", podman.state(power_vm))
+
+    # An explicit override still wins over the recorded state. Done while
+    # 'on' is still the newest snapshot, because reverting to 'off'
+    # discards everything taken after it.
+    lifecycle.revert(power_vm, "on", restart=False)
+    check("an explicit restart=False overrides the recorded state",
+          podman.state(power_vm) != "running", podman.state(power_vm))
+
+    # Reverting to the 'off' snapshot leaves it off, and discards 'on'.
+    lifecycle.revert(power_vm, "off")
+    check("reverting to a powered-off snapshot leaves it off",
+          podman.state(power_vm) != "running", podman.state(power_vm))
+    check("reverting to an older snapshot discarded the newer one",
+          "on" not in disk.snapshot_names(power_disk),
+          str(disk.snapshot_names(power_disk)))
+    check("and its recorded power state went with it",
+          "on" not in registry.load_meta(power_vm).snapshot_power,
+          str(registry.load_meta(power_vm).snapshot_power))
+
+    # Deleting the last snapshot forgets its state too.
+    lifecycle.delete_snapshot(power_vm, "off")
+    check("deleting a snapshot forgets its power state",
+          "off" not in registry.load_meta(power_vm).snapshot_power,
+          str(registry.load_meta(power_vm).snapshot_power))
+
     section("template and clone")
     lifecycle.stop(VM)
     lifecycle.mark_template(VM)
@@ -972,6 +1023,7 @@ def main() -> int:
     section("cleanup")
     for name in (
         f"{VM}-stop", f"{VM}-rival", f"{VM}-stale", f"{VM}-clone2",
+        f"{VM}-power",
         f"{VM}-secret", f"{VM}-fresh", f"{VM}-chosen", f"{VM}-roundtrip",
         f"{VM}-finishinstall",
         f"{VM}-clone", f"{VM}-linked-import", f"{VM}-libvirt",

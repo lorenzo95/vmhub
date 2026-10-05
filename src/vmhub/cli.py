@@ -309,7 +309,14 @@ def cmd_revert(args: argparse.Namespace, out: Out) -> int:
     ):
         out.say("aborted")
         return 1
-    lifecycle.revert(args.name, args.snapshot, progress=out.step, restart=not args.no_restart)
+    lifecycle.revert(
+        args.name,
+        args.snapshot,
+        progress=out.step,
+        # None follows the snapshot's recorded power state; --no-restart
+        # is the explicit override.
+        restart=False if args.no_restart else None,
+    )
     return 0
 
 

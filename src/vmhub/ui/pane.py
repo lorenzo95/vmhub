@@ -633,11 +633,14 @@ class VmPane(Gtk.Box):
             else "Clone this VM (uses its disk as the source)"
         )
         self.guest_button.set_visible(running)
-        self.snapshot_button.set_sensitive(running)
+        # Not gated on running any more: a powered-off VM can be
+        # snapshotted offline, which is exactly when a clean install is
+        # worth protecting.
+        self.snapshot_button.set_sensitive(bool(status.has_disk))
         self.snapshot_button.set_tooltip_text(
             "Take an instantaneous copy-on-write snapshot"
             if running
-            else "Start the VM to take a live snapshot"
+            else "Snapshot the disk as it is, with the VM powered off"
         )
 
         if self.cpu_spin.get_value() != status.cpus:

@@ -156,6 +156,19 @@ def create_overlay(path: Path, backing: Path, *, backing_fmt: str = "qcow2") -> 
     )
 
 
+def create_snapshot(path: Path, name: str) -> None:
+    """Take an internal snapshot with the VM stopped.
+
+    QMP is the right tool while QEMU holds the image, but it has nothing
+    to talk to once the container is stopped, so this goes through
+    qemu-img instead.
+
+    No -U here: it is not a global option (it must follow the subcommand)
+    and it only applies to read-only images, which a snapshot is not.
+    """
+    run(["snapshot", "-c", name, str(path)], timeout=300)
+
+
 def apply_snapshot(path: Path, name: str) -> None:
     if name not in snapshot_names(path):
         raise NotFound(f"no such snapshot: {name} in {path}")

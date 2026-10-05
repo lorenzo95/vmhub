@@ -25,6 +25,9 @@ class VmMeta:
     template_source: str | None = None
     dependents: list[str] = field(default_factory=list)
     last_run_state: str = "stopped"
+    # snapshot name -> whether the VM was powered on when it was taken,
+    # so revert can restore that state the way VMware does.
+    snapshot_power: dict[str, bool] = field(default_factory=dict)
     notes: str = ""
     # Set when meta.json could not be read; never persisted.
     broken: bool = False
