@@ -147,6 +147,20 @@ X-GNOME-Autostart-enabled=true
     )
 
 
+def _enable_failure(result: subprocess.CompletedProcess) -> str:
+    """Explain a failed `systemctl --user enable` in one readable line.
+
+    Kept separate so it can be tested without touching systemctl. The
+    obvious one-liner here is a str + list TypeError, which is what this
+    used to be: it fired on every host with no systemd user session, so
+    exactly the machines most likely to hit it never saw the advice.
+    """
+    detail = (result.stderr or result.stdout).strip().splitlines()
+    return "could not enable automatically: " + (
+        detail[-1] if detail else "systemctl gave no explanation"
+    )
+
+
 def install(*, target: str | None = None, gui: bool = False) -> list[str]:
     chosen = target or detect_init()
     done: list[str] = []
@@ -166,10 +180,7 @@ def install(*, target: str | None = None, gui: bool = False) -> list[str]:
             if result.returncode == 0:
                 done.append("enabled and started vmhub.service")
             else:
-                done.append(
-                    "could not enable automatically: "
-                    + (result.stderr or result.stdout).strip().splitlines()[-1:]
-                )
+                done.append(_enable_failure(result))
                 done.append(f"run manually: systemctl --user enable --now {SYSTEMD_UNIT_NAME}")
         else:
             done.append("systemctl not found; unit written but not enabled")

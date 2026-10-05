@@ -791,24 +791,37 @@ def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
     except ProjectRootError as exc:
         root = None
         root_problem = str(exc)
+    # Each row carries its own verdict. Deriving it from the rendered text,
+    # as "NOT" in value or value == "no" did, passed a root podman: the
+    # row reads "NO - containers run as root", which matches none of those
+    # substrings, so the worst outcome for a rootless tool read as healthy.
+    # It also flagged any innocent value containing those words.
+    try:
+        qemu_img, qemu_img_ok = disk.binary_version(), True
+    except VmhubError as exc:
+        # Used to propagate out of cmd_doctor entirely, so a missing
+        # qemu-img aborted the table instead of being reported in it.
+        qemu_img, qemu_img_ok = str(exc), False
+    has_podman = shutil.which("podman") is not None
+    rootless = podman.is_rootless()
+    has_kvm = podman.host_has_kvm()
     checks = [
-        ("project root", "NOT FOUND: " + root_problem if root_problem else str(root)),
-        ("podman", podman.version() if shutil.which("podman") else "NOT FOUND"),
-        ("podman rootless", "yes" if podman.is_rootless() else "NO - containers run as root"),
-        ("oci runtime", runtime_note),
-        ("uidmap", "installed" if not helpers else f"MISSING: {', '.join(helpers)}"),
-        ("rootless net", net_helper or "MISSING: passt (or slirp4netns)"),
-        ("qemu-img", disk.binary_version()),
-        ("host /dev/kvm", "readable" if podman.host_has_kvm() else "NOT ACCESSIBLE"),
-        ("python gi/gtk", "importable" if not gui_missing else f"MISSING: {', '.join(gui_missing)}"),
-        ("free space", spec.format_size(os.statvfs(root).f_bavail * os.statvfs(root).f_frsize) if root else ""),
-        ("init system", autostart.detect_init()),
-        ("vms", str(len(registry.all_names())) if root else ""),
+        ("project root", "NOT FOUND: " + root_problem if root_problem else str(root), root is not None),
+        ("podman", podman.version() if has_podman else "NOT FOUND", has_podman),
+        ("podman rootless", "yes" if rootless else "NO - containers run as root", rootless),
+        ("oci runtime", runtime_note, runtime != "NOT FOUND"),
+        ("uidmap", "installed" if not helpers else f"MISSING: {', '.join(helpers)}", not helpers),
+        ("rootless net", net_helper or "MISSING: passt (or slirp4netns)", bool(net_helper)),
+        ("qemu-img", qemu_img, qemu_img_ok),
+        ("host /dev/kvm", "readable" if has_kvm else "NOT ACCESSIBLE", has_kvm),
+        ("python gi/gtk", "importable" if not gui_missing else f"MISSING: {', '.join(gui_missing)}", not gui_missing),
+        ("free space", spec.format_size(os.statvfs(root).f_bavail * os.statvfs(root).f_frsize) if root else "", True),
+        ("init system", autostart.detect_init(), True),
+        ("vms", str(len(registry.all_names())) if root else "", True),
     ]
-    for label, value in checks:
-        bad = "NOT" in str(value) or str(value) == "no" or "MISSING" in str(value)
-        problems += 1 if bad else 0
-        out.say(f"  {label:16s} {out.bad(value) if bad else value}")
+    for label, value, ok in checks:
+        problems += 0 if ok else 1
+        out.say(f"  {label:16s} {value if ok else out.bad(value)}")
     if runtime not in {"crun", "NOT FOUND", ""}:
         out.say(out.dim(
             "                   --group-add keep-groups needs crun: apt-get install crun"

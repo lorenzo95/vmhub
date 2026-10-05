@@ -17,7 +17,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from vmhub import disk, export, iso as isomod, libvirt, lifecycle, paths, podman, ports, qga, rdp, registry, spec  # noqa: E402
+from vmhub import (  # noqa: E402
+    autostart,
+    cli,
+    disk,
+    export,
+    iso as isomod,
+    libvirt,
+    lifecycle,
+    paths,
+    podman,
+    ports,
+    qga,
+    rdp,
+    registry,
+    spec,
+)
 from vmhub.errors import VmhubError  # noqa: E402
 
 VM = "vmhub-selftest"
@@ -916,6 +931,43 @@ def main() -> int:
     fi_actions = lifecycle.finish_install(fi)
     check("finish-install is a no-op on a clean VM",
           fi_actions == [], str(fi_actions))
+
+    section("honest failure messages")
+    class _Result:
+        returncode = 1
+        stderr = "Failed to connect to bus: No such file or directory\n"
+        stdout = ""
+    line = autostart._enable_failure(_Result())
+    check("a failed enable yields a string, not a list", isinstance(line, str), repr(line))
+    check("a failed enable surfaces the real reason",
+          "No such file" in line, line)
+    _Result.stderr = ""
+    _Result.stdout = ""
+    silent = autostart._enable_failure(_Result())
+    check("a silent failure still yields a readable string",
+          isinstance(silent, str) and "could not enable" in silent, repr(silent))
+
+    # The old verdict was `"NOT" in value or value == "no"`, which the
+    # rootless row defeated with the string "NO - containers run as root".
+    # Faking that one condition proves the row is now really judged.
+    import argparse as _argparse
+    import contextlib as _contextlib
+    import io as _io
+
+    real_rootless = podman.is_rootless
+    podman.is_rootless = lambda: False
+    try:
+        doctor_buf = _io.StringIO()
+        with _contextlib.redirect_stdout(doctor_buf):
+            doctor_rc = cli.cmd_doctor(_argparse.Namespace(), cli.Out())
+    finally:
+        podman.is_rootless = real_rootless
+    doctor_text = doctor_buf.getvalue()
+    check("doctor names the root-podman condition",
+          "NO - containers run as root" in doctor_text, doctor_text[:160])
+    check("doctor exits non-zero for a root podman", doctor_rc != 0, str(doctor_rc))
+    check("doctor does not claim all good in that case",
+          "all good" not in doctor_text, doctor_text[-140:])
 
     section("cleanup")
     for name in (
