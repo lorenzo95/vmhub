@@ -6,6 +6,8 @@ from __future__ import annotations
 import sys
 import time
 import ast
+import contextlib
+import io
 import configparser
 import json
 import os
@@ -307,6 +309,13 @@ def main() -> int:
     check("no longer marked as a clone", registry.load_meta(f"{VM}-clone").template_source is None)
 
     section("export and import")
+    # A port the user added has to survive the trip. The bundle keeps the
+    # entry and drops only the host number, which belonged to this machine.
+    clone_net = registry.load_spec(f"{VM}-clone")
+    if 5432 not in clone_net.network.guest_ports:
+        clone_net.network.guest_ports = sorted({*clone_net.network.guest_ports, 5432})
+    clone_net.network.ports.append(spec.Port(guest=5432, host=5433, name="Postgres"))
+    registry.save_spec(clone_net)
     archive = export.export_vm(f"{VM}-clone")
     check("bundle written", archive.is_file(), str(archive))
     manifest = export.read_manifest(archive)
@@ -318,8 +327,18 @@ def main() -> int:
     copy = registry.load_meta(imported)
     check("imported VM got a fresh identity", original.uuid != copy.uuid)
     check("imported disk is standalone", disk.backing_file(paths.disk_path(imported)) is None)
+    kept = [p for p in registry.load_spec(imported).network.ports if p.name == "Postgres"]
+    check("a user port survives export and import", len(kept) == 1,
+          str(registry.load_spec(imported).network.ports))
+    check("and still points at the same guest port", bool(kept) and kept[0].guest == 5432, str(kept))
+    check("with a host port of its own", bool(kept) and kept[0].host > 0, str(kept))
+    check("that is not the one the bundle carried",
+          bool(kept) and kept[0].host != 5433, str(kept))
     lifecycle.start(imported)
     check("imported VM boots", podman.state(imported) == "running")
+    check("and the user port is still published after the start",
+          5432 in registry.load_spec(imported).network.published().values(),
+          str(registry.load_spec(imported).network.published()))
     lifecycle.stop(imported)
 
     section("install media")
@@ -403,7 +422,7 @@ def main() -> int:
     section("rdp")
     spec_rdp = registry.load_spec(VM)
     spec_rdp.network.guest_ports = [3389]
-    spec_rdp.network.host_rdp = 13389
+    spec_rdp.network.set_role("rdp", 3389, 13389)
     registry.save_spec(spec_rdp)
     tgt = rdp.target(VM)
     check("rdp target resolved", tgt.port == 13389)
@@ -429,16 +448,16 @@ def main() -> int:
     check("remmina profile carries no password", profile_section["password"] == "")
     rdp.remove_profile(VM)
     no_rdp_spec = registry.load_spec(VM)
-    saved = no_rdp_spec.network.host_rdp
-    no_rdp_spec.network.host_rdp = 0
+    saved = no_rdp_spec.network.host_for("rdp")
+    no_rdp_spec.network.set_role("rdp", 3389, 0)
     registry.save_spec(no_rdp_spec)
     ok_flag, ok_msg = rdp.probe(VM)
     check("probe refuses a VM with no rdp port", not ok_flag and "no RDP port" in ok_msg, ok_msg)
-    no_rdp_spec.network.host_rdp = saved
+    no_rdp_spec.network.set_role("rdp", 3389, saved)
     registry.save_spec(no_rdp_spec)
     check("probe reports the negotiated protocol",
           "RDP 5.0+" in rdp.RDP_PROTOCOLS.get(2, ""), rdp.RDP_PROTOCOLS.get(2, ""))
-    spec_rdp.network.host_rdp = 0
+    spec_rdp.network.set_role("rdp", 3389, 0)
     registry.save_spec(spec_rdp)
     check("no rdp port means unavailable", not rdp.target(VM).available)
 
@@ -827,13 +846,81 @@ def main() -> int:
     unused_handlers = sorted(n for n in defined if f"self.{n}" not in pane_src)
     check("no orphaned click handlers in the pane", not unused_handlers, str(unused_handlers))
 
+    section("signal handlers accept the widget they are given")
+    # GTK hands the emitting widget to "clicked". A handler wired straight to
+    # a signal has to take it: a zero-argument method connected directly
+    # raises TypeError the moment anyone presses the button, and the only
+    # symptom is a control that looks fine and does nothing. The guicheck
+    # sweep cannot catch this, because it calls handlers with no arguments.
+    ui_dir = paths.project_root() / "src" / "vmhub" / "ui"
+    bad_arity: list[str] = []
+    for ui_path in sorted(ui_dir.glob("*.py")):
+        tree = ast.parse(ui_path.read_text())
+        connected: set[str] = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "connect"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Attribute)
+                and isinstance(node.args[1].value, ast.Name)
+                and node.args[1].value.id == "self"
+            ):
+                connected.add(node.args[1].attr)
+        for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
+            for fn in cls.body:
+                if not isinstance(fn, ast.FunctionDef):
+                    continue
+                if fn.name not in connected and f"{cls.name}.{fn.name}" not in connected:
+                    continue
+                takes = fn.args.posonlyargs + fn.args.args
+                if len(takes) < 2 and not fn.args.vararg:
+                    bad_arity.append(f"{ui_path.name}:{fn.lineno} {fn.name}")
+    check("every directly connected handler takes the widget",
+          not bad_arity, str(bad_arity))
+
+    section("signal handlers accept the widget they are given")
+    # GTK hands the emitting widget to "clicked". A handler wired straight to
+    # a signal has to take it: a zero-argument method connected directly
+    # raises TypeError the moment anyone presses the button, and the only
+    # symptom is a control that looks fine and does nothing. The guicheck
+    # sweep cannot catch this, because it calls handlers with no arguments.
+    ui_dir = paths.project_root() / "src" / "vmhub" / "ui"
+    bad_arity: list[str] = []
+    for ui_path in sorted(ui_dir.glob("*.py")):
+        tree = ast.parse(ui_path.read_text())
+        connected: set[str] = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "connect"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Attribute)
+                and isinstance(node.args[1].value, ast.Name)
+                and node.args[1].value.id == "self"
+            ):
+                connected.add(node.args[1].attr)
+        for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
+            for fn in cls.body:
+                if not isinstance(fn, ast.FunctionDef):
+                    continue
+                if fn.name not in connected and f"{cls.name}.{fn.name}" not in connected:
+                    continue
+                takes = fn.args.posonlyargs + fn.args.args
+                if len(takes) < 2 and not fn.args.vararg:
+                    bad_arity.append(f"{ui_path.name}:{fn.lineno} {fn.name}")
+    check("every directly connected handler takes the widget",
+          not bad_arity, str(bad_arity))
+
     section("ports and orphans")
     rival = f"{VM}-rival"
     lifecycle.create(rival, blueprint="alpine")
     mine = registry.load_spec(VM)
     theirs = registry.load_spec(rival)
-    theirs.network.host_web = mine.network.host_web
-    theirs.network.host_ssh = mine.network.host_ssh
+    for role in ("web", "ssh"):
+        theirs.network.set_role(role, ports.ROLE_GUEST[role], mine.network.host_for(role))
     registry.save_spec(theirs)
     check("a forced clash is detected", bool(ports.collisions()))
     lifecycle.start(rival, progress=None)
@@ -1055,10 +1142,164 @@ def main() -> int:
     check("doctor does not claim all good in that case",
           "all good" not in doctor_text, doctor_text[-140:])
 
+    section("port list")
+    pvm = f"{VM}-ports"
+    lifecycle.create(pvm, blueprint="alpine")
+    pnet = registry.load_spec(pvm).network
+    check("a new VM starts with a web and an ssh entry",
+          {p.role for p in pnet.ports if p.role} == {"web", "ssh"},
+          str([(p.role, p.host) for p in pnet.ports]))
+    check("the web console is published", pnet.host_for("web") > 0, str(pnet.host_for("web")))
+    check("no rdp entry until one is asked for", pnet.by_role("rdp") is None)
+    check("and no entry is left unpublished",
+          all(port.host for port in pnet.ports),
+          str([(port.role, port.host) for port in pnet.ports]))
+
+    registry.save_spec(registry.load_spec(pvm))
+    reread = registry.load_spec(pvm).network
+    check("the port list survives a save and reload",
+          [(p.guest, p.host, p.role) for p in reread.ports]
+          == [(p.guest, p.host, p.role) for p in pnet.ports],
+          str([(p.guest, p.host, p.role) for p in reread.ports]))
+    written = paths.spec_path(pvm).read_text()
+    check("it is written as a table array", "[[network.ports]]" in written, written[-300:])
+    check("the old fixed slots are gone from the file", "host_web" not in written)
+
+    # A spec written before the list existed still names its ports. It has to
+    # keep working, and the next save has to move it to the new form.
+    legacy = spec.spec_from_dict({
+        "name": pvm,
+        "network": {
+            "mode": "user", "guest_ports": [22, 3389], "bind": "127.0.0.1",
+            "host_web": 8006, "host_ssh": 2222, "host_rdp": 3389,
+        },
+    })
+    check("an old spec's fixed slots still load as entries",
+          [(p.role, p.guest, p.host) for p in legacy.network.ports]
+          == [("web", 8006, 8006), ("ssh", 22, 2222), ("rdp", 3389, 3389)],
+          str([(p.role, p.guest, p.host) for p in legacy.network.ports]))
+    scratch = Path(tempfile.mkdtemp()) / "vm.toml"
+    spec.save(legacy, scratch)
+    legacy_written = scratch.read_text()
+    check("saving it writes the list instead of the old keys",
+          "[[network.ports]]" in legacy_written and "host_web" not in legacy_written,
+          legacy_written[-300:])
+    reread_legacy = spec.load(scratch, name="legacy")
+    check("and it reads back the same",
+          [(p.role, p.guest, p.host) for p in reread_legacy.network.ports]
+          == [("web", 8006, 8006), ("ssh", 22, 2222), ("rdp", 3389, 3389)],
+          str([(p.role, p.guest, p.host) for p in reread_legacy.network.ports]))
+    check("a half-written old spec loads without inventing ports",
+          spec.spec_from_dict({"name": "x", "network": {"host_ssh": 2222}}).network.host_for("web") == 0)
+
+    def run_ports(*argv) -> tuple[int, str]:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.cmd_ports(cli.build_parser().parse_args(["ports", pvm, *argv]), cli.Out())
+        return rc, buf.getvalue()
+
+    rc, text = run_ports("add", "5432", "--name", "Postgres")
+    check("a guest port can be added", rc == 0, text.strip())
+    pnet = registry.load_spec(pvm).network
+    pg = [p for p in pnet.ports if p.name == "Postgres"]
+    check("it lands in the list with its label", len(pg) == 1, str(pnet.ports))
+    check("with a host port picked for it", bool(pg) and pg[0].host > 0, str(pg))
+    check("the guest port is forwarded as well", 5432 in pnet.guest_ports, str(pnet.guest_ports))
+    check("published() reports it", pnet.published().get(pg[0].host) == 5432, str(pnet.published()))
+    argv = podman.run_argv(
+        registry.load_spec(pvm), registry.load_meta(pvm).uuid,
+        registry.load_meta(pvm).mac, None,
+    )
+    check("the container is told to forward it",
+          f"{pnet.bind or '127.0.0.1'}:{pg[0].host}:5432" in argv, "no -p for 5432")
+
+    rc, text = run_ports("add", "--as", "ssh")
+    check("a second ssh port is refused", rc == 1 and "already publishes" in text, text.strip())
+    check("and the refusal points at the way to move it", "ports set" in text, text.strip())
+
+    rc, text = run_ports("add", "--as", "rdp")
+    check("an rdp port can be added by role", rc == 0, text.strip())
+    check("adding it forwards 3389 too", 3389 in registry.load_spec(pvm).network.guest_ports)
+    check("rdp.target resolves to it",
+          rdp.target(pvm).port == registry.load_spec(pvm).network.host_for("rdp"))
+    rc, text = run_ports("rm", "rdp")
+    check("and removed again by role", rc == 0, text.strip())
+    check("after which rdp reports unavailable", not rdp.target(pvm).available)
+
+    first_host = pg[0].host
+    rc, text = run_ports("set", str(first_host), "--host", "16000")
+    check("a port can be moved to another host port", rc == 0, text.strip())
+    moved = [p for p in registry.load_spec(pvm).network.ports if p.name == "Postgres"]
+    check("and it really moved", bool(moved) and moved[0].host == 16000, str(moved))
+    rc, text = run_ports("set", "16000", "--host", "16000")
+    check("setting a port to the host it already has is a clean no-op",
+          rc == 0 and "already on host" in text, text.strip())
+    rc, text = run_ports("set", str(first_host), "--host", "16000")
+    check("naming a host port that has moved is an error, not a silent no-op",
+          rc == 1 and "publishes no port" in text, text.strip())
+    rc, text = run_ports("rm", "nope")
+    check("removing a port that is not there fails cleanly",
+          rc == 1 and "publishes no port" in text, text.strip())
+    rc, text = run_ports("rm", "16000")
+    check("removing by host port works", rc == 0, text.strip())
+    check("and it leaves published()", 16000 not in registry.load_spec(pvm).network.published())
+    check("and stops forwarding the guest port it had switched on",
+          5432 not in registry.load_spec(pvm).network.guest_ports,
+          str(registry.load_spec(pvm).network.guest_ports))
+    check("but leaves a port something else still publishes alone",
+          22 in registry.load_spec(pvm).network.guest_ports,
+          str(registry.load_spec(pvm).network.guest_ports))
+
+    clash = registry.load_spec(pvm)
+    clash.network.ports.append(
+        spec.Port(guest=5432, host=clash.network.host_for("web"), name="clash")
+    )
+    try:
+        clash.validate()
+        check("publishing one host port twice is rejected", False, "validate accepted it")
+    except VmhubError as exc:
+        check("publishing one host port twice is rejected", "published twice" in str(exc), str(exc))
+    bogus = registry.load_spec(pvm)
+    bogus.network.ports.append(spec.Port(guest=9999, host=16001, role="telnet"))
+    try:
+        bogus.validate()
+        check("an unknown role is rejected", False, "validate accepted it")
+    except VmhubError as exc:
+        check("an unknown role is rejected", "unknown role" in str(exc), str(exc))
+    dup_role = registry.load_spec(pvm)
+    dup_role.network.ports.append(spec.Port(guest=2222, host=16002, role="ssh"))
+    try:
+        dup_role.validate()
+        check("two entries claiming one role are rejected", False, "validate accepted it")
+    except VmhubError as exc:
+        check("two entries claiming one role are rejected", "claim the ssh role" in str(exc), str(exc))
+
+    # A user port that collides has to be moved like any other, and taking
+    # the port away must not quietly clear the entry.
+    thief = f"{VM}-thief"
+    lifecycle.create(thief, blueprint="alpine")
+    tspec = registry.load_spec(thief)
+    tspec.network.ports.append(spec.Port(guest=5432, host=16000, name="Stolen"))
+    registry.save_spec(tspec)
+    pspec = registry.load_spec(pvm)
+    pspec.network.ports.append(spec.Port(guest=5432, host=16000, name="Postgres"))
+    pspec.network.guest_ports = sorted({*pspec.network.guest_ports, 5432})
+    registry.save_spec(pspec)
+    changes = ports.ensure_for(pvm)
+    check("a clashing user port is reassigned too",
+          any("Postgres 16000 ->" in c for c in changes), str(changes))
+    after = registry.load_spec(pvm).network
+    moved_back = [p for p in after.ports if p.name == "Postgres"]
+    check("the guest port is unchanged by the move",
+          bool(moved_back) and moved_back[0].guest == 5432, str(moved_back))
+    check("the roles were left alone", after.host_for("web") > 0 and after.host_for("ssh") > 0)
+    lifecycle.remove(thief, progress=None)
+    lifecycle.remove(pvm, progress=None)
+
     section("cleanup")
     for name in (
         f"{VM}-stop", f"{VM}-rival", f"{VM}-stale", f"{VM}-clone2",
-        f"{VM}-power", f"{VM}-tpl", f"{VM}-kid",
+        f"{VM}-power", f"{VM}-tpl", f"{VM}-kid", f"{VM}-ports", f"{VM}-thief",
         f"{VM}-secret", f"{VM}-fresh", f"{VM}-chosen", f"{VM}-roundtrip",
         f"{VM}-finishinstall",
         f"{VM}-clone", f"{VM}-linked-import", f"{VM}-libvirt",

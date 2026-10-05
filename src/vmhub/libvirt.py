@@ -179,8 +179,8 @@ def materialize(
     # Firmware is detected from the imported disk by the container.
     vm_spec.boot.mode = "auto"
     vm_spec.network.guest_ports = [22]
-    vm_spec.network.host_web = ports.allocate("web")
-    vm_spec.network.host_ssh = ports.allocate("ssh")
+    vm_spec.network.set_role("web", 8006, ports.allocate("web"))
+    vm_spec.network.set_role("ssh", 22, ports.allocate("ssh"))
     vm_spec.validate()
 
     registry.save_spec(vm_spec)

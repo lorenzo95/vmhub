@@ -107,9 +107,15 @@ def export_vm(
             image=vm_spec.image,
             boot=spec.Boot(mode=vm_spec.boot.mode, iso="", media_type=vm_spec.boot.media_type),
             resources=vm_spec.resources,
+            # The port list travels without its host numbers, which belong
+            # to the machine the bundle was made on. The entries themselves
+            # do travel, so a user's own forwards survive the trip with
+            # their names; the import gives each one a port of its own.
             network=spec.Network(
                 mode=vm_spec.network.mode,
                 guest_ports=list(vm_spec.network.guest_ports),
+                ports=[spec.Port(guest=p.guest, host=0, role=p.role, name=p.name)
+                       for p in vm_spec.network.ports],
                 bind=vm_spec.network.bind,
                 mac="",
                 ip="",
@@ -234,11 +240,10 @@ def import_bundle(
         imported_spec.name = target_name
         from . import ports as ports_mod
 
-        allocated = ports_mod.allocate_all()
-        imported_spec.network.host_web = allocated["web"]
-        imported_spec.network.host_ssh = allocated["ssh"]
-        if 3389 in imported_spec.network.guest_ports:
-            imported_spec.network.host_rdp = allocated["rdp"]
+        wanted = imported_spec.network.ports or ports_mod.defaults(
+            imported_spec.network.guest_ports
+        )
+        imported_spec.network.ports = ports_mod.reallocate(wanted)
         imported_spec.validate()
         registry.save_spec(imported_spec)
 

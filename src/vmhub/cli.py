@@ -662,7 +662,8 @@ def cmd_console(args: argparse.Namespace, out: Out) -> int:
 
 def cmd_ssh(args: argparse.Namespace, out: Out) -> int:
     vm_spec = registry.load_spec(args.name)
-    if not vm_spec.network.host_ssh:
+    host_ssh = vm_spec.network.host_for("ssh")
+    if not host_ssh:
         print(out.bad(f"{args.name} has no published SSH port"))
         return 1
     target = lifecycle.ssh_target(args.name)
@@ -672,7 +673,7 @@ def cmd_ssh(args: argparse.Namespace, out: Out) -> int:
     if not shutil.which("ssh"):
         out.say(f"ssh {target}")
         return 0
-    return subprocess.run(["ssh", "-p", str(vm_spec.network.host_ssh),
+    return subprocess.run(["ssh", "-p", str(host_ssh),
                            vm_spec.network.bind or "127.0.0.1"]).returncode
 
 
@@ -681,7 +682,7 @@ def cmd_rdp(args: argparse.Namespace, out: Out) -> int:
     if not tgt.available:
         print(out.bad(
             f"{args.name} has no published RDP port. Add one with: "
-            f"vmctl set {args.name} network.guest_ports=3389"
+            f"vmctl ports add {args.name} --as rdp"
         ))
         return 1
     if args.check:
@@ -751,6 +752,115 @@ def cmd_prune(args: argparse.Namespace, out: Out) -> int:
     removed = podman.prune_orphans(keep_running=args.keep_running)
     for line in removed:
         out.say(out.good(f"removed {line}"))
+    return 0
+
+
+def _port_by_target(net: spec.Network, target: str) -> spec.Port | None:
+    """Find a port entry by its role or by the host port it publishes."""
+    for port in net.ports:
+        if port.role == target or str(port.host) == target:
+            return port
+    return None
+
+
+def cmd_ports(args: argparse.Namespace, out: Out) -> int:
+    action = getattr(args, "ports_action", "list")
+    vm_spec = registry.load_spec(args.name)
+    net = vm_spec.network
+
+    def restarted_note() -> None:
+        if podman.is_running(args.name):
+            out.say(out.dim("  takes effect the next time the VM starts"))
+
+    if action == "list":
+        if not net.ports:
+            out.say(out.dim(f"{args.name} publishes no ports"))
+            return 0
+        claimed = ports.used_by_vms(args.name)
+        for port in net.ports:
+            if not port.host:
+                note = out.dim("not published")
+            elif port.host in claimed:
+                note = out.bad(f"claimed by {claimed[port.host]}")
+            elif not ports.port_is_free(port.host):
+                note = out.bad("bound by another process")
+            else:
+                note = out.good("free")
+            role = f"  [{port.role}]" if port.role else ""
+            left = f"{port.host if port.host else '-':>5} -> {port.guest:<6}"
+            out.say(f"{left}  {port.label}{role}  {note}")
+        forward = ", ".join(str(p) for p in sorted(net.guest_ports)) or "none"
+        out.say(out.dim(f"  guest ports forwarded to the host: {forward}"))
+        return 0
+
+    if action == "add":
+        role = args.role or ""
+        guest = args.guest or ports.ROLE_GUEST.get(role, 0)
+        if not guest:
+            print(out.bad("give a guest port, or use --as web|ssh|rdp"))
+            return 2
+        if role and net.by_role(role) is not None:
+            print(out.bad(
+                f"{args.name} already publishes a {role} port; "
+                f"move it with: vmctl ports set {args.name} {role} --host PORT"
+            ))
+            return 1
+        if args.host:
+            if args.host in net.published():
+                print(out.bad(f"host port {args.host} is already published by this VM"))
+                return 1
+            host = args.host
+        else:
+            avoid = set(ports.used_by_vms(args.name)) | set(net.published())
+            host = (
+                ports.allocate(role, also_wanted=avoid)
+                if role
+                else ports.allocate_any(also_wanted=avoid)
+            )
+        net.ports.append(spec.Port(guest=guest, host=host, role=role, name=args.label))
+        # A guest service the container is not forwarding never answers, so
+        # turn the forwarding on now rather than leaving a port that only
+        # looks live. The web console is the container's own listener and has
+        # no guest side to forward.
+        if role != "web" and guest not in net.guest_ports:
+            net.guest_ports = sorted({*net.guest_ports, guest})
+            out.say(out.dim(f"  added guest {guest} to network.guest_ports"))
+        try:
+            vm_spec.validate()
+        except VmhubError as exc:
+            print(out.bad(str(exc)))
+            return 1
+        registry.save_spec(vm_spec)
+        out.say(out.good(f"published guest {guest} on host {host}"))
+        restarted_note()
+        return 0
+
+    port = _port_by_target(net, args.target)
+    if port is None:
+        print(out.bad(f"{args.name} publishes no port {args.target!r}"))
+        return 1
+
+    if action == "rm":
+        net.ports.remove(port)
+        ports.prune_guest_forward(net, port.guest)
+        vm_spec.validate()
+        registry.save_spec(vm_spec)
+        out.say(out.good(f"stopped publishing {port.label}"))
+        restarted_note()
+        return 0
+
+    # action == "set"
+    if args.host == port.host:
+        out.say(out.dim(f"{port.label} is already on host {port.host}"))
+        return 0
+    if args.host in net.published():
+        print(out.bad(f"host port {args.host} is already published by this VM"))
+        return 1
+    port.host = args.host
+    vm_spec.validate()
+    registry.save_spec(vm_spec)
+    out.say(out.good(f"{port.label} now on host {port.host}"))
+    restarted_note()
     return 0
 
 
@@ -1118,6 +1228,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip orphans that are still running (e.g. holding 16 GB of RAM)",
     )
     p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser("ports", help="show or change a VM's published ports")
+    p.add_argument("name", help="the VM")
+    ports_sub = p.add_subparsers(dest="ports_action")
+
+    sp = ports_sub.add_parser("list", help="list published ports (default)")
+    sp.set_defaults(func=cmd_ports)
+
+    sp = ports_sub.add_parser("add", help="publish a guest port")
+    sp.add_argument("guest", nargs="?", type=int, help="guest port, e.g. 5432")
+    sp.add_argument("--host", type=int, help="host port (default: the first free one)")
+    sp.add_argument("--name", dest="label", default="", help="label shown for the entry")
+    sp.add_argument(
+        "--as", dest="role", choices=list(spec.PORT_ROLES),
+        help="treat this as vmhub's web, ssh or rdp port",
+    )
+    sp.set_defaults(func=cmd_ports)
+
+    sp = ports_sub.add_parser("rm", help="stop publishing a port")
+    sp.add_argument("target", help="role (web, ssh, rdp) or the host port number")
+    sp.set_defaults(func=cmd_ports)
+
+    sp = ports_sub.add_parser("set", help="move a port to a different host port")
+    sp.add_argument("target", help="role (web, ssh, rdp) or the host port number")
+    sp.add_argument("--host", type=int, required=True, help="the new host port")
+    sp.set_defaults(func=cmd_ports)
+
+    p.set_defaults(func=cmd_ports, ports_action="list")
 
     p = sub.add_parser("repair-ports", help="reassign conflicting host ports")
     p.add_argument("--dry-run", action="store_true")

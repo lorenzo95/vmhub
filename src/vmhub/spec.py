@@ -103,27 +103,59 @@ class Resources:
         return parse_size(self.disk)
 
 
+PORT_ROLES = ("web", "ssh", "rdp")
+PORT_KEYS = {"guest", "host", "role", "name"}
+
+
+@dataclass
+class Port:
+    """One published host port.
+
+    `role` names the three ports vmhub drives itself: the container's own
+    web console, SSH and RDP. A port added for the user's own guest service
+    has no role. A `host` of 0 keeps the entry but does not publish it, so
+    the same guest port comes back the next time the VM is started.
+    """
+
+    guest: int = 0
+    host: int = 0
+    role: str = ""
+    name: str = ""
+
+    @property
+    def label(self) -> str:
+        return self.name or self.role or f"guest {self.guest}"
+
+
 @dataclass
 class Network:
     mode: str = "user"
     guest_ports: list[int] = field(default_factory=lambda: [22])
-    host_web: int = 0
-    host_ssh: int = 0
-    host_rdp: int = 0
+    ports: list[Port] = field(default_factory=list)
     bind: str = "127.0.0.1"
     mac: str = ""
     ip: str = ""
 
     def published(self) -> dict[int, int]:
-        mapping: dict[int, int] = {}
-        for host, guest in (
-            (self.host_web, 8006),
-            (self.host_ssh, 22),
-            (self.host_rdp, 3389),
-        ):
-            if host:
-                mapping[host] = guest
-        return mapping
+        return {port.host: port.guest for port in self.ports if port.host}
+
+    def by_role(self, role: str) -> Port | None:
+        for port in self.ports:
+            if port.role == role:
+                return port
+        return None
+
+    def host_for(self, role: str) -> int:
+        port = self.by_role(role)
+        return port.host if port else 0
+
+    def set_role(self, role: str, guest: int, host: int) -> None:
+        existing = self.by_role(role)
+        if existing is None:
+            self.ports.append(Port(guest=guest, host=host, role=role))
+        else:
+            existing.guest = guest
+            existing.host = host
 
 
 @dataclass
@@ -201,9 +233,32 @@ class VmSpec:
         for port in self.network.guest_ports:
             if not 1 <= int(port) <= 65535:
                 raise SpecError(f"network.guest_ports: bad port {port}")
-        for port in self.network.published():
-            if not 1 <= port <= 65535:
-                raise SpecError(f"published host port out of range: {port}")
+        seen_hosts: dict[int, str] = {}
+        seen_roles: set[str] = set()
+        for port in self.network.ports:
+            if not 1 <= int(port.guest) <= 65535:
+                raise SpecError(f"network.ports: guest port out of range: {port.guest}")
+            if port.host and not 1 <= int(port.host) <= 65535:
+                raise SpecError(f"network.ports: host port out of range: {port.host}")
+            if port.role and port.role not in PORT_ROLES:
+                raise SpecError(
+                    f"network.ports: {port.label} has unknown role {port.role!r}; "
+                    f"expected one of {list(PORT_ROLES)}, or none"
+                )
+            if port.role:
+                if port.role in seen_roles:
+                    raise SpecError(
+                        f"network.ports: two entries claim the {port.role} role -- "
+                        "only one of them can be the port vmctl uses for it"
+                    )
+                seen_roles.add(port.role)
+            if port.host and port.host in seen_hosts:
+                raise SpecError(
+                    f"network.ports: host port {port.host} is published twice "
+                    f"({seen_hosts[port.host]} and {port.label})"
+                )
+            if port.host:
+                seen_hosts[port.host] = port.label
         if self.display.protected and not self.display.password:
             raise SpecError("display.protected requires display.password")
         if not 0 <= int(self.shutdown.timeout) <= 600:
@@ -281,8 +336,42 @@ def _is_empty(value: Any) -> bool:
     return value is None or value == "" or value == [] or value == {}
 
 
+def _prune_items(value: Any) -> Any:
+    """Prune inside a list of tables too, so a port entry only writes the
+    fields it actually uses. The list itself is kept whole."""
+    if isinstance(value, list):
+        return [_prune(item) if isinstance(item, dict) else item for item in value]
+    return value
+
+
 def _prune(data: dict[str, Any]) -> dict[str, Any]:
-    return {key: _prune(val) if isinstance(val, dict) else val for key, val in data.items() if not _is_empty(val)}
+    return {
+        key: _prune(val) if isinstance(val, dict) else _prune_items(val)
+        for key, val in data.items()
+        if not _is_empty(val)
+    }
+
+
+def _legacy_ports(net_data: dict) -> list[Port]:
+    """Fold the three fixed host_* slots into port entries.
+
+    A spec written before the list existed still says which ports it wants;
+    read them so an existing VM keeps working, and let the next save write
+    the list instead. A host_* of 0 meant "not published" and still does.
+    """
+    out: list[Port] = []
+    for role, key, guest in (
+        ("web", "host_web", 8006),
+        ("ssh", "host_ssh", 22),
+        ("rdp", "host_rdp", 3389),
+    ):
+        try:
+            host = int(net_data.get(key) or 0)
+        except (TypeError, ValueError):
+            host = 0
+        if host:
+            out.append(Port(guest=guest, host=host, role=role))
+    return out
 
 
 def spec_from_dict(data: dict, *, name: str | None = None) -> VmSpec:
@@ -297,13 +386,16 @@ def spec_from_dict(data: dict, *, name: str | None = None) -> VmSpec:
             if k in {"cpus", "ram", "disk", "disk_type", "disk_fmt", "kvm", "ram_check"}
         }
     )
+    net_data = data.get("network") or {}
     network = Network(
-        **{
-            k: v
-            for k, v in (data.get("network") or {}).items()
-            if k in {"mode", "guest_ports", "host_web", "host_ssh", "host_rdp", "bind", "mac", "ip"}
-        }
+        **{k: v for k, v in net_data.items() if k in {"mode", "guest_ports", "bind", "mac", "ip"}}
     )
+    network.ports = [
+        Port(**{k: v for k, v in entry.items() if k in PORT_KEYS})
+        for entry in (net_data.get("ports") or [])
+    ]
+    if not network.ports:
+        network.ports = _legacy_ports(net_data)
     display = Display(
         **{
             k: v

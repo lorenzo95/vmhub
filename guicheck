@@ -33,7 +33,7 @@ import gi  # noqa: E402
 gi.require_version("Gtk", "4.0")
 from gi.repository import GLib, Gtk  # noqa: E402
 
-from vmhub import iso as isomod, lifecycle, paths, ports, registry  # noqa: E402
+from vmhub import iso as isomod, lifecycle, paths, ports, registry, spec  # noqa: E402
 from vmhub.ui import newvm, widgets  # noqa: E402
 from vmhub.ui.app import VmhubApp  # noqa: E402
 
@@ -62,10 +62,16 @@ def sweep(obj, label: str) -> None:
             if p.default is inspect.Parameter.empty
             and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
         ]
+        # slot and name already had real values. The port-table actions take
+        # a role or a Port rather than a button, so give them one: sweeping
+        # them with None would only prove the guard, not the action.
         args = [
-            (isomod.INSTALL_SLOT if p.name == "slot" else "guicheck-name")
-            if p.name in ("slot", "name")
-            else None
+            {
+                "slot": isomod.INSTALL_SLOT,
+                "name": "guicheck-name",
+                "role": "rdp",
+                "port": spec.Port(guest=5432, host=15999, name="guicheck"),
+            }.get(p.name)
             for p in required
         ]
         signature = f"{label}.{name}({', '.join(p.name for p in required)})"
@@ -234,7 +240,7 @@ def _probe(app) -> None:
         # give the VM an RDP port but no account, so _on_remmina takes the prompt path
         rdp_spec = registry.load_spec(VM)
         rdp_spec.network.guest_ports = [22, 3389]
-        rdp_spec.network.host_rdp = ports.allocate("rdp")
+        rdp_spec.network.set_role("rdp", 3389, ports.allocate("rdp"))
         rdp_spec.media.rdp_user = ""
         registry.save_spec(rdp_spec)
         settle()
@@ -242,6 +248,15 @@ def _probe(app) -> None:
         before = len(opened)
         window.panes[VM]._on_remmina(None)
         remmina_opened = len(opened) > before
+
+        # The two "Change…" actions on the port table open a prompt asking
+        # for the new host port. Drive them the way a click would.
+        before = len(opened)
+        window.panes[VM]._on_change_role("rdp")
+        change_role_opened = len(opened) > before
+        before = len(opened)
+        window.panes[VM]._on_change_port(spec.Port(guest=5432, host=15999, name="guicheck"))
+        change_port_opened = len(opened) > before
     finally:
         widgets.TextPrompt.present = original_present
         for dialog in opened:
@@ -260,6 +275,107 @@ def _probe(app) -> None:
     else:
         exercised.append("the Remmina account prompt is shown")
         print("  \033[32mPASS\033[0m  Connect with Remmina opens the account prompt")
+
+    for opened_ok, label, detail in (
+        (change_role_opened, "the RDP row's Change… opens its prompt",
+         "the port table's role prompt does nothing"),
+        (change_port_opened, "a custom port's Change… opens its prompt",
+         "the port table's entry prompt does nothing"),
+    ):
+        if not opened_ok:
+            failures.append((label, detail))
+            print(f"  \033[31mFAIL\033[0m  {detail}")
+        else:
+            exercised.append(label)
+            print(f"  \033[32mPASS\033[0m  {label}")
+
+    # The ports table and the details grid moved off Hardware and Console
+    # onto an Info tab of their own.
+    pane = window.panes[VM]
+    titles = [
+        pane.notebook.get_tab_label(pane.notebook.get_nth_page(i)).get_text()
+        for i in range(pane.notebook.get_n_pages())
+    ]
+    if "Info" not in titles:
+        failures.append(("Info tab missing", str(titles)))
+        print(f"  \033[31mFAIL\033[0m  no Info tab; tabs are {titles}")
+    else:
+        exercised.append("the Info tab exists")
+        print("  \033[32mPASS\033[0m  the Info tab exists")
+    if not pane.ports_box.get_first_child() and not pane.roles_box.get_first_child():
+        failures.append(("ports table empty", "the Info tab drew no port rows"))
+        print("  \033[31mFAIL\033[0m  the Info tab drew no port rows")
+    else:
+        exercised.append("the port table is drawn")
+        print("  \033[32mPASS\033[0m  the port table is drawn")
+
+    # ---- adding a custom forward, pressed the way a user presses it ----
+    # Calling the handler with no arguments is not enough: GTK hands the
+    # button to "clicked", so a zero-argument handler dies on the press and
+    # the control looks fine and does nothing. Pass the button, fill in the
+    # dialog's own fields, and press its Add button.
+    def find_named(widget, name):
+        if widget is None:
+            return None
+        if widget.get_name() == name:
+            return widget
+        child = widget.get_first_child()
+        while child is not None:
+            found = find_named(child, name)
+            if found is not None:
+                return found
+            child = child.get_next_sibling()
+        return None
+
+    add_dialogs: list = []
+    saved_present = widgets.TextPrompt.present
+    widgets.TextPrompt.present = lambda self: (add_dialogs.append(self), saved_present(self))[1]
+    try:
+        pane._on_add_port(None)
+        dialog = add_dialogs[-1] if add_dialogs else None
+        guest = find_named(dialog, "vmhub.add-port.guest")
+        if guest is None:
+            failures.append((
+                "forward dialog unusable",
+                "the Add dialog opened without its fields",
+            ))
+            print("  \033[31mFAIL\033[0m  Forward another port… opened no usable dialog")
+        else:
+            guest.set_text("5432")
+            host_field = find_named(dialog, "vmhub.add-port.host")
+            host_field.set_text("16050")
+            dialog.accept_button.emit("clicked")
+            pump_until(
+                lambda: 16050 in registry.load_spec(VM).network.published()
+            )
+            if 16050 in registry.load_spec(VM).network.published():
+                exercised.append("a custom port can be added from the port table")
+                print("  \033[32mPASS\033[0m  a custom port can be added from the port table")
+            else:
+                failures.append((
+                    "add port did nothing",
+                    "filling the dialog and pressing Add changed nothing",
+                ))
+                print("  \033[31mFAIL\033[0m  filling the dialog and pressing Add did nothing")
+            # and it can be taken away again from the same table
+            for child_port in list(registry.load_spec(VM).network.ports):
+                if child_port.host == 16050:
+                    pane._on_remove_port(child_port)
+                    break
+            pump_until(lambda: 16050 not in registry.load_spec(VM).network.published())
+            if 16050 not in registry.load_spec(VM).network.published():
+                exercised.append("a custom port can be removed from the port table")
+                print("  \033[32mPASS\033[0m  a custom port can be removed from the port table")
+            else:
+                failures.append((
+                    "remove port did nothing",
+                    "the Remove button on a custom port changed nothing",
+                ))
+                print("  \033[31mFAIL\033[0m  removing a custom port changed nothing")
+    finally:
+        widgets.TextPrompt.present = saved_present
+        for leaked in add_dialogs:
+            leaked.close()
 
     # a running VM's disk is locked, so cloning it must be disabled
     live = "vmhub-guicheck-live"

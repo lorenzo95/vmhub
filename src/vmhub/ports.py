@@ -61,24 +61,21 @@ def allocate_all(*, exclude: str | None = None) -> dict[str, int]:
 
 def verify(vm_spec: spec.VmSpec, *, check_busy: bool = True) -> list[str]:
     warnings: list[str] = []
-    guest_mapped = {
-        vm_spec.network.host_ssh: 22,
-        vm_spec.network.host_rdp: 3389,
-    }
-    for host_port, guest_port in vm_spec.network.published().items():
-        if guest_mapped.get(host_port) != guest_port:
+    forwarded = {int(p) for p in vm_spec.network.guest_ports}
+    for port in vm_spec.network.ports:
+        if not port.host:
             continue
-        if guest_port not in vm_spec.network.guest_ports:
+        # The web console is the container's own listener, not a guest
+        # service, so it is never gated on network.guest_ports.
+        if port.role != "web" and port.guest not in forwarded:
             warnings.append(
-                f"host port {host_port} forwards guest {guest_port} but {guest_port} "
+                f"host port {port.host} forwards guest {port.guest} but {port.guest} "
                 f"is not in network.guest_ports — add it or the guest service is unreachable"
             )
-    if check_busy:
-        for host_port in vm_spec.network.published():
-            if not port_is_free(host_port):
-                warnings.append(
-                    f"host port {host_port} is already bound by another process"
-                )
+        if check_busy and not port_is_free(port.host):
+            warnings.append(
+                f"host port {port.host} is already bound by another process"
+            )
     return warnings
 
 
@@ -95,13 +92,62 @@ def collisions() -> dict[int, list[str]]:
     return {port: sorted(names) for port, names in owners.items() if len(names) > 1}
 
 
-# host_web publishes the container's own noVNC server; it is never a guest
-# service and must never be gated on guest_ports.
-PORT_KINDS = {
-    "host_web": ("web", None),
-    "host_ssh": ("ssh", 22),
-    "host_rdp": ("rdp", 3389),
-}
+# The guest port behind each role. web is the container's own noVNC server,
+# which is why it is the one role that is not a guest service.
+ROLE_GUEST = {"web": 8006, "ssh": 22, "rdp": 3389}
+
+
+def allocate_any(*, also_wanted: Iterable[int] = (), start: int = 9000) -> int:
+    """A free host port for a port entry that has no role of its own."""
+    claimed = set(int(p) for p in also_wanted)
+    for candidate in range(start, min(start + MAX_OFFSET, 65536)):
+        if candidate in claimed:
+            continue
+        if port_is_free(candidate):
+            return candidate
+    raise NoFreePort(f"no free host port available from {start}")
+
+
+def defaults(guest_ports: Iterable[int]) -> list["spec.Port"]:
+    """The entries a VM gets when it has no port list of its own."""
+    forwarded = {int(p) for p in guest_ports}
+    out = [spec.Port(guest=8006, host=0, role="web")]
+    if 22 in forwarded:
+        out.append(spec.Port(guest=22, host=0, role="ssh"))
+    if 3389 in forwarded:
+        out.append(spec.Port(guest=3389, host=0, role="rdp"))
+    return out
+
+
+def prune_guest_forward(net: "spec.Network", guest: int) -> None:
+    """Stop forwarding a guest port that nothing publishes any more.
+
+    Adding a forward also turns the container's forwarding on for that guest
+    port, so taking the forward away has to take both back. Otherwise the
+    VM is left telling the container to forward a port that no longer has
+    anything on the other side, and the UI still lists it as forwarded.
+    """
+    if any(port.guest == guest for port in net.ports):
+        return
+    if guest in net.guest_ports:
+        net.guest_ports = [p for p in net.guest_ports if int(p) != guest]
+
+
+def reallocate(entries: Iterable["spec.Port"]) -> list["spec.Port"]:
+    """Give every entry a host port on this machine.
+
+    Used for specs that arrive from elsewhere -- an export bundle, an import
+    from another host -- where the numbers they name belong to a different
+    machine. Roles keep their familiar base range; anything else is given a
+    port from the high range. The caller's list is not modified.
+    """
+    claimed = set(int(p) for p in used_by_vms())
+    out: list[spec.Port] = []
+    for entry in entries:
+        host = allocate(entry.role, also_wanted=claimed) if entry.role else allocate_any(also_wanted=claimed)
+        claimed.add(host)
+        out.append(spec.Port(guest=entry.guest, host=host, role=entry.role, name=entry.name))
+    return out
 
 
 def _claimed_by_others(exclude: str) -> dict[int, str]:
@@ -127,27 +173,24 @@ def ensure_for(vm: str) -> list[str]:
     """
     vm_spec = registry.load_spec(vm)
     claimed = _claimed_by_others(vm)
+    forwarded = {int(p) for p in vm_spec.network.guest_ports}
     changes: list[str] = []
-    for attr, (kind, guest) in PORT_KINDS.items():
-        current = getattr(vm_spec.network, attr)
+    for port in vm_spec.network.ports:
+        current = port.host
         if not current:
             continue
-        if guest is not None and guest not in vm_spec.network.guest_ports:
-            setattr(vm_spec.network, attr, 0)
-            changes.append(
-                f"cleared {attr}={current} (guest {guest} is not forwarded)"
-            )
+        if port.role != "web" and port.guest not in forwarded:
+            port.host = 0
+            changes.append(f"cleared {port.label} (guest {port.guest} is not forwarded)")
             continue
         holder = claimed.get(current)
         if holder is None and port_is_free(current):
             continue
-        avoid = set(claimed) | {
-            p for p in vm_spec.network.published()
-        } | {current}
-        fresh = allocate(kind, exclude=vm, also_wanted=avoid)
-        setattr(vm_spec.network, attr, fresh)
+        avoid = set(claimed) | set(vm_spec.network.published()) | {current}
+        fresh = allocate(port.role, also_wanted=avoid) if port.role else allocate_any(also_wanted=avoid)
+        port.host = fresh
         why = f"claimed by {holder}" if holder else "bound by another process"
-        changes.append(f"{attr} {current} -> {fresh} ({why})")
+        changes.append(f"{port.label} {current} -> {fresh} ({why})")
     if changes:
         registry.save_spec(vm_spec)
     return changes

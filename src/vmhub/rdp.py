@@ -93,7 +93,7 @@ def target(vm: str) -> RdpTarget:
     vm_spec = registry.load_spec(vm)
     return RdpTarget(
         host=vm_spec.network.bind or "127.0.0.1",
-        port=vm_spec.network.host_rdp,
+        port=vm_spec.network.host_for("rdp"),
         user=rdp_user(vm),
         # No invented default: a blank password must stay blank so the
         # client prompts, and so nothing lands in the process table.

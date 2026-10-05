@@ -211,11 +211,17 @@ class TextPrompt(Gtk.Window):
         accept_label: str = "OK",
         extra: Gtk.Widget | None = None,
         on_accept: Callable[[str], None] | None = None,
+        show_entry: bool | None = None,
     ) -> None:
         super().__init__(modal=True, transient_for=parent, title=heading)
         self.set_default_size(460, -1)
         self.set_resizable(False)
         self.on_accept = on_accept
+        # A caller that brings its own fields has no use for the built-in
+        # entry, and leaving it visible invites the user to type into a box
+        # that nothing reads. The accept rule follows: an empty entry means
+        # "not filled in" only when the entry is the input.
+        self.entry_is_input = (extra is None) if show_entry is None else show_entry
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         root.set_margin_top(14)
@@ -239,11 +245,13 @@ class TextPrompt(Gtk.Window):
         if extra is not None:
             root.append(extra)
 
-        self.entry = Gtk.Entry(text=default)
-        if placeholder:
-            self.entry.set_placeholder_text(placeholder)
-        self.entry.connect("activate", self._on_accept_clicked)
-        root.append(self.entry)
+        self.entry: Gtk.Entry | None = None
+        if self.entry_is_input:
+            self.entry = Gtk.Entry(text=default)
+            if placeholder:
+                self.entry.set_placeholder_text(placeholder)
+            self.entry.connect("activate", self._on_accept_clicked)
+            root.append(self.entry)
 
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         buttons.set_halign(Gtk.Align.END)
@@ -263,10 +271,12 @@ class TextPrompt(Gtk.Window):
         self.present()
 
     def _on_accept_clicked(self, _widget: object) -> None:
-        text = self.entry.get_text().strip()
+        text = self.entry.get_text().strip() if self.entry is not None else ""
         callback = self.on_accept
         self.close()
-        if callback is not None and text:
+        if callback is None:
+            return
+        if text or not self.entry_is_input:
             callback(text)
 
 
@@ -280,6 +290,7 @@ def prompt_text(
     placeholder: str = "",
     accept_label: str = "OK",
     extra: Gtk.Widget | None = None,
+    show_entry: bool | None = None,
 ) -> TextPrompt:
     return TextPrompt(
         parent,
@@ -290,6 +301,7 @@ def prompt_text(
         accept_label=accept_label,
         extra=extra,
         on_accept=on_accept,
+        show_entry=show_entry,
     )
 
 

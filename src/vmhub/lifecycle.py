@@ -196,17 +196,20 @@ def create(
     progress("Allocating host ports...")
     allocated = ports.allocate_all()
     wanted = ports_map or {}
-    vm_spec.network.host_web = int(wanted.get("web") or allocated["web"])
+    net = vm_spec.network
+    net.set_role("web", 8006, int(wanted.get("web") or allocated["web"]))
     # Only publish a port whose guest service is actually forwarded, otherwise the
     # host port forwards to a passt listener that will never answer.
-    vm_spec.network.host_ssh = (
-        int(wanted.get("ssh") or allocated["ssh"]) if 22 in vm_spec.network.guest_ports else 0
-    )
-    vm_spec.network.host_rdp = (
+    ssh_host = int(wanted.get("ssh") or allocated["ssh"]) if 22 in net.guest_ports else 0
+    if ssh_host:
+        net.set_role("ssh", 22, ssh_host)
+    rdp_host = (
         int(wanted.get("rdp") or allocated["rdp"])
-        if 3389 in vm_spec.network.guest_ports or wanted.get("rdp")
+        if 3389 in net.guest_ports or wanted.get("rdp")
         else 0
     )
+    if rdp_host:
+        net.set_role("rdp", 3389, rdp_host)
 
     vm_spec.validate()
     paths.storage_dir(name).mkdir(parents=True, exist_ok=True)
@@ -219,11 +222,7 @@ def create(
         blueprint=vm_spec.blueprint,
         image=vm_spec.image.ref,
     )
-    published = [f"viewer :{vm_spec.network.host_web}"]
-    if vm_spec.network.host_ssh:
-        published.append(f"ssh :{vm_spec.network.host_ssh}")
-    if vm_spec.network.host_rdp:
-        published.append(f"rdp :{vm_spec.network.host_rdp}")
+    published = [f"{port.label} :{port.host}" for port in vm_spec.network.ports if port.host]
     progress(f"Created {name} ({', '.join(published)})")
     return meta
 
@@ -286,10 +285,11 @@ def clone(
 
     progress("Allocating host ports...")
     allocated = ports.allocate_all()
-    vm_spec.network.host_web = allocated["web"]
-    vm_spec.network.host_ssh = allocated["ssh"] if 22 in vm_spec.network.guest_ports else 0
+    vm_spec.network.set_role("web", 8006, allocated["web"])
+    if 22 in vm_spec.network.guest_ports:
+        vm_spec.network.set_role("ssh", 22, allocated["ssh"])
     if 3389 in vm_spec.network.guest_ports:
-        vm_spec.network.host_rdp = allocated["rdp"]
+        vm_spec.network.set_role("rdp", 3389, allocated["rdp"])
 
     clone_disk = paths.disk_path(name)
     paths.storage_dir(name).mkdir(parents=True, exist_ok=True)
@@ -778,7 +778,7 @@ def console_url(vm: str, *, ctx: Ctx | None = None) -> str:
         vm_spec = ctx.vm_spec(vm) if ctx else registry.load_spec(vm)
     except Exception:
         return ""
-    host_port = vm_spec.network.host_web
+    host_port = vm_spec.network.host_for("web")
     if not host_port:
         return ""
     return f"http://{vm_spec.network.bind or '127.0.0.1'}:{host_port}/"
@@ -955,16 +955,17 @@ def guest_info(vm: str, *, timeout: float = qga.DEFAULT_TIMEOUT) -> qga.GuestInf
 
 def viewer_port(vm: str, *, ctx: Ctx | None = None) -> int:
     try:
-        return (ctx.vm_spec(vm) if ctx else registry.load_spec(vm)).network.host_web
+        return (ctx.vm_spec(vm) if ctx else registry.load_spec(vm)).network.host_for("web")
     except Exception:
         return 0
 
 
 def ssh_target(vm: str) -> str:
     vm_spec = registry.load_spec(vm)
-    if not vm_spec.network.host_ssh:
+    host_ssh = vm_spec.network.host_for("ssh")
+    if not host_ssh:
         return ""
-    return f"{spec_user_hint(vm)}@{vm_spec.network.bind or '127.0.0.1'} -p {vm_spec.network.host_ssh}"
+    return f"{spec_user_hint(vm)}@{vm_spec.network.bind or '127.0.0.1'} -p {host_ssh}"
 
 
 def spec_user_hint(vm: str) -> str:

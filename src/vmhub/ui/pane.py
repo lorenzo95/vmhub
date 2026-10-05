@@ -14,6 +14,15 @@ from . import style, widgets  # noqa: E402
 
 DISK_TYPES = ["scsi", "blk", "ide", "sata", "nvme"]
 
+# The three ports vmhub drives itself: the title shown for the row, and the
+# guest port behind it. web is the container's own display rather than a
+# guest service, which is why it is never gated on network.guest_ports.
+ROLE_ROWS = {
+    "web": ("Web console", 8006),
+    "ssh": ("SSH", 22),
+    "rdp": ("RDP", 3389),
+}
+
 
 class VmPane(Gtk.Box):
     def __init__(self, window: Gtk.Window, vm_name: str) -> None:
@@ -34,6 +43,7 @@ class VmPane(Gtk.Box):
         self.append(self.notebook)
         self._build_console_tab()
         self._build_hardware_tab()
+        self._build_info_tab()
         self._build_snapshots_tab()
         self._build_actions_tab()
         self._build_logs_tab()
@@ -130,15 +140,13 @@ class VmPane(Gtk.Box):
         self.rdp_missing_hint = Gtk.Label(
             label=(
                 "No RDP port is published for this VM. RDP is only useful for a "
-                "Windows guest; for Linux use the SSH row above."
+                "Windows guest; for Linux use the SSH row above. Publish one from "
+                "the Ports section on the Info tab."
             )
         )
         self.rdp_missing_hint.add_css_class("hint")
         self.rdp_missing_hint.set_wrap(True)
         self.rdp_missing_hint.set_xalign(0.0)
-        self.rdp_enable_button = Gtk.Button(label="Publish an RDP port anyway")
-        self.rdp_enable_button.set_halign(Gtk.Align.START)
-        self.rdp_enable_button.connect("clicked", self._on_enable_rdp)
         self.rdp_test_button = Gtk.Button(label="Test connection")
         self.rdp_test_button.set_tooltip_text(
             "Speak RDP to the published port and report which hop fails"
@@ -158,7 +166,6 @@ class VmPane(Gtk.Box):
         box.append(self.rdp_user_label)
         box.append(self.rdp_test_button)
         box.append(self.rdp_missing_hint)
-        box.append(self.rdp_enable_button)
 
         box.append(widgets.section("Install media"))
         media_hint = Gtk.Label(
@@ -311,23 +318,334 @@ class VmPane(Gtk.Box):
 
         widgets.run_task(self.window, work, on_done=done, label="Testing RDP")
 
-    def _on_enable_rdp(self, _button: object = None) -> None:
+    @staticmethod
+    def _clear_box(box: Gtk.Box) -> None:
+        while True:
+            child = box.get_first_child()
+            if child is None:
+                break
+            nxt = child.get_next_sibling()
+            box.remove(child)
+            child = nxt
+
+    def _refresh_ports(self) -> None:
+        self._clear_box(self.roles_box)
+        self._clear_box(self.ports_box)
+        try:
+            net = registry.load_spec(self.vm).network
+        except VmhubError as exc:
+            label = Gtk.Label(label=str(exc))
+            label.add_css_class("hint")
+            self.ports_box.append(label)
+            return
+        for role in spec.PORT_ROLES:
+            self.roles_box.append(self._role_row(role, net.by_role(role)))
+        extras = [port for port in net.ports if not port.role]
+        if extras:
+            self.ports_box.append(widgets.section("Also forwarding"))
+        for port in extras:
+            self.ports_box.append(self._port_row(port))
+
+    def _role_row(self, role: str, port: spec.Port | None) -> Gtk.Widget:
+        title, guest = ROLE_ROWS[role]
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        name = Gtk.Label(label=title)
+        name.set_xalign(0.0)
+        name.set_size_request(150, -1)
+        row.append(name)
+        if port and port.host:
+            text = Gtk.Label(label=f"host {port.host} → guest {port.guest}")
+            text.add_css_class("mono")
+            text.set_xalign(0.0)
+            text.set_hexpand(True)
+            row.append(text)
+            if role == "rdp":
+                test = Gtk.Button(label="Test")
+                test.set_tooltip_text("Speak RDP to the published port")
+                test.connect("clicked", self._on_test_rdp)
+                row.append(test)
+            change = Gtk.Button(label="Change…")
+            change.connect("clicked", lambda _b, r=role: self._on_change_role(r))
+            row.append(change)
+            remove = Gtk.Button(label="Remove")
+            remove.add_css_class("destructive-action")
+            remove.connect("clicked", lambda _b, r=role: self._on_remove_role(r))
+            row.append(remove)
+        else:
+            text = Gtk.Label(label=f"not published (guest {guest})")
+            text.add_css_class("hint")
+            text.set_xalign(0.0)
+            text.set_hexpand(True)
+            row.append(text)
+            add = Gtk.Button(label="Publish")
+            add.set_tooltip_text(f"Pick a free host port for guest {guest}")
+            add.connect("clicked", lambda _b, r=role: self._on_add_role(r))
+            row.append(add)
+        return row
+
+    def _port_row(self, port: spec.Port) -> Gtk.Widget:
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        name = Gtk.Label(label=port.name or f"guest {port.guest}")
+        name.set_xalign(0.0)
+        name.set_size_request(150, -1)
+        if port.host:
+            text = Gtk.Label(label=f"host {port.host} → guest {port.guest}")
+        else:
+            text = Gtk.Label(label=f"not published (guest {port.guest})")
+            text.add_css_class("hint")
+        text.add_css_class("mono")
+        text.set_xalign(0.0)
+        text.set_hexpand(True)
+        change = Gtk.Button(label="Change…")
+        change.connect("clicked", lambda _b, p=port: self._on_change_port(p))
+        remove = Gtk.Button(label="Remove")
+        remove.add_css_class("destructive-action")
+        remove.connect("clicked", lambda _b, p=port: self._on_remove_port(p))
+        row.append(name)
+        row.append(text)
+        row.append(change)
+        row.append(remove)
+        return row
+
+    def _parse_port(self, text: str, what: str, *, blank_ok: bool = False) -> int | None:
+        """A port the user typed, or None after saying what was wrong."""
+        raw = text.strip()
+        if not raw:
+            if blank_ok:
+                return 0
+            self.window.report(f"Enter a {what}.")
+            return None
+        try:
+            port = int(raw)
+        except ValueError:
+            self.window.report(f"{raw!r} is not a {what}.")
+            return None
+        if not 1 <= port <= 65535:
+            self.window.report(f"A {what} must be between 1 and 65535, not {port}.")
+            return None
+        return port
+
+    def _on_add_role(self, role: str | None = None) -> None:
+        # A bare call has no row behind it; the click handlers always pass
+        # the role they were built for.
+        if not role:
+            return
+        title, guest = ROLE_ROWS[role]
+
         def work(progress):
             from .. import ports as ports_mod
 
             vm_spec = registry.load_spec(self.vm)
-            if 3389 not in vm_spec.network.guest_ports:
-                vm_spec.network.guest_ports = [*vm_spec.network.guest_ports, 3389]
-            if not vm_spec.network.host_rdp:
-                vm_spec.network.host_rdp = ports_mod.allocate("rdp")
-            if not vm_spec.media.rdp_user:
+            net = vm_spec.network
+            if role != "web" and guest not in net.guest_ports:
+                # A guest service the container is not forwarding never answers.
+                net.guest_ports = sorted({*net.guest_ports, guest})
+            host = ports_mod.allocate(
+                role, also_wanted=set(ports_mod.used_by_vms(self.vm)) | set(net.published())
+            )
+            net.set_role(role, guest, host)
+            if role == "rdp" and not vm_spec.media.rdp_user:
                 vm_spec.media.rdp_user = "user"
             vm_spec.validate()
             registry.save_spec(vm_spec)
-            progress(f"RDP will be published on port {vm_spec.network.host_rdp} after the next start")
+            progress(f"{title} will be on host {host} after the next start")
             return True
 
-        widgets.run_task(self.window, work, label="Publishing an RDP port")
+        widgets.run_task(self.window, work, label=f"Publishing {title.lower()}")
+
+    def _on_change_role(self, role: str | None = None) -> None:
+        if not role:
+            return
+        title, guest = ROLE_ROWS[role]
+        current = registry.load_spec(self.vm).network.host_for(role)
+
+        def accept(text: str) -> None:
+            host = self._parse_port(text, "host port")
+            if host is None:
+                return
+
+            def work(progress):
+                vm_spec = registry.load_spec(self.vm)
+                vm_spec.network.set_role(role, guest, host)
+                vm_spec.validate()
+                registry.save_spec(vm_spec)
+                progress(f"{title} will be on host {host} after the next start")
+                return True
+
+            widgets.run_task(self.window, work, label="Changing a port")
+
+        widgets.prompt_text(
+            self.window,
+            f"Change the {title} port",
+            f"The port on this machine that reaches guest port {guest}.",
+            default=str(current),
+            on_accept=accept,
+            placeholder="e.g. 8080",
+        )
+
+    def _on_remove_role(self, role: str | None = None) -> None:
+        if not role:
+            return
+        title, _guest = ROLE_ROWS[role]
+
+        def work(progress):
+            from .. import ports as ports_mod
+
+            vm_spec = registry.load_spec(self.vm)
+            port = vm_spec.network.by_role(role)
+            if port is not None:
+                port.host = 0
+                vm_spec.network.ports.remove(port)
+            ports_mod.prune_guest_forward(vm_spec.network, guest)
+            vm_spec.validate()
+            registry.save_spec(vm_spec)
+            progress(f"{title} will stop being published after the next start")
+            return True
+
+        widgets.run_task(self.window, work, label="Removing a port")
+
+    def _on_add_port(self, _button: object = None) -> None:
+        guest_entry = Gtk.Entry()
+        guest_entry.set_name("vmhub.add-port.guest")
+        guest_entry.set_placeholder_text("5432")
+        name_entry = Gtk.Entry()
+        name_entry.set_name("vmhub.add-port.name")
+        name_entry.set_placeholder_text("PostgreSQL (optional)")
+        host_entry = Gtk.Entry()
+        host_entry.set_name("vmhub.add-port.host")
+        host_entry.set_placeholder_text("leave empty to pick a free one")
+        grid = Gtk.Grid(column_spacing=8, row_spacing=6)
+        for row, (caption, entry) in enumerate((
+            ("Guest port", guest_entry),
+            ("Label", name_entry),
+            ("Host port", host_entry),
+        )):
+            key = Gtk.Label(label=caption)
+            key.set_xalign(0.0)
+            grid.attach(key, 0, row, 1, 1)
+            grid.attach(entry, 1, row, 1, 1)
+
+        def accept(_text: str) -> None:
+            # Read every entry here, on the main loop. The worker below runs
+            # off it, and GTK is not safe to touch from there.
+            guest = self._parse_port(guest_entry.get_text(), "guest port")
+            if guest is None:
+                return
+            host = self._parse_port(host_entry.get_text(), "host port", blank_ok=True)
+            if host is None:
+                return
+            label = name_entry.get_text().strip()
+
+            def work(progress):
+                from .. import ports as ports_mod
+
+                vm_spec = registry.load_spec(self.vm)
+                net = vm_spec.network
+                if host and host in net.published():
+                    raise VmhubError(
+                        f"host port {host} is already published by this VM"
+                    )
+                # A separate name from the one captured above: rebinding
+                # `host` here would make it local to work() and the read
+                # above would raise UnboundLocalError.
+                chosen = host
+                if not chosen:
+                    chosen = ports_mod.allocate_any(
+                        also_wanted=set(ports_mod.used_by_vms(self.vm)) | set(net.published())
+                    )
+                net.ports.append(spec.Port(guest=guest, host=chosen, name=label))
+                # Forward it in the same breath, so the row is not a promise
+                # the container has no way to keep.
+                net.guest_ports = sorted({*net.guest_ports, guest})
+                vm_spec.validate()
+                registry.save_spec(vm_spec)
+                progress(f"guest {guest} will be on host {chosen} after the next start")
+                return True
+
+            widgets.run_task(self.window, work, label="Adding a port")
+
+        dialog = widgets.prompt_text(
+            self.window,
+            "Forward another port",
+            "Publish a port of the VM's own on a port of this machine.",
+            on_accept=accept,
+            extra=grid,
+            accept_label="Add",
+        )
+        # There is no single entry to press Enter in, so wire the grid's own
+        # fields up to the accept button.
+        for entry in (guest_entry, name_entry, host_entry):
+            entry.connect("activate", lambda _e: dialog.accept_button.emit("clicked"))
+        return dialog
+
+    def _on_change_port(self, port: spec.Port | None = None) -> None:
+        if port is None:
+            return
+        guest, old_host, name = port.guest, port.host, port.name
+
+        def accept(text: str) -> None:
+            host = self._parse_port(text, "host port")
+            if host is None:
+                return
+
+            def work(progress):
+                vm_spec = registry.load_spec(self.vm)
+                net = vm_spec.network
+                entry = self._find_port(net, guest, old_host, name)
+                if entry is None:
+                    raise VmhubError("the port list changed; try again")
+                if net.published().get(host, guest) != guest:
+                    raise VmhubError(f"host port {host} is already published by this VM")
+                entry.host = host
+                vm_spec.validate()
+                registry.save_spec(vm_spec)
+                progress(f"guest {guest} will be on host {host} after the next start")
+                return True
+
+            widgets.run_task(self.window, work, label="Changing a port")
+
+        widgets.prompt_text(
+            self.window,
+            "Change the host port",
+            f"The port on this machine that reaches guest port {guest}.",
+            default=str(old_host),
+            on_accept=accept,
+            placeholder="e.g. 15432",
+        )
+
+    def _on_remove_port(self, port: spec.Port | None = None) -> None:
+        if port is None:
+            return
+        guest, host, name = port.guest, port.host, port.name
+
+        def work(progress):
+            from .. import ports as ports_mod
+
+            vm_spec = registry.load_spec(self.vm)
+            entry = self._find_port(vm_spec.network, guest, host, name)
+            if entry is None:
+                raise VmhubError("the port list changed; try again")
+            vm_spec.network.ports.remove(entry)
+            ports_mod.prune_guest_forward(vm_spec.network, guest)
+            vm_spec.validate()
+            registry.save_spec(vm_spec)
+            progress(f"guest {guest} will stop being reachable after the next start")
+            return True
+
+        widgets.run_task(self.window, work, label="Removing a port")
+
+    @staticmethod
+    def _find_port(net: spec.Network, guest: int, host: int, name: str) -> spec.Port | None:
+        """The entry a row was drawn from, matched on what the row showed.
+
+        The table is rebuilt from a poll every few seconds, so the object
+        the row holds is a snapshot. Matching on the values the user can
+        see means a stale row fails loudly instead of moving the wrong port.
+        """
+        for port in net.ports:
+            if port.guest == guest and port.host == host and port.name == name:
+                return port
+        return None
 
     def _on_remmina(self, _button: object = None) -> None:
         try:
@@ -434,10 +752,42 @@ class VmPane(Gtk.Box):
         apply_hint.set_xalign(0.0)
         box.append(apply_hint)
 
+        self._add_tab("Hardware", widgets.scroll(box))
+
+    def _build_info_tab(self) -> None:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(14)
+        box.set_margin_bottom(14)
+        box.set_margin_start(14)
+        box.set_margin_end(14)
+
+        box.append(widgets.section("Ports"))
+        ports_hint = Gtk.Label(
+            label="Each forward sends a port on this machine to a port inside the VM. "
+            "Web console, SSH and RDP are set up for you; anything else you add is "
+            "yours to keep track of. Changes take effect the next time the VM starts."
+        )
+        ports_hint.add_css_class("hint")
+        ports_hint.set_wrap(True)
+        ports_hint.set_xalign(0.0)
+        box.append(ports_hint)
+
+        self.roles_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.append(self.roles_box)
+        self.ports_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.append(self.ports_box)
+        add_button = Gtk.Button(label="Forward another port…")
+        add_button.set_halign(Gtk.Align.START)
+        add_button.set_tooltip_text(
+            "Publish a port of your own -- a database, say -- on a port of your choosing"
+        )
+        add_button.connect("clicked", self._on_add_port)
+        box.append(add_button)
+
         box.append(widgets.section("Details"))
         self.details_grid = widgets.key_value_grid([])
         box.append(self.details_grid)
-        self._add_tab("Hardware", widgets.scroll(box))
+        self._add_tab("Info", widgets.scroll(box))
 
     def _build_snapshots_tab(self) -> None:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -610,6 +960,8 @@ class VmPane(Gtk.Box):
         self.media_notice.set_visible(False)
         self.finish_install_button.set_visible(False)
         _replace_grid(self.details_grid, [])
+        self._clear_box(self.roles_box)
+        self._clear_box(self.ports_box)
 
     def _update_details(self, status: lifecycle.VmStatus) -> None:
         parts = [status.summary, f"{status.cpus} vCPU", status.ram, status.disk_size]
@@ -686,7 +1038,6 @@ class VmPane(Gtk.Box):
             widgets.set_copy_text(self.rdp_row, target.uri())
         self.remmina_button.set_visible(has_rdp and rdp.remmina_available())
         self.rdp_missing_hint.set_visible(not has_rdp)
-        self.rdp_enable_button.set_visible(not has_rdp)
         self.rdp_test_button.set_visible(has_rdp)
         user = registry.load_spec(status.name).media.rdp_user or ""
         self.rdp_user_label.set_visible(has_rdp and not user)
@@ -705,6 +1056,8 @@ class VmPane(Gtk.Box):
             bool(getattr(status, "finish_install_needed", False))
         )
 
+        self._refresh_ports()
+
         details = [
             ("Container", podman.container_name(status.name)),
             ("Image", registry.load_meta(status.name).image or "-"),
@@ -713,8 +1066,7 @@ class VmPane(Gtk.Box):
             ("Disk bus", status.disk_type),
             ("Boot mode", status.boot_mode),
             ("Backing file", status.backing or "none (self-contained)"),
-            ("Host ports", ", ".join(f"{h} → {g}" for h, g in sorted(status.ports.items())) or "-"),
-            ("Guest ports", ", ".join(str(p) for p in status.guest_ports) or "-"),
+            ("Guest ports forwarded", ", ".join(str(p) for p in status.guest_ports) or "-"),
             ("Boot media", status.boot_image or "-"),
             ("Guest-to-guest", ", ".join(status.peer_targets)
                 if status.peer_targets
