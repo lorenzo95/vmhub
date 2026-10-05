@@ -863,10 +863,37 @@ def main() -> int:
     check("no secret anywhere in the bundle",
           b"console-pw-canary" not in packed and b"rdp-pw-canary" not in packed)
 
+    section("settings survive a save and reload")
+    rt = f"{VM}-roundtrip"
+    lifecycle.create(rt, blueprint="debian13")
+    rt_spec = registry.load_spec(rt)
+    rt_spec.features.guest_agent = False
+    rt_spec.features.hv = False
+    rt_spec.resources.kvm = False
+    rt_spec.shutdown.timeout = 0
+    registry.save_spec(rt_spec)
+    back = registry.load_spec(rt)
+    check("features.guest_agent=false survives a reload",
+          back.features.guest_agent is False, str(back.features))
+    check("features.hv=false survives a reload",
+          back.features.hv is False, str(back.features))
+    check("resources.kvm=false survives a reload",
+          back.resources.kvm is False, str(back.resources))
+    check("shutdown.timeout=0 survives a reload",
+          back.shutdown.timeout == 0, str(back.shutdown.timeout))
+    check("the reloaded spec reaches the container env",
+          "QGA" not in back.env(uuid="u", mac="m"), str(back.env(uuid="u", mac="m")))
+    check("empty strings are still pruned from the file",
+          "media_type" not in back.to_dict().get("boot", {}),
+          str(back.to_dict().get("boot", {})))
+    check("an explicit false is written out",
+          back.to_dict()["features"].get("guest_agent") is False,
+          str(back.to_dict().get("features", {})))
+
     section("cleanup")
     for name in (
         f"{VM}-stop", f"{VM}-rival", f"{VM}-stale", f"{VM}-clone2",
-        f"{VM}-secret", f"{VM}-fresh", f"{VM}-chosen",
+        f"{VM}-secret", f"{VM}-fresh", f"{VM}-chosen", f"{VM}-roundtrip",
         f"{VM}-clone", f"{VM}-linked-import", f"{VM}-libvirt",
         f"{VM}-plain", f"{VM}-full-from-plain", imported, VM,
     ):

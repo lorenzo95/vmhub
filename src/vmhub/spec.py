@@ -269,7 +269,16 @@ class VmSpec:
 
 
 def _is_empty(value: Any) -> bool:
-    return value is None or value == "" or value == [] or value == {} or value is False or value == 0
+    """True for values worth omitting from vm.toml.
+
+    False and 0 are deliberately NOT empty. Dropping them here meant a
+    spec that had guest_agent=False or shutdown.timeout=0 came back from
+    spec_from_dict() holding the dataclass default instead, and `vmctl set`
+    reported success while the value silently reverted. Writing the value
+    is the only way the file can distinguish 'explicitly off' from 'never
+    set', so False and 0 are kept even where they match the default.
+    """
+    return value is None or value == "" or value == [] or value == {}
 
 
 def _prune(data: dict[str, Any]) -> dict[str, Any]:
