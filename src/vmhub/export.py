@@ -114,7 +114,18 @@ def export_vm(
                 mac="",
                 ip="",
             ),
-            display=vm_spec.display,
+            # Never carry the console password out of the bundle. The
+            # rest of Display is cosmetic and worth keeping; the password is
+            # a secret, and protected must be cleared with it because
+            # spec.validate() rejects protected without a password.
+            display=spec.Display(
+                protected=False,
+                password="",
+                audio=vm_spec.display.audio,
+                gpu=vm_spec.display.gpu,
+                lossy=vm_spec.display.lossy,
+                vga=vm_spec.display.vga,
+            ),
             features=vm_spec.features,
         )
         (staging / paths.SPEC_FILE).write_text(

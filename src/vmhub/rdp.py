@@ -95,7 +95,9 @@ def target(vm: str) -> RdpTarget:
         host=vm_spec.network.bind or "127.0.0.1",
         port=vm_spec.network.host_rdp,
         user=rdp_user(vm),
-        password=vm_spec.media.rdp_password or "admin",
+        # No invented default: a blank password must stay blank so the
+        # client prompts, and so nothing lands in the process table.
+        password=vm_spec.media.rdp_password,
     )
 
 

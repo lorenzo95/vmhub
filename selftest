@@ -797,9 +797,51 @@ def main() -> int:
     except VmhubError:
         check("shrink is refused", True)
 
+    section("secrets never leave the process")
+    check("no password is invented when none is configured",
+          rdp.RdpTarget("h", 1, "u", "").password == "")
+    check("an empty password produces no freerdp /p: flag",
+          not any(a.startswith("/p:")
+                  for a in rdp.RdpTarget("h", 1, "u", "").freerdp_argv()))
+    check("a configured password still reaches freerdp",
+          any(a == "/p:real-pw"
+              for a in rdp.RdpTarget("h", 1, "u", "real-pw").freerdp_argv()))
+
+    secret_vm = f"{VM}-secret"
+    lifecycle.create(secret_vm, blueprint="alpine")
+    secret_spec = registry.load_spec(secret_vm)
+    secret_spec.display.protected = True
+    secret_spec.display.password = "console-pw-canary"
+    secret_spec.media.rdp_user = "Administrator"
+    registry.save_spec(secret_spec)
+    check("a known account with no password gets no password",
+          rdp.target(secret_vm).password == "", rdp.target(secret_vm).password)
+    secret_spec = registry.load_spec(secret_vm)
+    secret_spec.media.rdp_password = "rdp-pw-canary"
+    registry.save_spec(secret_spec)
+
+    secret_archive = export.export_vm(secret_vm)
+    secret_manifest = export.read_manifest(secret_archive)
+    check("export keeps the console password out of the manifest",
+          "console-pw-canary" not in json.dumps(secret_manifest))
+    check("export keeps the rdp password out of the manifest",
+          "rdp-pw-canary" not in json.dumps(secret_manifest))
+    check("the exported spec is not left marked protected",
+          secret_manifest["spec"]["display"].get("protected", False) is False,
+          str(secret_manifest["spec"]["display"]))
+    with export.tarfile.open(secret_archive, "r:*") as secret_tar:
+        packed = b"".join(
+            secret_tar.extractfile(m).read()
+            for m in secret_tar.getmembers()
+            if m.isfile() and m.size < 2_000_000
+        )
+    check("no secret anywhere in the bundle",
+          b"console-pw-canary" not in packed and b"rdp-pw-canary" not in packed)
+
     section("cleanup")
     for name in (
         f"{VM}-stop", f"{VM}-rival", f"{VM}-stale", f"{VM}-clone2",
+        f"{VM}-secret",
         f"{VM}-clone", f"{VM}-linked-import", f"{VM}-libvirt",
         f"{VM}-plain", f"{VM}-full-from-plain", imported, VM,
     ):
