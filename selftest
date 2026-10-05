@@ -890,10 +890,38 @@ def main() -> int:
           back.to_dict()["features"].get("guest_agent") is False,
           str(back.to_dict().get("features", {})))
 
+    section("finish install is offered exactly when it helps")
+    fi = f"{VM}-finishinstall"
+    # No blueprint: a blueprint sets boot.iso, and finish_install()
+    # legitimately has something to clear in that case.
+    lifecycle.create(fi)
+    check("a fresh VM with nothing attached does not need finishing",
+          lifecycle.status(fi).finish_install_needed is False,
+          str(lifecycle.status(fi).notices))
+    fi_spec = registry.load_spec(fi)
+    fi_spec.media.install = "/tmp/does-not-need-to-exist.iso"
+    registry.save_spec(fi_spec)
+    check("an attached install ISO means finishing is needed",
+          lifecycle.status(fi).finish_install_needed is True,
+          str(lifecycle.status(fi).notices))
+    check("and the advice is shown in the same refresh",
+          any("install ISO" in n for n in lifecycle.status(fi).notices),
+          str(lifecycle.status(fi).notices))
+    fi_spec = registry.load_spec(fi)
+    fi_spec.media.install = ""
+    registry.save_spec(fi_spec)
+    check("detaching the ISO removes the need again",
+          lifecycle.status(fi).finish_install_needed is False,
+          str(lifecycle.status(fi).notices))
+    fi_actions = lifecycle.finish_install(fi)
+    check("finish-install is a no-op on a clean VM",
+          fi_actions == [], str(fi_actions))
+
     section("cleanup")
     for name in (
         f"{VM}-stop", f"{VM}-rival", f"{VM}-stale", f"{VM}-clone2",
         f"{VM}-secret", f"{VM}-fresh", f"{VM}-chosen", f"{VM}-roundtrip",
+        f"{VM}-finishinstall",
         f"{VM}-clone", f"{VM}-linked-import", f"{VM}-libvirt",
         f"{VM}-plain", f"{VM}-full-from-plain", imported, VM,
     ):

@@ -175,6 +175,16 @@ class VmPane(Gtk.Box):
         self.media_notice.set_wrap(True)
         self.media_notice.set_xalign(0.0)
         box.append(self.media_notice)
+        self.finish_install_button = Gtk.Button(label="Finish install")
+        self.finish_install_button.add_css_class("suggested-action")
+        self.finish_install_button.set_halign(Gtk.Align.START)
+        self.finish_install_button.set_tooltip_text(
+            "Detach any install ISO and drop the cached fallback image, so this "
+            "VM boots from its disk and nothing else"
+        )
+        self.finish_install_button.set_visible(False)
+        self.finish_install_button.connect("clicked", self._on_finish_install)
+        box.append(self.finish_install_button)
 
         self.iso_rows: dict[str, dict[str, object]] = {}
         for slot in (isomod.INSTALL_SLOT, isomod.DRIVERS_SLOT):
@@ -598,6 +608,7 @@ class VmPane(Gtk.Box):
             detail.set_text("unknown")
             row["detach"].set_sensitive(False)
         self.media_notice.set_visible(False)
+        self.finish_install_button.set_visible(False)
         _replace_grid(self.details_grid, [])
 
     def _update_details(self, status: lifecycle.VmStatus) -> None:
@@ -687,6 +698,9 @@ class VmPane(Gtk.Box):
         notices = list(getattr(status, "notices", []))
         self.media_notice.set_text("\n".join(notices))
         self.media_notice.set_visible(bool(notices))
+        self.finish_install_button.set_visible(
+            bool(getattr(status, "finish_install_needed", False))
+        )
 
         details = [
             ("Container", podman.container_name(status.name)),
@@ -1024,6 +1038,18 @@ class VmPane(Gtk.Box):
             self.window,
             lambda progress: lifecycle.flatten(self.vm, progress=progress),
             label="Flattening",
+        )
+
+    def _on_finish_install(self, _button) -> None:
+        widgets.run_task(
+            self.window,
+            lambda progress: lifecycle.finish_install(self.vm, progress=progress),
+            label=f"Finishing install of {self.vm}",
+            on_done=lambda actions: self.window.report(
+                f"{self.vm}: {'; '.join(actions)}"
+                if actions
+                else f"{self.vm} already boots from its disk"
+            ),
         )
 
     def _on_export(self, _button) -> None:

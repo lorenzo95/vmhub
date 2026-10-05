@@ -58,6 +58,7 @@ class VmStatus:
     peer_targets: list[str] = field(default_factory=list)
     live_media: list[str] = field(default_factory=list)
     drifted: bool = False
+    finish_install_needed: bool = False
     notices: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -733,11 +734,18 @@ def status(vm: str, *, ctx: Ctx | None = None) -> VmStatus:
             f"both an attached ISO and boot.iso={vm_spec.boot.iso!r} are set — "
             f"the container would download {vm_spec.boot.iso!r} too"
         )
-    if has_disk and result.has_disk_data and (paths.storage_dir(vm) / "boot.iso").is_file():
+    cached_fallback = has_disk and result.has_disk_data and (
+        paths.storage_dir(vm) / "boot.iso"
+    ).is_file()
+    if cached_fallback:
         result.notices.append(
             "a cached fallback image is still attached as the last boot device; "
-            f"vmctl finish-install {vm} removes it"
+            f"finish-install it below (or vmctl finish-install {vm}) to remove it"
         )
+    # Same conditions as the notices above, so the GUI button and the
+    # advice never disagree. A fresh alpine VM sets boot.iso on purpose
+    # and has nothing to detach, so it is deliberately not offered.
+    result.finish_install_needed = bool(vm_spec.media.install) or cached_fallback
     if has_disk and not result.has_disk_data and not result.backing:
         result.notices.append(
             "disk is still empty, so the container downloads an Alpine Linux ISO "
