@@ -281,6 +281,7 @@ class VmhubWindow(Gtk.ApplicationWindow):
             child = self.list_box.get_first_child()
             while child is not None:
                 nxt = child.get_next_sibling()
+                self._dispose_row_menu(child)
                 self.list_box.remove(child)
                 child = nxt
             self.rows.clear()
@@ -325,6 +326,13 @@ class VmhubWindow(Gtk.ApplicationWindow):
         finally:
             self._syncing = False
 
+    def _dispose_row_menu(self, row: Gtk.Widget) -> None:
+        """Let go of a row's popover before the row goes away."""
+        popover = getattr(row, "_vmhub_popover", None)
+        if popover is not None:
+            popover.unparent()
+            row._vmhub_popover = None
+
     def _attach_row_menu(self, row: Gtk.ListBoxRow, name: str) -> None:
         """Right-click actions for one VM, without selecting it first."""
         menu = Gio.Menu()
@@ -342,6 +350,17 @@ class VmhubWindow(Gtk.ApplicationWindow):
         popover = Gtk.PopoverMenu()
         popover.set_menu_model(menu)
         popover.set_has_arrow(False)
+        # The popover needs a parent before it can be popped up. Without
+        # one, popup() realises it outside the widget hierarchy, gets no
+        # surface, and GTK4 takes the whole process down with it -- so
+        # right-clicking a VM in the sidebar killed the app. Parenting it to
+        # the row also means it dies with the row when the list is rebuilt.
+        popover.set_parent(row)
+        # Kept on the row so it can be released when the row is thrown away.
+        # A parented popover outlives its parent otherwise, and GTK complains
+        # about a row finalised with children still on it every time the list
+        # is rebuilt -- which is every time a VM is added, removed or filtered.
+        row._vmhub_popover = popover
 
         gesture = Gtk.GestureClick()
         gesture.set_button(3)

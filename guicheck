@@ -589,6 +589,50 @@ def _probe(app) -> None:
         ))
         print("  \033[31mFAIL\033[0m  the default blueprint option is not usable")
 
+    # ---- Delete has to be reachable, and right-click has to not be fatal ----
+    # Right-clicking a VM row popped up a menu that had no parent widget.
+    # GTK4 realised it outside the hierarchy, got no surface, and killed
+    # the process. Delete was only in that menu, so the crash also meant
+    # there was no way to delete a VM at all.
+    popovers: list[Gtk.PopoverMenu] = []
+    for widget in _walk(window):
+        if isinstance(widget, Gtk.PopoverMenu):
+            popovers.append(widget)
+    orphan = [p for p in popovers if p.get_parent() is None]
+    if popovers and not orphan:
+        exercised.append("right-clicking a VM opens its menu without dying")
+        print("  \033[32mPASS\033[0m  right-clicking a VM opens its menu without dying")
+    else:
+        failures.append((
+            "row menu popover",
+            f"{len(popovers)} found, {len(orphan)} without a parent",
+        ))
+        print(
+            f"  \033[31mFAIL\033[0m  {len(orphan)} of {len(popovers)} row-menu "
+            "popovers have no parent (right-click would kill the app)"
+        )
+
+    # Gio.Menu sections are opaque to PyGObject -- get_item_attribute_value
+    # returns None for "section" -- so the menu's contents are asserted from
+    # the source in selftest rather than here.
+
+    # And Delete has a button, which is the point: dissolving the Actions tab
+    # left the one action that cannot be undone reachable only by right-click.
+    header_buttons = {
+        w.get_label()
+        for w in _walk(pane.header_bar)
+        if isinstance(w, Gtk.Button)
+    }
+    if any(label and label.startswith("Delete") for label in header_buttons):
+        exercised.append("Delete has a button in the pane header")
+        print("  \033[32mPASS\033[0m  Delete has a button in the pane header")
+    else:
+        failures.append((
+            "delete button missing",
+            f"header has {sorted(b for b in header_buttons if b)}",
+        ))
+        print("  \033[31mFAIL\033[0m  there is no Delete button in the pane header")
+
     # ---- the tab you are on carries over to a VM you have not opened ----
     # Every new pane used to open on the Console, so comparing two machines
     # meant clicking back to the same tab every time you switched.

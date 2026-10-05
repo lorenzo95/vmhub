@@ -829,6 +829,34 @@ def main() -> int:
                     duplicates.append(f"{path.name}:{node.name}.{name}@{lines}")
     check("no duplicate GUI method definitions", not duplicates, str(duplicates))
 
+# A popover with no parent is not a cosmetic problem. popup() realises it
+    # outside the widget hierarchy, gets no surface, and GTK4 segfaults --
+    # right-clicking a VM in the sidebar used to take the whole app down.
+    orphan_popovers: list[str] = []
+    for path in sorted(ui_dir.glob("*.py")):
+        for _cls, _fn, src in gui_methods(path):
+            if "Popover" not in src:
+                continue
+            if not re.search(r"\.(set_parent|set_parent_widget)\s*\(", src):
+                orphan_popovers.append(f"{path.name}:{_cls}.{_fn}")
+    check("every popover is given a parent before it is popped up",
+          not orphan_popovers, str(orphan_popovers))
+
+    # Gio.Menu sections are opaque to PyGObject, so what the sidebar's
+    # right-click menu contains is checked here rather than in guicheck.
+    # Delete lives in that menu as well as on the pane header: when the
+    # Actions tab was dissolved it was left with no button at all.
+    row_menu_src = (ui_dir / "window.py").read_text()
+    attach = ""
+    for _cls, fn, src in gui_methods(ui_dir / "window.py"):
+        if fn == "_attach_row_menu":
+            attach = src
+    check("the sidebar context menu still offers Delete",
+          "Delete" in attach and "row.delete" in attach,
+          attach[:120].replace("\n", " "))
+    check("Delete is a button on the pane header, not only in a menu",
+          "delete_button" in (ui_dir / "pane.py").read_text())
+
     # A handler that builds a dialog directly (rather than via prompt_text) must
     # also show it; TextPrompt does not present itself any more, but this catches
     # any future dialog that gets constructed and dropped.

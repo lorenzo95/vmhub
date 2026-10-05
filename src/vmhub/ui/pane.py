@@ -96,9 +96,20 @@ class VmPane(Gtk.Box):
         )
         self.force_button.connect("clicked", self._on_force_stop)
 
+        # Delete lost its button when the Actions tab was dissolved and was
+        # reachable only from the sidebar's right-click menu, which is not
+        # somewhere to keep the one action that cannot be undone.
+        self.delete_button = Gtk.Button(label="Delete…")
+        self.delete_button.add_css_class("destructive-action")
+        self.delete_button.set_tooltip_text(
+            "Remove this VM, its container and its disk. This cannot be undone."
+        )
+        self.delete_button.connect("clicked", self._on_delete)
+
         bar.append(self.snapshot_button)
         bar.append(self.power_button)
         bar.append(self.force_button)
+        bar.append(self.delete_button)
         self.append(bar)
         self.header_bar = bar
 
