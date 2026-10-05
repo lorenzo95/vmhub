@@ -32,7 +32,7 @@ if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
 import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from vmhub import (  # noqa: E402
     iso as isomod,
@@ -246,13 +246,13 @@ def _probe(app) -> None:
         print("  \033[32mPASS\033[0m  pane pruned when the VM disappeared")
 
     # ---- sidebar context menu and accelerators ----
-    # These must be looked up under the "row." prefix the menu model uses.
-    # This check used the bare names and passed happily while every item in
-    # the context menu was greyed out, because it was confirming that
-    # actions nobody could reach existed.
+    # These live in the "row" action group, not on the window. Checking the
+    # window used to pass while every item in the menu was greyed out: the
+    # window did have the actions, just not anywhere the popover could see.
+    row_group = getattr(window, "row_actions", None)
     missing_actions = [
         name for name in ("console", "start", "stop", "clone", "export", "delete")
-        if window.lookup_action(f"row.{name}") is None
+        if row_group is None or row_group.lookup_action(name) is None
     ]
     if missing_actions:
         failures.append(("row actions missing", str(missing_actions)))
@@ -644,42 +644,86 @@ def _probe(app) -> None:
 
     # A menu item is greyed out when its action cannot be resolved, and the
     # label still renders perfectly well while greyed -- so this is invisible
-    # in a screenshot and needs asking the live window directly. The actions
-    # were registered bare ("delete") while the menu asked for "row.delete",
-    # which made every item in the context menu a no-op.
+    # in a screenshot and has to be asked of the widget that owns the menu.
     #
-    # The names come from the source because Gio.Menu sections cannot be
-    # walked from PyGObject; the lookup itself is against the real window.
-    menu_source = inspect.getsource(window._attach_row_menu)
-    row_actions = sorted(set(re.findall(r'"row\.(\w+)::', menu_source)))
-    unresolved = []
-    for kind in row_actions:
-        full = f"row.{kind}"
-        action = window.lookup_action(full)
-        if action is None:
-            unresolved.append(f"{full} (not registered)")
-            continue
-        # Gio.Action.get_parameter_type_string() is not bound by PyGObject;
-        # get_parameter_type() returns a GLib.VariantType (None if no argument).
-        vtype = action.get_parameter_type()
-        ptype = vtype.dup_string() if vtype is not None else None
-        if ptype != "s":
-            unresolved.append(f"{full} (takes {ptype!r}, not a VM name)")
-    if row_actions and not unresolved:
-        exercised.append(f"all {len(row_actions)} sidebar menu actions are live")
-        print(
-            f"  \033[32mPASS\033[0m  all {len(row_actions)} sidebar menu actions "
-            "resolve and accept a VM name"
-        )
+    # "row.delete" means "the action delete in the group named row". These
+    # actions used to live on the window, which a popover parented to a
+    # sidebar row does not resolve: every item was a no-op. Asking the
+    # window -- which is what a test naturally reaches for -- passes anyway,
+    # because the window did have them. So this asks the popover.
+    #
+    # The probe action is added to the app's own group and does nothing, so
+    # resolution is exercised with no side effect on any VM.
+    row_popover = next(
+        (
+            w for w in _walk(window)
+            if isinstance(w, Gtk.PopoverMenu)
+            and isinstance(w.get_parent(), Gtk.ListBoxRow)
+        ),
+        None,
+    )
+    row_group = getattr(window, "row_actions", None)
+    if row_popover is None or row_group is None:
+        failures.append(("row popover", "no row-parented popover or no action group"))
+        print("  \033[31mFAIL\033[0m  no row-parented popover with an action group")
+    else:
+        probe_action = Gio.SimpleAction.new("guicheck_resolves", None)
+        row_group.add_action(probe_action)
+        resolves = row_popover.activate_action("row.guicheck_resolves", None)
+
+        menu_source = inspect.getsource(window._attach_row_menu)
+        row_actions = sorted(set(re.findall(r'"row\.(\w+)::', menu_source)))
+        missing = []
+        for kind in row_actions:
+            action = row_group.lookup_action(kind)
+            if action is None:
+                missing.append(f"row.{kind} (not in the group)")
+                continue
+            vtype = action.get_parameter_type()
+            if vtype is None or vtype.dup_string() != "s":
+                missing.append(f"row.{kind} (takes no VM name)")
+        if resolves and row_actions and not missing:
+            exercised.append("the sidebar menu's actions resolve from the row popover")
+            print(
+                f"  \033[32mPASS\033[0m  the sidebar menu's {len(row_actions)} actions "
+                "resolve from the row popover"
+            )
+        else:
+            failures.append((
+                "sidebar menu actions",
+                f"popover resolves={resolves}, menu names {row_actions}, "
+                f"unusable: {missing or 'none found'}",
+            ))
+            print(
+                f"  \033[31mFAIL\033[0m  sidebar menu actions do not resolve "
+                f"(popover resolves={resolves}): {missing}"
+            )
+
+    # The header's overflow menu asks for win.* and needs its own group for
+    # the same reason. It carries no VM name, so a parameterless probe works.
+    win_group = getattr(window, "win_actions", None)
+    header_popover = next(
+        (
+            w for w in _walk(window)
+            if isinstance(w, Gtk.PopoverMenu)
+            and isinstance(w.get_parent(), Gtk.MenuButton)
+        ),
+        None,
+    )
+    win_resolves = False
+    if header_popover is not None and win_group is not None:
+        win_group.add_action(Gio.SimpleAction.new("guicheck_resolves", None))
+        win_resolves = header_popover.activate_action("win.guicheck_resolves", None)
+    if win_resolves:
+        exercised.append("the header overflow menu's actions resolve")
+        print("  \033[32mPASS\033[0m  the header overflow menu's actions resolve")
     else:
         failures.append((
-            "sidebar menu actions",
-            f"menu names {row_actions}, unusable: {unresolved or 'none found'}",
+            "header menu actions",
+            f"popover={header_popover is not None} group={win_group is not None} "
+            f"resolves={win_resolves}",
         ))
-        print(
-            f"  \033[31mFAIL\033[0m  {len(unresolved) or 'no'} sidebar menu actions "
-            f"are greyed out: {unresolved}"
-        )
+        print("  \033[31mFAIL\033[0m  the header overflow menu's actions do not resolve")
 
     # ---- the tab you are on carries over to a VM you have not opened ----
     # Every new pane used to open on the Console, so comparing two machines

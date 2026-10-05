@@ -874,20 +874,30 @@ def main() -> int:
     check("Delete is a button on the pane header, not only in a menu",
           "delete_button" in (ui_dir / "pane.py").read_text())
 
-    # Every action the sidebar menu names must be registered under exactly
-    # that name. They were registered bare ("delete") while the menu asked
-    # for "row.delete", so Gtk.PopoverMenu greyed out all of them: the
-    # labels still rendered, so the menu looked real and did nothing.
+    # A menu entry "row.delete" means "the action `delete` in the group named
+    # `row`". The actions used to be added to the window instead, and a
+    # PopoverMenu parented to a sidebar row does not resolve the window's
+    # actions -- so every item went grey with its label drawn perfectly
+    # normally. The header's overflow menu had the same defect with win.*.
     install = ""
+    win_install = ""
     for _cls, fn, src in gui_methods(ui_dir / "window.py"):
         if fn == "_install_row_actions":
             install = src
+        elif fn == "_install_win_actions":
+            win_install = src
     wanted = sorted(set(re.findall(r"row\.(\w+)::", attach)))
     check("the sidebar menu names some actions to check",
-          bool(wanted), f"no row.<name>:: entries found in _attach_row_menu")
-    check("row actions are registered with the prefix the menu asks for",
-          'f"row.{action_name}"' in install,
-          "registered name must be built as f\"row.{action_name}\"")
+          bool(wanted), "no row.<name>:: entries found in _attach_row_menu")
+    check("sidebar actions go in a group the row popovers can reach",
+          'insert_action_group("row"' in install,
+          '_install_row_actions must insert_action_group("row", ...) on the list box')
+    check("sidebar actions are added to that group, not to the window",
+          "group.add_action(action)" in install and "self.add_action" not in install,
+          "add_action on the window is not reachable from a row's popover")
+    check("the header overflow menu's actions go in a win group too",
+          'insert_action_group("win"' in win_install,
+          'the overflow menu asks for win.* and needs that group inserted')
     registered = re.search(r'for action_name in \(([^)]*)\)', install)
     listed = sorted(re.findall(r'"(\w+)"', registered.group(1))) if registered else []
     check("every sidebar menu action is registered",

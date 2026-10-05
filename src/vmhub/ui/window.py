@@ -139,6 +139,9 @@ class VmhubWindow(Gtk.ApplicationWindow):
         self.list_box.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.list_box.connect("row-selected", self._on_row_selected)
         self.list_box.connect("row-activated", self._on_row_activated)
+        # The action group has to go into the list box, so it cannot be
+        # installed alongside the other actions before this widget exists.
+        self._install_row_actions()
 
         sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         scroller = Gtk.ScrolledWindow()
@@ -179,25 +182,46 @@ class VmhubWindow(Gtk.ApplicationWindow):
         self._vmhub_status = self.status_strip
 
     def _install_row_actions(self) -> None:
+        """Put the sidebar's actions where the row popovers can reach them.
+
+        A menu entry like "row.delete" means "the action `delete` in the
+        group named `row`". No such group existed: the actions were added to
+        the window instead, and a PopoverMenu parented to a sidebar row does
+        not resolve the window's actions. Every item in the context menu was
+        therefore greyed out -- with its label drawn perfectly normally, so
+        the menu looked like a menu and did nothing.
+
+        Measured, not assumed: for the same menu model, activate_action()
+        returns False with the actions on the window and True once a
+        SimpleActionGroup named "row" is inserted into the list box.
+        """
+        group = Gio.SimpleActionGroup()
         for action_name in ("console", "start", "stop", "clone", "export", "delete"):
-            # The name must carry the same "row." prefix the sidebar menu
-            # model uses. It used to be registered bare, so every item in
-            # the context menu pointed at an action that did not exist and
-            # Gtk.PopoverMenu greyed all of them out -- the labels rendered
-            # fine, which is why it looked like a menu rather than a dud.
-            # A PopoverMenu resolves actions by walking up the widget tree,
-            # so registering them on the window is enough for the rows.
-            action = Gio.SimpleAction.new(
-                f"row.{action_name}", GLib.VariantType.new("s")
-            )
+            action = Gio.SimpleAction.new(action_name, GLib.VariantType.new("s"))
             action.connect(
                 "activate",
                 lambda _a, param, kind=action_name: self._row_action(kind, param.get_string()),
             )
-            self.add_action(action)
+            group.add_action(action)
+        self.row_actions = group
+        self.list_box.insert_action_group("row", group)
+
+    def _install_win_actions(self) -> None:
+        """Same story for the header's overflow menu, which asks for win.*."""
+        group = Gio.SimpleActionGroup()
+        for action_name, handler in (
+            ("refresh", self.refresh),
+            ("doctor", self._on_doctor),
+            ("restore", self._on_restore),
+        ):
+            action = Gio.SimpleAction.new(action_name, None)
+            action.connect("activate", lambda _a, fn=handler: fn())
+            group.add_action(action)
+        self.win_actions = group
+        self.insert_action_group("win", group)
 
     def _install_actions(self) -> None:
-        self._install_row_actions()
+        self._install_win_actions()
         refresh = Gio.SimpleAction.new("refresh", None)
         refresh.connect("activate", lambda *a: self.refresh())
         self.add_action(refresh)
