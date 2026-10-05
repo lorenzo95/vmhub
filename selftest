@@ -1233,10 +1233,23 @@ def main() -> int:
     check("and it really moved", bool(moved) and moved[0].host == 16000, str(moved))
     rc, text = run_ports("set", "16000", "--host", "16000")
     check("setting a port to the host it already has is a clean no-op",
-          rc == 0 and "already on host" in text, text.strip())
+          rc == 0 and "already host 16000" in text, text.strip())
     rc, text = run_ports("set", str(first_host), "--host", "16000")
     check("naming a host port that has moved is an error, not a silent no-op",
           rc == 1 and "publishes no port" in text, text.strip())
+    rc, text = run_ports("set", "16000", "--guest", "5433")
+    check("a mistyped guest number can be corrected in place", rc == 0, text.strip())
+    fixed = [p for p in registry.load_spec(pvm).network.ports if p.host == 16000]
+    check("and the corrected guest number is the one published",
+          bool(fixed) and fixed[0].guest == 5433, str(fixed))
+    check("and the old one stops being forwarded",
+          5432 not in registry.load_spec(pvm).network.guest_ports
+          and 5433 in registry.load_spec(pvm).network.guest_ports,
+          str(registry.load_spec(pvm).network.guest_ports))
+    check("and the port keeps its label", bool(fixed) and fixed[0].name == "Postgres", str(fixed))
+    rc, text = run_ports("set", "16000")
+    check("a set with neither --host nor --guest is refused",
+          rc == 2 and "give the new host port" in text, text.strip())
     rc, text = run_ports("rm", "nope")
     check("removing a port that is not there fails cleanly",
           rc == 1 and "publishes no port" in text, text.strip())
@@ -1244,7 +1257,7 @@ def main() -> int:
     check("removing by host port works", rc == 0, text.strip())
     check("and it leaves published()", 16000 not in registry.load_spec(pvm).network.published())
     check("and stops forwarding the guest port it had switched on",
-          5432 not in registry.load_spec(pvm).network.guest_ports,
+          5433 not in registry.load_spec(pvm).network.guest_ports,
           str(registry.load_spec(pvm).network.guest_ports))
     check("but leaves a port something else still publishes alone",
           22 in registry.load_spec(pvm).network.guest_ports,

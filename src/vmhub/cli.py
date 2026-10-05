@@ -850,16 +850,32 @@ def cmd_ports(args: argparse.Namespace, out: Out) -> int:
         return 0
 
     # action == "set"
-    if args.host == port.host:
-        out.say(out.dim(f"{port.label} is already on host {port.host}"))
+    if not args.host and not args.guest:
+        print(out.bad("give the new host port with --host, or the guest port with --guest"))
+        return 2
+    new_host = int(args.host) if args.host else port.host
+    new_guest = int(args.guest) if args.guest else port.guest
+    if new_host == port.host and new_guest == port.guest:
+        out.say(out.dim(f"{port.label} is already host {port.host} to guest {port.guest}"))
         return 0
-    if args.host in net.published():
-        print(out.bad(f"host port {args.host} is already published by this VM"))
+    if ports.host_taken_by_other(net, new_host, exclude=port):
+        print(out.bad(f"host port {new_host} is already published by this VM"))
         return 1
-    port.host = args.host
+    old_guest = port.guest
+    port.host = new_host
+    port.guest = new_guest
+    if port.role != "web" and new_guest not in net.guest_ports:
+        net.guest_ports = sorted({*net.guest_ports, new_guest})
+    if old_guest != new_guest:
+        # The forwarding this port switched on for its old guest port has
+        # to go back off, or the VM is left forwarding a port nothing uses.
+        ports.prune_guest_forward(net, old_guest)
     vm_spec.validate()
     registry.save_spec(vm_spec)
-    out.say(out.good(f"{port.label} now on host {port.host}"))
+    if new_guest == old_guest:
+        out.say(out.good(f"{port.label} now on host {new_host}"))
+    else:
+        out.say(out.good(f"{port.label} now guest {new_guest} on host {new_host}"))
     restarted_note()
     return 0
 
@@ -1250,9 +1266,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("target", help="role (web, ssh, rdp) or the host port number")
     sp.set_defaults(func=cmd_ports)
 
-    sp = ports_sub.add_parser("set", help="move a port to a different host port")
+    sp = ports_sub.add_parser("set", help="change a port's host or guest number")
     sp.add_argument("target", help="role (web, ssh, rdp) or the host port number")
-    sp.add_argument("--host", type=int, required=True, help="the new host port")
+    sp.add_argument("--host", type=int, help="the new host port")
+    sp.add_argument(
+        "--guest", type=int,
+        help="the new guest port -- use this to correct a mistyped guest number",
+    )
     sp.set_defaults(func=cmd_ports)
 
     p.set_defaults(func=cmd_ports, ports_action="list")

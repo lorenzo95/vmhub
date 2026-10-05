@@ -119,6 +119,18 @@ def defaults(guest_ports: Iterable[int]) -> list["spec.Port"]:
     return out
 
 
+def host_taken_by_other(
+    net: "spec.Network", host: int, *, exclude: "spec.Port | None" = None
+) -> bool:
+    """Whether some entry other than `exclude` already publishes this host port.
+
+    The entry being edited counts as not taken. Comparing against the guest
+    number already on that host instead would make an edit look like a
+    collision with itself whenever the guest number changed.
+    """
+    return any(port.host == host and port is not exclude for port in net.ports)
+
+
 def prune_guest_forward(net: "spec.Network", guest: int) -> None:
     """Stop forwarding a guest port that nothing publishes any more.
 

@@ -453,35 +453,115 @@ class VmPane(Gtk.Box):
 
         widgets.run_task(self.window, work, label=f"Publishing {title.lower()}")
 
+    def _port_dialog(
+        self,
+        heading: str,
+        body: str,
+        *,
+        guest: int = 0,
+        host: int = 0,
+        name: str = "",
+        show_label: bool,
+        host_optional: bool,
+        prefill: bool = True,
+        on_save: Callable[[int, int, str], None],
+    ) -> None:
+        """Ask for a port's guest number, host number and label.
+
+        Every one of them is editable. A guest number is as easy to mistype
+        as a host one, and before this the only way to correct it was to
+        delete the entry and add it again -- which loses the port and any
+        habit the user had built up around it.
+        """
+        guest_entry = Gtk.Entry()
+        guest_entry.set_name("vmhub.port.guest")
+        host_entry = Gtk.Entry()
+        host_entry.set_name("vmhub.port.host")
+        name_entry = Gtk.Entry()
+        name_entry.set_name("vmhub.port.name")
+        if prefill:
+            guest_entry.set_text(str(guest) if guest else "")
+            host_entry.set_text(str(host) if host else "")
+            name_entry.set_text(name)
+        else:
+            guest_entry.set_placeholder_text("5432")
+            host_entry.set_placeholder_text(
+                "leave empty to pick a free one" if host_optional else "e.g. 15432"
+            )
+            name_entry.set_placeholder_text("optional label")
+        rows = [("Guest port", guest_entry), ("Host port", host_entry)]
+        if show_label:
+            rows.insert(1, ("Label", name_entry))
+        grid = Gtk.Grid(column_spacing=8, row_spacing=6)
+        for row, (caption, entry) in enumerate(rows):
+            key = Gtk.Label(label=caption)
+            key.set_xalign(0.0)
+            grid.attach(key, 0, row, 1, 1)
+            grid.attach(entry, 1, row, 1, 1)
+
+        def accept(_text: str) -> None:
+            # Read the entries here, on the main loop. The worker runs off
+            # it, and GTK is not safe to touch from there.
+            new_guest = self._parse_port(guest_entry.get_text(), "guest port")
+            if new_guest is None:
+                return
+            new_host = self._parse_port(
+                host_entry.get_text(), "host port", blank_ok=host_optional
+            )
+            if new_host is None:
+                return
+            new_name = name_entry.get_text().strip() if show_label else name
+            on_save(new_guest, new_host, new_name)
+
+        dialog = widgets.prompt_text(
+            self.window, heading, body, on_accept=accept, extra=grid, accept_label="Save"
+        )
+        for entry in (guest_entry, host_entry, name_entry):
+            entry.connect("activate", lambda _e: dialog.accept_button.emit("clicked"))
+        return dialog
+
     def _on_change_role(self, role: str | None = None) -> None:
         if not role:
             return
-        title, guest = ROLE_ROWS[role]
-        current = registry.load_spec(self.vm).network.host_for(role)
-
-        def accept(text: str) -> None:
-            host = self._parse_port(text, "host port")
-            if host is None:
-                return
-
-            def work(progress):
-                vm_spec = registry.load_spec(self.vm)
-                vm_spec.network.set_role(role, guest, host)
-                vm_spec.validate()
-                registry.save_spec(vm_spec)
-                progress(f"{title} will be on host {host} after the next start")
-                return True
-
-            widgets.run_task(self.window, work, label="Changing a port")
-
-        widgets.prompt_text(
-            self.window,
-            f"Change the {title} port",
-            f"The port on this machine that reaches guest port {guest}.",
-            default=str(current),
-            on_accept=accept,
-            placeholder="e.g. 8080",
+        title, default_guest = ROLE_ROWS[role]
+        port = registry.load_spec(self.vm).network.by_role(role)
+        self._port_dialog(
+            f"Edit the {title} port",
+            "The port inside the VM, and the port on this machine that reaches it.",
+            guest=port.guest if port else default_guest,
+            host=port.host if port else 0,
+            show_label=False,
+            host_optional=False,
+            on_save=lambda guest, host, _name: self._apply_role_edit(role, guest, host),
         )
+
+    def _apply_role_edit(self, role: str, guest: int, host: int) -> None:
+        title, _default_guest = ROLE_ROWS[role]
+
+        def work(progress):
+            from .. import ports as ports_mod
+
+            vm_spec = registry.load_spec(self.vm)
+            net = vm_spec.network
+            entry = net.by_role(role)
+            old_guest = entry.guest if entry else 0
+            if ports_mod.host_taken_by_other(net, host, exclude=entry):
+                raise VmhubError(f"host port {host} is already published by this VM")
+            if entry is None:
+                net.ports.append(spec.Port(guest=guest, host=host, role=role))
+            else:
+                entry.guest = guest
+                entry.host = host
+            if role != "web" and guest not in net.guest_ports:
+                net.guest_ports = sorted({*net.guest_ports, guest})
+            if old_guest and old_guest != guest:
+                ports_mod.prune_guest_forward(net, old_guest)
+            vm_spec.validate()
+            registry.save_spec(vm_spec)
+            progress(f"{title} will be guest {guest} on host {host} after the next start")
+            return True
+
+        widgets.run_task(self.window, work, label="Saving the port")
 
     def _on_remove_role(self, role: str | None = None) -> None:
         if not role:
@@ -505,37 +585,7 @@ class VmPane(Gtk.Box):
         widgets.run_task(self.window, work, label="Removing a port")
 
     def _on_add_port(self, _button: object = None) -> None:
-        guest_entry = Gtk.Entry()
-        guest_entry.set_name("vmhub.add-port.guest")
-        guest_entry.set_placeholder_text("5432")
-        name_entry = Gtk.Entry()
-        name_entry.set_name("vmhub.add-port.name")
-        name_entry.set_placeholder_text("PostgreSQL (optional)")
-        host_entry = Gtk.Entry()
-        host_entry.set_name("vmhub.add-port.host")
-        host_entry.set_placeholder_text("leave empty to pick a free one")
-        grid = Gtk.Grid(column_spacing=8, row_spacing=6)
-        for row, (caption, entry) in enumerate((
-            ("Guest port", guest_entry),
-            ("Label", name_entry),
-            ("Host port", host_entry),
-        )):
-            key = Gtk.Label(label=caption)
-            key.set_xalign(0.0)
-            grid.attach(key, 0, row, 1, 1)
-            grid.attach(entry, 1, row, 1, 1)
-
-        def accept(_text: str) -> None:
-            # Read every entry here, on the main loop. The worker below runs
-            # off it, and GTK is not safe to touch from there.
-            guest = self._parse_port(guest_entry.get_text(), "guest port")
-            if guest is None:
-                return
-            host = self._parse_port(host_entry.get_text(), "host port", blank_ok=True)
-            if host is None:
-                return
-            label = name_entry.get_text().strip()
-
+        def on_save(guest: int, host: int, name: str) -> None:
             def work(progress):
                 from .. import ports as ports_mod
 
@@ -553,7 +603,7 @@ class VmPane(Gtk.Box):
                     chosen = ports_mod.allocate_any(
                         also_wanted=set(ports_mod.used_by_vms(self.vm)) | set(net.published())
                     )
-                net.ports.append(spec.Port(guest=guest, host=chosen, name=label))
+                net.ports.append(spec.Port(guest=guest, host=chosen, name=name))
                 # Forward it in the same breath, so the row is not a promise
                 # the container has no way to keep.
                 net.guest_ports = sorted({*net.guest_ports, guest})
@@ -564,54 +614,60 @@ class VmPane(Gtk.Box):
 
             widgets.run_task(self.window, work, label="Adding a port")
 
-        dialog = widgets.prompt_text(
-            self.window,
+        return self._port_dialog(
             "Forward another port",
             "Publish a port of the VM's own on a port of this machine.",
-            on_accept=accept,
-            extra=grid,
-            accept_label="Add",
+            show_label=True,
+            host_optional=True,
+            prefill=False,
+            on_save=on_save,
         )
-        # There is no single entry to press Enter in, so wire the grid's own
-        # fields up to the accept button.
-        for entry in (guest_entry, name_entry, host_entry):
-            entry.connect("activate", lambda _e: dialog.accept_button.emit("clicked"))
-        return dialog
 
     def _on_change_port(self, port: spec.Port | None = None) -> None:
         if port is None:
             return
         guest, old_host, name = port.guest, port.host, port.name
-
-        def accept(text: str) -> None:
-            host = self._parse_port(text, "host port")
-            if host is None:
-                return
-
-            def work(progress):
-                vm_spec = registry.load_spec(self.vm)
-                net = vm_spec.network
-                entry = self._find_port(net, guest, old_host, name)
-                if entry is None:
-                    raise VmhubError("the port list changed; try again")
-                if net.published().get(host, guest) != guest:
-                    raise VmhubError(f"host port {host} is already published by this VM")
-                entry.host = host
-                vm_spec.validate()
-                registry.save_spec(vm_spec)
-                progress(f"guest {guest} will be on host {host} after the next start")
-                return True
-
-            widgets.run_task(self.window, work, label="Changing a port")
-
-        widgets.prompt_text(
-            self.window,
-            "Change the host port",
-            f"The port on this machine that reaches guest port {guest}.",
-            default=str(old_host),
-            on_accept=accept,
-            placeholder="e.g. 15432",
+        self._port_dialog(
+            f"Edit {name or f'guest {guest}'}",
+            "The port inside the VM, and the port on this machine that reaches it.",
+            guest=guest,
+            host=old_host,
+            name=name,
+            show_label=True,
+            host_optional=False,
+            on_save=lambda new_guest, new_host, new_name: self._apply_port_edit(
+                (guest, old_host, name), new_guest, new_host, new_name
+            ),
         )
+
+    def _apply_port_edit(
+        self, expected: tuple[int, int, str], guest: int, host: int, name: str
+    ) -> None:
+        old_guest, old_host, old_name = expected
+
+        def work(progress):
+            from .. import ports as ports_mod
+
+            vm_spec = registry.load_spec(self.vm)
+            net = vm_spec.network
+            entry = self._find_port(net, old_guest, old_host, old_name)
+            if entry is None:
+                raise VmhubError("the port list changed; try again")
+            if ports_mod.host_taken_by_other(net, host, exclude=entry):
+                raise VmhubError(f"host port {host} is already published by this VM")
+            entry.guest = guest
+            entry.host = host
+            entry.name = name
+            if guest not in net.guest_ports:
+                net.guest_ports = sorted({*net.guest_ports, guest})
+            if old_guest != guest:
+                ports_mod.prune_guest_forward(net, old_guest)
+            vm_spec.validate()
+            registry.save_spec(vm_spec)
+            progress(f"guest {guest} will be on host {host} after the next start")
+            return True
+
+        widgets.run_task(self.window, work, label="Saving the port")
 
     def _on_remove_port(self, port: spec.Port | None = None) -> None:
         if port is None:

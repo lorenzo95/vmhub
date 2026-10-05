@@ -333,7 +333,7 @@ def _probe(app) -> None:
     try:
         pane._on_add_port(None)
         dialog = add_dialogs[-1] if add_dialogs else None
-        guest = find_named(dialog, "vmhub.add-port.guest")
+        guest = find_named(dialog, "vmhub.port.guest")
         if guest is None:
             failures.append((
                 "forward dialog unusable",
@@ -342,7 +342,7 @@ def _probe(app) -> None:
             print("  \033[31mFAIL\033[0m  Forward another port… opened no usable dialog")
         else:
             guest.set_text("5432")
-            host_field = find_named(dialog, "vmhub.add-port.host")
+            host_field = find_named(dialog, "vmhub.port.host")
             host_field.set_text("16050")
             dialog.accept_button.emit("clicked")
             pump_until(
@@ -357,6 +357,59 @@ def _probe(app) -> None:
                     "filling the dialog and pressing Add changed nothing",
                 ))
                 print("  \033[31mFAIL\033[0m  filling the dialog and pressing Add did nothing")
+            # A mistyped guest number has to be correctable in place. It
+            # used to mean removing the entry and adding it again, losing
+            # the port and the label the user had given it.
+            target = next(
+                (p for p in registry.load_spec(VM).network.ports if p.host == 16050), None
+            )
+            if target is None:
+                failures.append(("edit port", "the port to edit was not there"))
+                print("  \033[31mFAIL\033[0m  the port to edit was not there")
+            else:
+                add_dialogs.clear()
+                pane._on_change_port(target)
+                edit = add_dialogs[-1] if add_dialogs else None
+                edit_guest = find_named(edit, "vmhub.port.guest") if edit else None
+                if edit_guest is None:
+                    failures.append((
+                        "edit dialog unusable",
+                        "the Edit dialog opened without a guest field",
+                    ))
+                    print("  \033[31mFAIL\033[0m  the Edit dialog opened without a guest field")
+                elif edit_guest.get_text() != "5432":
+                    failures.append((
+                        "edit dialog not prefilled",
+                        f"the guest field showed {edit_guest.get_text()!r}, not '5432'",
+                    ))
+                    print("  \033[31mFAIL\033[0m  the Edit dialog did not show the current guest port")
+                else:
+                    edit_guest.set_text("5433")
+                    edit.accept_button.emit("clicked")
+                    pump_until(
+                        lambda: 5433 in registry.load_spec(VM).network.published().values()
+                    )
+                    published = registry.load_spec(VM).network.published()
+                    forwarded = registry.load_spec(VM).network.guest_ports
+                    if 5433 in published.values() and 16050 in published:
+                        exercised.append("a mistyped guest port can be corrected in place")
+                        print("  \033[32mPASS\033[0m  a mistyped guest port can be corrected in place")
+                    else:
+                        failures.append((
+                            "edit guest port did nothing",
+                            f"published is {published}",
+                        ))
+                        print("  \033[31mFAIL\033[0m  editing the guest port changed nothing")
+                    if 5432 not in forwarded and 5433 in forwarded:
+                        exercised.append("the old guest port stops being forwarded")
+                        print("  \033[32mPASS\033[0m  the old guest port stops being forwarded")
+                    else:
+                        failures.append((
+                            "stale guest forward",
+                            f"guest_ports is {forwarded}",
+                        ))
+                        print("  \033[31mFAIL\033[0m  the old guest port is still forwarded")
+
             # and it can be taken away again from the same table
             for child_port in list(registry.load_spec(VM).network.ports):
                 if child_port.host == 16050:
