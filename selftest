@@ -515,6 +515,41 @@ def main() -> int:
     for name in (full_from_plain, plain):
         lifecycle.remove(name)
 
+    section("deleting a source resolves its linked clones first")
+    tmpl_src = f"{VM}-tpl"
+    lifecycle.create(tmpl_src, blueprint="alpine")
+    lifecycle.mark_template(tmpl_src)
+    linked_kid = f"{VM}-kid"
+    lifecycle.clone(linked_kid, tmpl_src, mode="linked")
+    check("the clone starts out linked",
+          bool(lifecycle.status(linked_kid).backing),
+          str(lifecycle.status(linked_kid).backing))
+
+    # A running clone blocks the removal rather than being killed for it.
+    lifecycle.start(linked_kid)
+    try:
+        lifecycle.remove(tmpl_src)
+        check("a running clone blocks its source's removal", False, "it was allowed")
+    except VmhubError as exc:
+        check("a running clone blocks its source's removal",
+              linked_kid in str(exc), str(exc))
+    lifecycle.stop(linked_kid)
+
+    lifecycle.remove(tmpl_src)
+    check("removing the source succeeded once the clone was stopped",
+          not registry.exists(tmpl_src))
+    check("the clone outlived its source", registry.exists(linked_kid))
+    check("and was flattened into a standalone disk",
+          lifecycle.status(linked_kid).backing is None,
+          str(lifecycle.status(linked_kid).backing))
+    check("and no longer records a template relationship",
+          registry.load_meta(linked_kid).template_source is None)
+    lifecycle.start(linked_kid)
+    check("the flattened clone still starts",
+          podman.state(linked_kid) == "running", podman.state(linked_kid))
+    lifecycle.stop(linked_kid)
+    lifecycle.remove(linked_kid)
+
     section("finish install and live media")
     lifecycle.start(VM)
     check("running VM exposes live media", isinstance(lifecycle.live_media(VM), list))
@@ -1023,7 +1058,7 @@ def main() -> int:
     section("cleanup")
     for name in (
         f"{VM}-stop", f"{VM}-rival", f"{VM}-stale", f"{VM}-clone2",
-        f"{VM}-power",
+        f"{VM}-power", f"{VM}-tpl", f"{VM}-kid",
         f"{VM}-secret", f"{VM}-fresh", f"{VM}-chosen", f"{VM}-roundtrip",
         f"{VM}-finishinstall",
         f"{VM}-clone", f"{VM}-linked-import", f"{VM}-libvirt",

@@ -641,7 +641,22 @@ def remove(vm: str, *, keep_disk: bool = False, progress: Progress = _noop) -> N
     meta = registry.load_meta(vm)
     dependents = registry.dependents_of(vm)
     if dependents:
-        raise TemplateInUse(f"{vm} is used as a template by: {', '.join(dependents)}")
+        # A linked clone's disk has this VM's disk as its backing file.
+        # Deleting the source without resolving that first would leave every
+        # clone pointing at a file that no longer exists, so make them
+        # standalone while the backing file is still there.
+        for dep in dependents:
+            if podman.is_running(dep):
+                raise VmRunning(
+                    f"{dep} is a linked clone of {vm} and is running; "
+                    f"stop it before removing {vm}"
+                )
+        for dep in dependents:
+            progress(f"{dep} is a linked clone of {vm}; making it standalone...")
+            flatten(dep, progress=progress)
+        progress(
+            f"Resolved {len(dependents)} linked clone(s) of {vm} into standalone disks"
+        )
 
     if meta.template_source:
         registry.release_dependent(vm)
