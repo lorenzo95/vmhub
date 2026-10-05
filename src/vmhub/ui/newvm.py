@@ -5,12 +5,14 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk  # noqa: E402
 
-from .. import blueprints, lifecycle, spec  # noqa: E402
+from .. import blueprints, lifecycle, registry, spec  # noqa: E402
 from ..errors import VmhubError  # noqa: E402
 from . import widgets  # noqa: E402
 
+NONE_BLUEPRINT = "(none)"
+
 BLUEPRINT_ROWS = [
-    ("(none)", "Start from a blank spec"),
+    (NONE_BLUEPRINT, "Start from a blank spec"),
     ("debian13", "Debian 13 — general purpose, good template base"),
     ("alpine", "Alpine Linux — 60 MB, fastest to try out"),
     ("win11", "Windows 11 — IDE during install, then virtio-scsi"),
@@ -58,6 +60,12 @@ class NewVmDialog(Gtk.Window):
         self.cpu_spin.set_value(2)
         self.ram_entry = Gtk.Entry(text="4G")
         self.disk_entry = Gtk.Entry(text="64G")
+        # Every field is validated as it is typed. These two had no handler
+        # at all, so "4G" -> "banana" left Create enabled and the error
+        # label empty, and the failure only surfaced in the worker with
+        # the dialog already closed.
+        for field in (self.ram_entry, self.disk_entry):
+            field.connect("changed", lambda _e: self._validate())
         for row, (label, control) in enumerate(
             [("vCPUs", self.cpu_spin), ("RAM", self.ram_entry), ("Disk", self.disk_entry)]
         ):
@@ -109,7 +117,11 @@ class NewVmDialog(Gtk.Window):
 
     def _blueprint_name(self) -> str:
         index = self.blueprint_drop.get_selected()
-        return BLUEPRINT_ROWS[index][0] if 0 <= index < len(BLUEPRINT_ROWS) else ""
+        name = BLUEPRINT_ROWS[index][0] if 0 <= index < len(BLUEPRINT_ROWS) else ""
+        # "(none)" is a label for "no blueprint", not the name of one. It
+        # was passed through as a name, so the default row of the default
+        # dialog said "no such blueprint: (none)" and Create could only fail.
+        return "" if name == NONE_BLUEPRINT else name
 
     def _on_blueprint(self) -> None:
         name = self._blueprint_name()
@@ -135,10 +147,17 @@ class NewVmDialog(Gtk.Window):
         message = ""
         try:
             spec.validate_name(name)
+            if name and registry.exists(name):
+                # Create used to find this out in the worker, after the
+                # dialog had closed and the typed-in values were gone.
+                ok = False
+                message = f"a VM called {name!r} already exists"
         except VmhubError as exc:
             ok = False
             message = str(exc)
         for field, label in ((self.ram_entry, "RAM"), (self.disk_entry, "Disk")):
+            if not ok:
+                break
             try:
                 spec.parse_size(field.get_text().strip())
             except VmhubError as exc:
@@ -146,8 +165,15 @@ class NewVmDialog(Gtk.Window):
                 message = f"{label}: {exc}"
         self.create_button.set_sensitive(ok and bool(name))
         self.error_label.set_text(message)
+        return ok and bool(name)
 
     def _on_create(self, _button) -> None:
+        # Check once more before closing: a handler can be invoked without
+        # the fields having been typed through, and closing first throws the
+        # dialog away while the message explaining why goes to the window
+        # behind it.
+        if not self._validate():
+            return
         name = self.name_entry.get_text().strip()
         blueprint = self._blueprint_name() or None
         start = self.start_check.get_active()

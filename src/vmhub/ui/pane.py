@@ -10,7 +10,7 @@ from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
 from .. import blueprints, disk, export, iso as isomod, lifecycle, paths, podman, rdp, registry, spec  # noqa: E402
 from ..errors import VmhubError  # noqa: E402
-from . import style, widgets  # noqa: E402
+from . import style, widgets, workers  # noqa: E402
 
 DISK_TYPES = ["scsi", "blk", "ide", "sata", "nvme"]
 
@@ -33,6 +33,7 @@ class VmPane(Gtk.Box):
         self._snap_signature: tuple[str, ...] = ()
         self._log_tag = 0
         self._log_source = 0
+        self._log_reading = False
         # Whether the user has an unapplied edit in the hardware controls,
         # and whether we are the ones writing into them right now.
         self._dirty = False
@@ -970,18 +971,43 @@ class VmPane(Gtk.Box):
             # tab, or a minimised window -- is not a reason to stop
             # watching, so keep the timer and do nothing this time round.
             return True
-        if not self._follow or not podman.exists(self.vm):
+        if not self._follow:
             return True
-        try:
-            text = podman.logs(self.vm, tail=200)
-        except Exception:
+        if self._log_reading:
+            # A read is still in flight. Every open pane polls every two
+            # seconds, so without this a slow `podman logs` would have a
+            # second copy started behind it.
             return True
-        cleaned = "\n".join(
-            line for line in text.splitlines() if "\x1b[" not in line
-        )
-        self._log_buffer.set_text(cleaned[-40000:])
-        end = self._log_buffer.get_end_iter()
-        self.log_view.scroll_to_iter(end, 0.0, False, 0.0, 0.0)
+        self._log_reading = True
+        vm = self.vm
+
+        def read(_progress):
+            # podman logs and podman container exists both spawn a process.
+            # Doing that from a GLib timeout is doing it on the main loop,
+            # which is what the four-second status refresh was fixed for.
+            if not podman.exists(vm):
+                return ""
+            text = podman.logs(vm, tail=200)
+            return "\n".join(
+                line for line in text.splitlines() if "\x1b[" not in line
+            )
+
+        def done(text: str) -> bool:
+            self._log_reading = False
+            if vm != self.vm:
+                return False
+            self._log_buffer.set_text(text[-40000:])
+            end = self._log_buffer.get_end_iter()
+            self.log_view.scroll_to_iter(end, 0.0, False, 0.0, 0.0)
+            return False
+
+        def failed(_exc: BaseException) -> bool:
+            # A VM whose container has gone away is not an error worth a
+            # dialog every two seconds.
+            self._log_reading = False
+            return False
+
+        workers.run_async(read, on_done=done, on_error=failed)
         return True
 
     def _stop_follow(self) -> None:

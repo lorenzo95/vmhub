@@ -207,8 +207,10 @@ def create(
     if boot_iso is not None:
         vm_spec.boot.iso = boot_iso
     if image is not None:
-        repository, _, tag = image.partition(":")
-        vm_spec.image = spec.Image(repository=repository or spec.DEFAULT_REPO, tag=tag or "latest")
+        repository, tag = spec.split_image_ref(image)
+        vm_spec.image = spec.Image(
+            repository=repository or spec.DEFAULT_REPO, tag=tag or "latest"
+        )
     progress("Allocating host ports...")
     allocated = ports.allocate_all()
     wanted = ports_map or {}

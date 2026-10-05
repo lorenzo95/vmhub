@@ -33,8 +33,16 @@ import gi  # noqa: E402
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
-from vmhub import iso as isomod, lifecycle, paths, ports, registry, spec  # noqa: E402
-from vmhub.ui import newvm, widgets  # noqa: E402
+from vmhub import (  # noqa: E402
+    iso as isomod,
+    lifecycle,
+    paths,
+    podman,
+    ports,
+    registry,
+    spec,
+)
+from vmhub.ui import newvm, widgets, workers  # noqa: E402
 from vmhub.ui.app import VmhubApp  # noqa: E402
 from vmhub.ui.pane import VmPane  # noqa: E402
 
@@ -129,6 +137,11 @@ def pump_until(condition, timeout: float = 8.0) -> bool:
         GLib.timeout_add(25, lambda: False)
         main.iteration(True)
     return condition()
+
+
+def settle_dialog() -> None:
+    """Let GTK deliver the change signal an entry just emitted."""
+    pump_until(lambda: False, 0.25)
 
 
 def _cleanup() -> None:
@@ -478,6 +491,103 @@ def _probe(app) -> None:
                 f"away and back ({before} -> {tag})"
             )
         settle()
+
+    # ---- the log poll must not run podman on the main loop ----
+    # _poll_logs is a GLib timeout, so it runs on the main loop. It was
+    # calling `podman logs` and `podman container exists` from there --
+    # two subprocesses, every two seconds, for every open pane.
+    # Stub out the dispatch as well as podman, so nothing runs on a thread
+    # and the only thing measured is what the main loop itself did.
+    live_pane = window.panes[VM]
+    window.select_vm(VM)
+    settle()
+    calls: list[str] = []
+    dispatched: list[object] = []
+    real_run_async = workers.run_async
+    real_logs, real_exists = podman.logs, podman.exists
+    workers.run_async = lambda work, **kw: dispatched.append((work, kw))
+    podman.logs = lambda *a, **k: calls.append("logs") or "line\n"
+    podman.exists = lambda *a, **k: calls.append("exists") or True
+    try:
+        live_pane._log_reading = False
+        shown = live_pane.is_visible()
+        kept = live_pane._poll_logs(live_pane._log_source)
+        blocked, queued = list(calls), len(dispatched)
+    finally:
+        workers.run_async = real_run_async
+        podman.logs, podman.exists = real_logs, real_exists
+        live_pane._log_reading = False
+    if shown and kept and queued == 1 and not blocked:
+        exercised.append("the log poll does not shell out on the main loop")
+        print("  \033[32mPASS\033[0m  the log poll does not shell out on the main loop")
+    else:
+        failures.append((
+            "log poll blocks the UI",
+            f"visible {shown}, kept timer {kept}, called {blocked}, dispatched {queued}",
+        ))
+        print(
+            "  \033[31mFAIL\033[0m  the log poll ran "
+            f"{blocked} on the main loop (dispatched {queued})"
+        )
+
+    # ---- the New VM dialog must notice a size that is typed in ----
+    # RAM and Disk had no "changed" handler, so a good value could be
+    # replaced with a bad one and Create stayed enabled -- and the dialog
+    # closed before the failure was reported anywhere.
+    dialog = newvm.NewVmDialog(window)
+    dialog.name_entry.set_text("guicheck-newvm")
+    settle_dialog()
+    dialog.ram_entry.set_text("banana")
+    settle_dialog()
+    if not dialog.create_button.get_sensitive():
+        exercised.append("a bad RAM size disables Create as it is typed")
+        print("  \033[32mPASS\033[0m  a bad RAM size disables Create as it is typed")
+    else:
+        failures.append((
+            "newvm validation",
+            "RAM was set to 'banana' and Create is still enabled",
+        ))
+        print("  \033[31mFAIL\033[0m  a bad RAM size left Create enabled")
+    dialog.ram_entry.set_text("2G")
+    settle_dialog()
+    if dialog.create_button.get_sensitive():
+        exercised.append("fixing the size enables Create again")
+        print("  \033[32mPASS\033[0m  fixing the size enables Create again")
+    else:
+        failures.append(("newvm validation", "a good RAM size did not re-enable Create"))
+        print("  \033[31mFAIL\033[0m  a good RAM size left Create disabled")
+
+    # Creating a VM that already exists used to fail in the worker, after
+    # the dialog had closed.
+    dialog.name_entry.set_text(VM)
+    settle_dialog()
+    if not dialog.create_button.get_sensitive():
+        exercised.append("an existing VM name disables Create")
+        print("  \033[32mPASS\033[0m  an existing VM name disables Create")
+    else:
+        failures.append((
+            "newvm validation",
+            f"{VM!r} already exists and Create is still enabled",
+        ))
+        print("  \033[31mFAIL\033[0m  an existing VM name left Create enabled")
+    dialog.close()
+
+    # The first row of the Blueprint list is "(none)": no blueprint. It was
+    # used as a name, so the default row of the default dialog greeted you
+    # with "no such blueprint: (none)".
+    blank = newvm.NewVmDialog(window)
+    blank_hint = blank.blueprint_desc.get_text()
+    blank_ok = blank._blueprint_name() == "" and "invalid blueprint" not in blank_hint
+    blank.close()
+    if blank_ok:
+        exercised.append('"(none)" means no blueprint, not a blueprint named (none)')
+        print("  \033[32mPASS\033[0m  \"(none)\" means no blueprint, not a broken one")
+    else:
+        failures.append((
+            "none blueprint",
+            f"selected {blank._blueprint_name()!r}, hint said {blank_hint!r}",
+        ))
+        print("  \033[31mFAIL\033[0m  the default blueprint option is not usable")
 
     # ---- the tab you are on carries over to a VM you have not opened ----
     # Every new pane used to open on the Console, so comparing two machines

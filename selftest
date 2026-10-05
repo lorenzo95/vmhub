@@ -1319,6 +1319,77 @@ def main() -> int:
     lifecycle.remove(thief, progress=None)
     lifecycle.remove(pvm, progress=None)
 
+    section("what vmhub runs, and what it reports")
+    # An image reference is not "everything before the first colon". A
+    # registry carries a port, and splitting there produced a repository
+    # and a tag that no registry has ever heard of.
+    for ref, want in (
+        ("docker.io/library/alpine:3.19", ("docker.io/library/alpine", "3.19")),
+        ("alpine", ("alpine", "")),
+        ("alpine:3.19", ("alpine", "3.19")),
+        ("registry.example:5000/qemu", ("registry.example:5000/qemu", "")),
+        ("localhost:5000/qemu:1.2", ("localhost:5000/qemu", "1.2")),
+        ("quay.io/qemu@sha256:" + "a" * 64, ("quay.io/qemu@sha256:" + "a" * 64, "")),
+    ):
+        check(f"image {ref} splits correctly", spec.split_image_ref(ref) == want,
+              str(spec.split_image_ref(ref)))
+
+    imvm = f"{VM}-image"
+    lifecycle.create(imvm, blueprint="alpine", image="registry.example:5000/qemu:1.2")
+    imspec = registry.load_spec(imvm)
+    check("a ported registry survives into the spec",
+          imspec.image.repository == "registry.example:5000/qemu", imspec.image.repository)
+    check("and its tag is the tag", imspec.image.tag == "1.2", imspec.image.tag)
+    check("the reference round-trips", imspec.image.ref == "registry.example:5000/qemu:1.2",
+          imspec.image.ref)
+
+    # resources.kvm=false reached the spec and was reported in the UI, but
+    # run_argv passed /dev/kvm either way: QEMU was told KVM=N and ignored
+    # the device, while the container still had it.
+    kvm_vm = f"{VM}-nokvm"
+    lifecycle.create(kvm_vm, blueprint="alpine")
+    kspec = registry.load_spec(kvm_vm)
+    kspec.resources.kvm = False
+    registry.save_spec(kspec)
+    argv = podman.run_argv(registry.load_spec(kvm_vm), "uuid", "mac", None)
+    check("kvm=false keeps /dev/kvm out of the container",
+          "/dev/kvm" not in argv, str(argv[:14]))
+    kspec.resources.kvm = True
+    registry.save_spec(kspec)
+    argv = podman.run_argv(registry.load_spec(kvm_vm), "uuid", "mac", None)
+    check("kvm=true still passes it",
+          "/dev/kvm" in argv, str(argv[:14]))
+
+    # vmctl stop printed the failure in red and exited 0, so
+    # `vmctl stop x && vmctl rm x` deleted a VM that was still running.
+    # A stop that cannot happen has to be visible to the shell.
+    import argparse as _argparse
+
+    stopvm = f"{VM}-stoprc"
+    lifecycle.create(stopvm, blueprint="alpine")
+
+    def run_stop(names, mode):
+        ns = _argparse.Namespace(names=names, force=False, mode=mode, quiet=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.cmd_stop(ns, cli.Out())
+        return rc, buf.getvalue()
+
+    # Built by hand: argparse rejects an unknown mode before cmd_stop ever
+    # sees it, and lifecycle.stop is what has to raise.
+    rc, text = run_stop([stopvm], "nonsense")
+    check("vmctl stop exits non-zero when a VM does not stop", rc != 0, f"rc={rc}")
+    check("and says which one", stopvm in text, text.strip())
+    lifecycle.start(stopvm)
+    rc, text = run_stop([stopvm], "force")
+    check("vmctl stop exits 0 when it worked", rc == 0, f"rc={rc} {text.strip()}")
+    check("and the VM really is stopped", podman.state(stopvm) != "running",
+          podman.state(stopvm))
+
+    lifecycle.remove(stopvm)
+    lifecycle.remove(imvm)
+    lifecycle.remove(kvm_vm)
+
     section("cleanup")
     for name in (
         f"{VM}-stop", f"{VM}-rival", f"{VM}-stale", f"{VM}-clone2",

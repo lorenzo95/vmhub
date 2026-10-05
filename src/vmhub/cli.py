@@ -235,6 +235,7 @@ def cmd_stop(args: argparse.Namespace, out: Out) -> int:
     if not names:
         out.say(out.dim("nothing running"))
         return 0
+    failed = 0
     for name in names:
         try:
             used = lifecycle.stop(
@@ -243,11 +244,16 @@ def cmd_stop(args: argparse.Namespace, out: Out) -> int:
             if not args.quiet:
                 out.say(out.good(f"{name} stopped ({used})"))
         except VmhubError as exc:
+            failed += 1
             out.say(out.bad(f"{name}: {exc}"))
-    return 0
+    # A VM that did not stop is still running, and `vmctl stop x && vmctl rm
+    # x` must not delete it. Reporting the failure in red and exiting 0 sent
+    # the shell on to the rm.
+    return 1 if failed else 0
 
 
 def cmd_stop_all(args: argparse.Namespace, out: Out) -> int:
+    failed = 0
     for item in lifecycle.list_vms():
         if item.powered:
             if not args.quiet:
@@ -255,9 +261,10 @@ def cmd_stop_all(args: argparse.Namespace, out: Out) -> int:
             try:
                 lifecycle.stop(item.name, mode=args.mode or ("force" if args.force else None))
             except VmhubError as exc:
+                failed += 1
                 if not args.quiet:
                     out.say(out.warn(f"  {exc}"))
-    return 0
+    return 1 if failed else 0
 
 
 def cmd_restore(args: argparse.Namespace, out: Out) -> int:

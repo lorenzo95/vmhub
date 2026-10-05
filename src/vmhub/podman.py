@@ -202,8 +202,13 @@ def run_argv(vm_spec: spec.VmSpec, meta_uuid: str, meta_mac: str, template_disk:
         f"{LABEL_UUID}={meta_uuid}",
         "--label",
         f"{LABEL_SPEC}={spec_hash(vm_spec, meta_uuid, meta_mac, template_disk)}",
-        "--device",
-        "/dev/kvm",
+    ]
+    if vm_spec.resources.kvm:
+        # Only when the spec asks for it. Passing it unconditionally meant
+        # `resources.kvm = false` still handed the guest /dev/kvm: QEMU was
+        # told KVM=N and ignored the device, but the container had it.
+        args += ["--device", "/dev/kvm"]
+    args += [
         "--device",
         "/dev/net/tun",
         "--cap-add",

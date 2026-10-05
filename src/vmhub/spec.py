@@ -81,6 +81,27 @@ class Image:
         return f"{self.repository}:{self.tag}"
 
 
+def split_image_ref(image: str) -> tuple[str, str]:
+    """Split an image reference into (repository, tag).
+
+    Only a colon after the last slash is a tag separator. A registry
+    carries a port, so `registry.example:5000/qemu` is one repository and
+    no tag -- splitting on the first colon turns it into the repository
+    `registry.example` and the tag `5000/qemu`, which is not an image
+    anybody can pull.
+
+    A digest reference is already pinned, so it is all repository and no
+    tag, which is what Image.ref then reproduces exactly.
+    """
+    image = image.strip()
+    if "@" in image:
+        return image, ""
+    head, sep, tail = image.rpartition(":")
+    if not sep or "/" in tail:
+        return image, ""
+    return head, tail
+
+
 @dataclass
 class Boot:
     mode: str = "uefi"
