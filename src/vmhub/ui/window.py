@@ -180,7 +180,16 @@ class VmhubWindow(Gtk.ApplicationWindow):
 
     def _install_row_actions(self) -> None:
         for action_name in ("console", "start", "stop", "clone", "export", "delete"):
-            action = Gio.SimpleAction.new(action_name, GLib.VariantType.new("s"))
+            # The name must carry the same "row." prefix the sidebar menu
+            # model uses. It used to be registered bare, so every item in
+            # the context menu pointed at an action that did not exist and
+            # Gtk.PopoverMenu greyed all of them out -- the labels rendered
+            # fine, which is why it looked like a menu rather than a dud.
+            # A PopoverMenu resolves actions by walking up the widget tree,
+            # so registering them on the window is enough for the rows.
+            action = Gio.SimpleAction.new(
+                f"row.{action_name}", GLib.VariantType.new("s")
+            )
             action.connect(
                 "activate",
                 lambda _a, param, kind=action_name: self._row_action(kind, param.get_string()),

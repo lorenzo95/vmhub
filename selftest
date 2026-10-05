@@ -162,6 +162,10 @@ def _make_fixture_iso(path: Path) -> Path:
 
 
 def main() -> int:
+    # Every VM that exists before this run is somebody's VM, not ours. Record
+    # them now and prove at the end that all of them survived: a test suite
+    # that quietly removes the user's machines is worse than one that fails.
+    preexisting = set(registry.all_names())
     leftovers = [m for m in registry.iter_metas() if m.name.startswith(VM)]
     leftovers.sort(key=lambda m: (m.is_template, m.template_source is not None, m.name))
     for meta in leftovers:
@@ -829,16 +833,29 @@ def main() -> int:
                     duplicates.append(f"{path.name}:{node.name}.{name}@{lines}")
     check("no duplicate GUI method definitions", not duplicates, str(duplicates))
 
-# A popover with no parent is not a cosmetic problem. popup() realises it
+    # A popover with no parent is not a cosmetic problem. popup() realises it
     # outside the widget hierarchy, gets no surface, and GTK4 segfaults --
     # right-clicking a VM in the sidebar used to take the whole app down.
+    #
+    # Asked of the AST rather than the text: the word "Popover" in a comment is
+    # prose about popovers, not a popover, and matching it would flag this
+    # very file for explaining the bug.
     orphan_popovers: list[str] = []
     for path in sorted(ui_dir.glob("*.py")):
-        for _cls, _fn, src in gui_methods(path):
-            if "Popover" not in src:
+        text = path.read_text()
+        for node in ast.walk(ast.parse(text)):
+            if not isinstance(node, ast.FunctionDef):
                 continue
-            if not re.search(r"\.(set_parent|set_parent_widget)\s*\(", src):
-                orphan_popovers.append(f"{path.name}:{_cls}.{_fn}")
+            mentions = any(
+                (isinstance(n, ast.Attribute) and "Popover" in n.attr)
+                or (isinstance(n, ast.Name) and "Popover" in n.id)
+                for n in ast.walk(node)
+            )
+            if not mentions:
+                continue
+            seg = ast.get_source_segment(text, node) or ""
+            if not re.search(r"\.(set_parent|set_parent_widget)\s*\(", seg):
+                orphan_popovers.append(f"{path.name}:{node.name}")
     check("every popover is given a parent before it is popped up",
           not orphan_popovers, str(orphan_popovers))
 
@@ -856,6 +873,26 @@ def main() -> int:
           attach[:120].replace("\n", " "))
     check("Delete is a button on the pane header, not only in a menu",
           "delete_button" in (ui_dir / "pane.py").read_text())
+
+    # Every action the sidebar menu names must be registered under exactly
+    # that name. They were registered bare ("delete") while the menu asked
+    # for "row.delete", so Gtk.PopoverMenu greyed out all of them: the
+    # labels still rendered, so the menu looked real and did nothing.
+    install = ""
+    for _cls, fn, src in gui_methods(ui_dir / "window.py"):
+        if fn == "_install_row_actions":
+            install = src
+    wanted = sorted(set(re.findall(r"row\.(\w+)::", attach)))
+    check("the sidebar menu names some actions to check",
+          bool(wanted), f"no row.<name>:: entries found in _attach_row_menu")
+    check("row actions are registered with the prefix the menu asks for",
+          'f"row.{action_name}"' in install,
+          "registered name must be built as f\"row.{action_name}\"")
+    registered = re.search(r'for action_name in \(([^)]*)\)', install)
+    listed = sorted(re.findall(r'"(\w+)"', registered.group(1))) if registered else []
+    check("every sidebar menu action is registered",
+          set(wanted) <= set(listed),
+          f"menu asks for {wanted}, registered {listed}")
 
     # A handler that builds a dialog directly (rather than via prompt_text) must
     # also show it; TextPrompt does not present itself any more, but this catches
@@ -1447,6 +1484,10 @@ def main() -> int:
           str([b.name for b in stale]))
     leftovers = [m.name for m in registry.iter_metas() if m.name.startswith("vmhub-selftest")]
     check("no leftovers on disk", not leftovers, str(leftovers))
+    vanished = sorted(preexisting - set(registry.all_names()))
+    check("every VM that existed before this run still exists",
+          not vanished,
+          f"the test run removed {vanished}")
 
     print()
     if failed:

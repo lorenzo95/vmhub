@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 import time
 import sys
 from pathlib import Path
@@ -178,6 +179,10 @@ def rebuild_pane(window, name: str) -> None:
 def _probe(app) -> None:
     _cleanup()
     window = app.window
+    # This sweep calls every handler in the GUI, on real widgets, for real.
+    # Whatever VMs exist right now belong to the user: remember them so the
+    # end of the run can prove none of them was removed by the sweep.
+    preexisting = set(registry.all_names())
 
     def settle() -> None:
         """Render a snapshot synchronously; the real refresh() is async."""
@@ -241,9 +246,13 @@ def _probe(app) -> None:
         print("  \033[32mPASS\033[0m  pane pruned when the VM disappeared")
 
     # ---- sidebar context menu and accelerators ----
+    # These must be looked up under the "row." prefix the menu model uses.
+    # This check used the bare names and passed happily while every item in
+    # the context menu was greyed out, because it was confirming that
+    # actions nobody could reach existed.
     missing_actions = [
         name for name in ("console", "start", "stop", "clone", "export", "delete")
-        if window.lookup_action(name) is None
+        if window.lookup_action(f"row.{name}") is None
     ]
     if missing_actions:
         failures.append(("row actions missing", str(missing_actions)))
@@ -633,6 +642,45 @@ def _probe(app) -> None:
         ))
         print("  \033[31mFAIL\033[0m  there is no Delete button in the pane header")
 
+    # A menu item is greyed out when its action cannot be resolved, and the
+    # label still renders perfectly well while greyed -- so this is invisible
+    # in a screenshot and needs asking the live window directly. The actions
+    # were registered bare ("delete") while the menu asked for "row.delete",
+    # which made every item in the context menu a no-op.
+    #
+    # The names come from the source because Gio.Menu sections cannot be
+    # walked from PyGObject; the lookup itself is against the real window.
+    menu_source = inspect.getsource(window._attach_row_menu)
+    row_actions = sorted(set(re.findall(r'"row\.(\w+)::', menu_source)))
+    unresolved = []
+    for kind in row_actions:
+        full = f"row.{kind}"
+        action = window.lookup_action(full)
+        if action is None:
+            unresolved.append(f"{full} (not registered)")
+            continue
+        # Gio.Action.get_parameter_type_string() is not bound by PyGObject;
+        # get_parameter_type() returns a GLib.VariantType (None if no argument).
+        vtype = action.get_parameter_type()
+        ptype = vtype.dup_string() if vtype is not None else None
+        if ptype != "s":
+            unresolved.append(f"{full} (takes {ptype!r}, not a VM name)")
+    if row_actions and not unresolved:
+        exercised.append(f"all {len(row_actions)} sidebar menu actions are live")
+        print(
+            f"  \033[32mPASS\033[0m  all {len(row_actions)} sidebar menu actions "
+            "resolve and accept a VM name"
+        )
+    else:
+        failures.append((
+            "sidebar menu actions",
+            f"menu names {row_actions}, unusable: {unresolved or 'none found'}",
+        ))
+        print(
+            f"  \033[31mFAIL\033[0m  {len(unresolved) or 'no'} sidebar menu actions "
+            f"are greyed out: {unresolved}"
+        )
+
     # ---- the tab you are on carries over to a VM you have not opened ----
     # Every new pane used to open on the Console, so comparing two machines
     # meant clicking back to the same tab every time you switched.
@@ -898,6 +946,24 @@ def _probe(app) -> None:
 
     lifecycle.stop(VM, force=True)
     lifecycle.remove(VM)
+
+    # The sweep must not have taken a user's VM with it.
+    vanished = sorted(preexisting - set(registry.all_names()))
+    if vanished:
+        failures.append((
+            "the sweep removed a user's VM",
+            f"gone: {vanished}",
+        ))
+        print(
+            f"  \033[31mFAIL\033[0m  the handler sweep removed {vanished} "
+            "-- VMs that existed before this run"
+        )
+    else:
+        exercised.append("the handler sweep removes no VM it did not create")
+        print(
+            "  \033[32mPASS\033[0m  the handler sweep removed none of the "
+            f"{len(preexisting)} VM(s) that already existed"
+        )
 
     print()
     if failures:
