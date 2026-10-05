@@ -797,6 +797,31 @@ def main() -> int:
     except VmhubError:
         check("shrink is refused", True)
 
+    section("the alpine fallback is never a surprise")
+    fresh = f"{VM}-fresh"
+    lifecycle.create(fresh)
+    fresh_msgs: list[str] = []
+    lifecycle.start(fresh, progress=fresh_msgs.append)
+    fresh_notices = lifecycle.status(fresh).notices
+    lifecycle.stop(fresh)
+    check("starting an empty-disk VM warns that Alpine is attached",
+          any("Alpine" in m for m in fresh_msgs), str(fresh_msgs[:4]))
+    check("the warning explains the boot-order consequence",
+          any("boot order" in m for m in fresh_msgs), str(fresh_msgs[:4]))
+    check("the status notice names Alpine rather than a mystery image",
+          any("Alpine" in n for n in fresh_notices), str(fresh_notices))
+    check("the status notice no longer claims it never boots ahead of your ISO",
+          not any("never boots ahead" in n for n in fresh_notices),
+          str(fresh_notices))
+
+    chosen = f"{VM}-chosen"
+    lifecycle.create(chosen, blueprint="alpine")
+    chosen_msgs: list[str] = []
+    lifecycle.start(chosen, progress=chosen_msgs.append)
+    lifecycle.stop(chosen)
+    check("a VM that explicitly asked for alpine is not warned about it",
+          not any("Alpine" in m for m in chosen_msgs), str(chosen_msgs[:4]))
+
     section("secrets never leave the process")
     check("no password is invented when none is configured",
           rdp.RdpTarget("h", 1, "u", "").password == "")
@@ -841,7 +866,7 @@ def main() -> int:
     section("cleanup")
     for name in (
         f"{VM}-stop", f"{VM}-rival", f"{VM}-stale", f"{VM}-clone2",
-        f"{VM}-secret",
+        f"{VM}-secret", f"{VM}-fresh", f"{VM}-chosen",
         f"{VM}-clone", f"{VM}-linked-import", f"{VM}-libvirt",
         f"{VM}-plain", f"{VM}-full-from-plain", imported, VM,
     ):

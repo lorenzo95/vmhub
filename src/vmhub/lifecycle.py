@@ -461,6 +461,14 @@ def start(vm: str, *, progress: Progress = _noop) -> str:
             f"{vm_spec.boot.iso!r}. The container will download {vm_spec.boot.iso!r} "
             f"as well. Clear it with: vmctl set {vm} boot.iso=  (or re-attach the ISO)"
         )
+    disk_file = paths.disk_path(vm)
+    if disk_file.is_file() and not _disk_has_data(vm) and not vm_spec.boot.iso:
+        progress(
+            f"warning: {vm}'s disk is empty and boot.iso is unset, so the container "
+            f"will download an Alpine Linux image (~60 MB) and attach it. Anything "
+            f"already attached competes with it for boot order -- if that does not "
+            f"boot, you will land in Alpine. Set boot.iso to choose your own media."
+        )
 
     if _needs_recreate(vm, vm_spec, meta):
         if podman.exists(vm):
@@ -732,9 +740,12 @@ def status(vm: str, *, ctx: Ctx | None = None) -> VmStatus:
         )
     if has_disk and not result.has_disk_data and not result.backing:
         result.notices.append(
-            "disk is still empty, so the container fetches a 60 MB fallback image "
-            "once on first start. It never boots ahead of your ISO or the disk, and "
-            "it stops once the guest is installed."
+            "disk is still empty, so the container downloads an Alpine Linux ISO "
+            "(~60 MB) on first start and attaches it as a boot device. With "
+            "nothing else to boot, it boots that; if an ISO of yours is attached but "
+            "the firmware does not take it, Alpine is where you land. Set "
+            "boot.iso, or run vmctl finish-install once the guest is installed, and "
+            "it stops being used."
         )
     return result
 

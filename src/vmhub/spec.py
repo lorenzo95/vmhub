@@ -258,6 +258,12 @@ class VmSpec:
             env["PASSWORD"] = self.display.password
         env.update(self.features.extra_env)
         cleaned = {k: v for k, v in env.items() if v != ""}
+        # Keep BOOT present even when empty. The container treats an
+        # absent or empty BOOT as "unspecified" and downloads its own
+        # Alpine image, so this is the same either way -- but sending it
+        # explicitly documents that "no boot media" is a real state here
+        # rather than an oversight. It is not a way to suppress the
+        # fallback: BOOT=none is rejected by the container.
         cleaned["BOOT"] = env["BOOT"]
         return cleaned
 
