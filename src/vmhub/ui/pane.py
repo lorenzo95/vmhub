@@ -222,6 +222,9 @@ class VmPane(Gtk.Box):
         self.share_source.set_wrap(True)
         self.share_source.set_xalign(0.0)
         box.append(self.share_source)
+        # Set while a refresh pushes values into the entries, so those writes
+        # are not mistaken for the user editing them.
+        self._rdp_loading = False
 
         box.append(widgets.section("Install media"))
         media_hint = Gtk.Label(
@@ -367,7 +370,7 @@ class VmPane(Gtk.Box):
         undo, and making it a separate step is how it went unset before."""
         # A handler sweep calls this with a placeholder argument; there is no
         # entry to read, and there is nothing to save.
-        if entry is None:
+        if entry is None or self._rdp_loading:
             return
         text = entry.get_text().strip()
 
@@ -382,7 +385,7 @@ class VmPane(Gtk.Box):
         widgets.run_task(self.window, work, label=f"Saving RDP account for {self.vm}")
 
     def _on_share_changed(self, entry: Gtk.Entry | None) -> None:
-        if entry is None:
+        if entry is None or self._rdp_loading:
             return
         text = entry.get_text().strip()
         # "." is how a VM opts out of a shared default. Empty cannot mean "map
@@ -1256,14 +1259,24 @@ class VmPane(Gtk.Box):
 
         # RDP options. The fields show what is in effect, not only what this
         # VM overrides, so an inherited default is visible rather than blank.
-        effective_user = target.user
-        if not self.rdp_user_entry.get_property("has-focus"):
-            self.rdp_user_entry.set_text(effective_user)
-        own_share = registry.load_spec(status.name).media.share_path
-        if not self.share_entry.get_property("has-focus"):
-            # Blank means "inherit the default", which is what the label below
-            # says. "." is only ever what the user types to opt out.
-            self.share_entry.set_text(own_share)
+        #
+        # set_text() emits "changed", which is the very signal these handlers
+        # save on. Without the guard, every 4-second refresh rewrote every
+        # VM's vm.toml, and two of those writes landing at once tore the file
+        # into invalid TOML -- which is how a real VM was damaged. Loading a
+        # value into a field is not the user editing it.
+        self._rdp_loading = True
+        try:
+            effective_user = target.user
+            if not self.rdp_user_entry.get_property("has-focus"):
+                self.rdp_user_entry.set_text(effective_user)
+            own_share = registry.load_spec(status.name).media.share_path
+            if not self.share_entry.get_property("has-focus"):
+                # Blank means "inherit the default", which is what the label
+                # below says. "." is only ever what the user types to opt out.
+                self.share_entry.set_text(own_share)
+        finally:
+            self._rdp_loading = False
         inherited = settings.get("share_path")
         if own_share:
             self.share_source.set_text(f"This VM maps {own_share}.")

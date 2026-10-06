@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import uuid as uuidlib
 from dataclasses import asdict, dataclass, field, fields
@@ -474,6 +475,19 @@ def load(path: Path, *, name: str | None = None) -> VmSpec:
 def save(spec: VmSpec, path: Path, *, header: str = "") -> None:
     spec.validate()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        toml_io.dumps(spec.to_dict(), header=header or f"vmhub spec for {spec.name}")
+    body = toml_io.dumps(
+        spec.to_dict(), header=header or f"vmhub spec for {spec.name}"
     )
+    # Write beside the target, then rename over it. A plain write_text leaves
+    # the file truncated and half-written if anything interrupts it -- another
+    # writer, a crash, a full disk -- and a vm.toml that parses as neither the
+    # old spec nor the new one makes the VM unreadable rather than merely
+    # stale. os.replace is atomic within a filesystem, so a reader sees the
+    # old file or the new one and never a splice of both.
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(body)
+        os.replace(tmp, path)
+    finally:
+        # A failed rename leaves the scratch file behind; it is not the spec.
+        tmp.unlink(missing_ok=True)

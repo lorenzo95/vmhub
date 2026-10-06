@@ -593,6 +593,51 @@ def main() -> int:
           (paths.project_root() / "src" / "vmhub" / "ui" / "window.py").read_text(),
           "the defaults need a way to set them the GUI can reach")
 
+# A vm.toml that was interrupted mid-write is neither the old spec nor the
+# new one, and the VM becomes unreadable rather than merely stale. A real one
+# turned up like this: a duplicated key and an orphaned value fragment.
+    atomic_vm = f"{VM}-atomic"
+    lifecycle.create(atomic_vm, blueprint="alpine")
+    atomic_path = paths.spec_path(atomic_vm)
+    before_text = atomic_path.read_text()
+    atomic_spec = registry.load_spec(atomic_vm)
+    spec.save(atomic_spec, atomic_path)
+    check("a save leaves the spec readable", atomic_path.read_text() == before_text,
+          atomic_path.read_text()[:80])
+    check("a save leaves no scratch file behind",
+          not list(paths.vm_dir(atomic_vm).glob("*.tmp.*")),
+          str(list(paths.vm_dir(atomic_vm).iterdir())))
+
+    # Simulate a write that dies after the file is already truncated -- a full
+    # disk, a crash, a second writer. pathlib opens the target for writing
+    # before it has any bytes, so a plain write leaves a file that is neither
+    # the old spec nor the new one. This is the shape a real vm.toml turned
+    # up in: a duplicated key and an orphaned value fragment.
+    real_write_text = Path.write_text
+
+    def dying_write_text(self, data, *a, **k):
+        with open(self, "w") as handle:
+            handle.write(data[: len(data) // 2])
+        raise OSError("simulated: died mid-write")
+
+    try:
+        Path.write_text = dying_write_text  # type: ignore[method-assign]
+        spec.save(atomic_spec, atomic_path)
+    except OSError:
+        pass
+    finally:
+        Path.write_text = real_write_text  # type: ignore[method-assign]
+
+    check("a write that dies mid-flight leaves the old spec intact",
+          atomic_path.read_text() == before_text,
+          atomic_path.read_text()[:120])
+    check("and cleans up its scratch file",
+          not list(paths.vm_dir(atomic_vm).glob("*.tmp.*")),
+          str(list(paths.vm_dir(atomic_vm).iterdir())))
+    check("the VM still loads after an interrupted save",
+          registry.load_spec(atomic_vm).name == atomic_vm)
+    lifecycle.remove(atomic_vm)
+
     section("clone modes")
     for name in registry.dependents_of(VM):
         if podman.is_running(name):

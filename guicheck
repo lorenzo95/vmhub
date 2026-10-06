@@ -464,6 +464,54 @@ def _probe(app) -> None:
         # pointing at a probe value.
         settings_mod.save({key: "" for key in settings_mod.FIELDS})
 
+    # A pane refresh pushes values into the RDP entries with set_text(), which
+    # emits "changed" -- the signal those handlers save on. Without a guard,
+    # every refresh rewrote the VM's vm.toml. Two of those writes landing at
+    # once tore the file into invalid TOML, which is how a real VM was
+    # damaged.
+    #
+    # The damage was a race, so comparing file contents does not reproduce
+    # it: one sequential save per refresh is merely wrong, not visibly torn.
+    # Assert the thing that actually must not happen instead -- a refresh
+    # must not ask to save anything.
+    victim = f"{VM}-specsafe"
+    lifecycle.create(victim, blueprint="alpine")
+    window.select_vm(VM)
+    saved_labels: list[str] = []
+    real_run_task = widgets.run_task
+
+    def spy(*call_args, **call_kwargs):
+        saved_labels.append(str(call_kwargs.get("label", "")))
+        return real_run_task(*call_args, **call_kwargs)
+
+    widgets.run_task = spy
+    try:
+        window.select_vm(victim)
+        window.select_vm(VM)
+        window.select_vm(victim)
+    finally:
+        widgets.run_task = real_run_task
+    writes = [label for label in saved_labels if "Saving" in label]
+    if not writes:
+        exercised.append("selecting a VM does not rewrite its spec")
+        print(
+            "  \033[32mPASS\033[0m  selecting a VM saves nothing; a refresh is "
+            "not an edit"
+        )
+    else:
+        failures.append((
+            "pane refresh saved the spec",
+            f"asked to save: {writes}",
+        ))
+        print(
+            "  \033[31mFAIL\033[0m  selecting a VM asked to save its spec: "
+            f"{writes}"
+        )
+    window.select_vm(VM)
+    window.panes.pop(victim, None)
+    if registry.exists(victim):
+        lifecycle.remove(victim)
+
     if not pane.ports_box.get_first_child() and not pane.roles_box.get_first_child():
         failures.append(("ports table empty", "the Info tab drew no port rows"))
         print("  \033[31mFAIL\033[0m  the Info tab drew no port rows")
