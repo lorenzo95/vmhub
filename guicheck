@@ -279,6 +279,50 @@ def _probe(app) -> None:
         exercised.append("panes are pruned when a VM disappears")
         print("  \033[32mPASS\033[0m  pane pruned when the VM disappeared")
 
+    # ---- a dialog that can be opened must actually appear ----
+    # Preferences was wired into the menu, not greyed out, and never
+    # presented: get_visible() and get_mapped() were both False, so clicking
+    # it did nothing at all.
+    from vmhub.ui.prefs import PreferencesDialog
+    prefs = PreferencesDialog(window)
+    settle()
+    if prefs.get_visible():
+        exercised.append("the Preferences dialog actually appears")
+        print("  \033[32mPASS\033[0m  Preferences dialog appears when opened")
+    else:
+        failures.append(("Preferences dialog never appears", "get_visible() is False"))
+        print("  \033[31mFAIL\033[0m  Preferences dialog is built but never shown")
+    prefs.close()
+
+    # ---- a control disabled by a transient error must come back ----
+    # update() greys out Start when a VM's spec is unreadable, and restored
+    # every other control it disables -- except this one, so a VM that tripped
+    # the error once left Start dead for the rest of the session.
+    import dataclasses
+    revert_vm = f"{VM}-recover"
+    lifecycle.create(revert_vm, blueprint="alpine")
+    settle()
+    recover_pane = VmPane(window, revert_vm)
+    good = lifecycle.status(revert_vm)
+    recover_pane.update(dataclasses.replace(good, exists=False, errors=["torn vm.toml"]))
+    # get_sensitive() is True when ENABLED, so negate it to mean "greyed out".
+    greyed = not recover_pane.power_button.get_sensitive()
+    recover_pane.update(good)
+    recovered = recover_pane.power_button.get_sensitive()
+    if greyed and recovered:
+        exercised.append("Start comes back after a transient spec error")
+        print("  \033[32mPASS\033[0m  Start is restored after the VM becomes readable")
+    else:
+        failures.append((
+            "Start stays disabled after recovery",
+            f"disabled={not greyed}, re-enabled={recovered}",
+        ))
+        print(f"  \033[31mFAIL\033[0m  Start never re-enabled "
+              f"(disabled={not greyed}, re-enabled={recovered})")
+    recover_pane.close()
+    lifecycle.remove(revert_vm, progress=None)
+    settle()
+
     # ---- a pane that is not on screen must still refresh ----
     # _apply_statuses refreshed only self.current, so a VM whose spec changed
     # while another one was selected kept showing the old numbers until you

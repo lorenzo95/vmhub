@@ -81,13 +81,24 @@ class PreferencesDialog(Gtk.Window):
         outer.append(row)
 
         self.set_child(outer)
+        # A dialog exists only to be shown. Without this the menu item was
+        # wired up, not greyed out, and did nothing at all when clicked --
+        # get_visible() and get_mapped() were both False. widgets.TextPrompt
+        # carries this same rule and the comment explaining it; this one was
+        # never given it.
+        self.present()
 
     def _on_save(self, _button: object = None) -> None:
         values = {key: entry.get_text().strip() for key, entry in self.entries.items()}
+        # Bound before the call, not by it: `path` was assigned only by the
+        # very call that raises, so the error handler below raised
+        # UnboundLocalError instead of reporting the failure it exists to
+        # report. config_path() is the same file settings.save() writes.
+        target = settings.config_path()
         try:
             path = settings.save(values)
         except OSError as exc:
-            self.status.set_text(f"Could not write {path}: {exc}")
+            self.status.set_text(f"Could not write {target}: {exc}")
             return
         self.status.set_text(f"Saved to {path}")
         self.close()

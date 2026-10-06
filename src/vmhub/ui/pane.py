@@ -1240,6 +1240,12 @@ class VmPane(Gtk.Box):
         self.state_label.set_text("  ·  ".join(parts))
 
         running = status.powered
+        # update() disables this when the VM is unreadable. Every other
+        # control it disables is restored further down this method -- this one
+        # was not, so a VM that tripped the error once left Start greyed out
+        # for the rest of the session, and selecting the VM again reuses the
+        # cached pane rather than rebuilding it.
+        self.power_button.set_sensitive(True)
         self.power_button.set_label("Stop" if running else "Start")
         self.power_button.remove_css_class("suggested-action")
         self.power_button.remove_css_class("destructive-action")
@@ -1562,6 +1568,15 @@ class VmPane(Gtk.Box):
         dialog.choose(self.window, None, on_choice)
 
     def _on_snapshot(self, _button) -> None:
+        # Offer a name rather than an empty box. TextPrompt closes before it
+        # decides whether to call back, so an empty entry closed the dialog
+        # and did nothing -- the `if not name: return` below was unreachable.
+        # Same reasoning as the clone dialog prefilling "<source>-copy".
+        taken = list(self.status.snapshots) if self.status else []
+        number = len(taken) + 1
+        while f"snap-{number}" in taken:
+            number += 1
+
         def accept(name: str) -> None:
             if not name:
                 return
@@ -1575,6 +1590,7 @@ class VmPane(Gtk.Box):
             self.window,
             "Take a snapshot",
             "Name this point-in-time snapshot. It is instantaneous and copy-on-write.",
+            default=f"snap-{number}",
             on_accept=accept,
         )
 
