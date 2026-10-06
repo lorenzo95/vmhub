@@ -223,13 +223,19 @@ def write_profile(vm: str) -> Path:  # noqa: D401
     ]
     lines += [f"{key}={value}" for key, value in PROFILE_FIELDS.items()]
 
-    # Drive mapping. Remmina only offers the folder when both keys are set:
-    # sharepath names it, share turns sharing on. This VM's own setting wins
-    # over the app-wide default; with neither, the session maps nothing.
+    # Drive mapping. The key is "drive", and it is the only one: this Remmina's
+    # RDP plugin registers `drive`, with `sharefolder` kept only as a deprecated
+    # alias it migrates forward. There is no `sharepath` and no `share` -- vmhub
+    # wrote both for a long time and the tests passed, because they asserted the
+    # keys vmhub wrote rather than the keys Remmina reads. Remmina ignored them
+    # silently, so the shared folder never reached the session.
+    #
+    # `sharefolder` is written too, with the same value, for older Remmina builds
+    # that only know that name. This version migrates it to `drive` unchanged.
     share = share_path(vm)
     if share:
-        lines.append(f"sharepath={share}")
-        lines.append("share=1")
+        lines.append(f"drive={share}")
+        lines.append(f"sharefolder={share}")
 
     path.write_text("\n".join(lines) + "\n")
     path.chmod(0o600)
