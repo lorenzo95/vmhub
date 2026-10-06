@@ -23,13 +23,21 @@ RDP_PROTOCOLS = {
 }
 
 
+# The session resolution, and the window it is shown in. These are the
+# same number deliberately: vmhub asked Remmina for 1920x1080 and left
+# the window alone, so Remmina reused its own 640x480 default and the
+# desktop was scaled into a quarter of the screen it was given.
+SESSION_WIDTH = 1920
+SESSION_HEIGHT = 1080
+
+
 @dataclass
 class RdpTarget:
     host: str
     port: int
     user: str
     password: str
-    resolution: str = "1920x1080"
+    resolution: str = f"{SESSION_WIDTH}x{SESSION_HEIGHT}"
 
     def __post_init__(self) -> None:
         # A default password only makes sense next to a known account; with no
@@ -163,11 +171,19 @@ def probe(vm: str, timeout: float = 6.0) -> tuple[bool, str]:
 
 PROFILE_GROUP = "vmhub"
 PROFILE_FIELDS = {
-    "resolution_width": 1920,
-    "resolution_height": 1080,
+    "resolution_width": SESSION_WIDTH,
+    "resolution_height": SESSION_HEIGHT,
     "resolution_mode": 0,
     "colordepth": 63,
     "viewmode": 1,
+    # The window the session is shown in, sized to the session rather
+    # than to whatever Remmina last remembered.
+    "window_width": SESSION_WIDTH,
+    "window_height": SESSION_HEIGHT,
+    # Spelled out rather than omitted. Remmina saves its window state
+    # back into this same file, so leaving the key out would let a
+    # remembered maximize quietly decide the window instead of us.
+    "window_maximize": 0,
     "cert_ignore": 1,
     "ignore-tls-errors": 1,
     "security": "",

@@ -619,6 +619,13 @@ def main() -> int:
     check("the default account reaches the profile",
           "username=gero" in shared_text,
           [line for line in shared_text.splitlines() if line.startswith("username")])
+    window_lines = [ln for ln in shared_text.splitlines() if ln.startswith("window")]
+    check("the window is sized to the session it shows",
+          f"window_width={rdp.PROFILE_FIELDS['resolution_width']}" in shared_text
+          and f"window_height={rdp.PROFILE_FIELDS['resolution_height']}" in shared_text,
+          window_lines)
+    check("and is not maximized behind Remmina's back",
+          "window_maximize=0" in shared_text, window_lines)
     check("rdp.share_path reports the inherited default",
           rdp.share_path(defaults_vm) == "/home/admin/Shared",
           rdp.share_path(defaults_vm))
