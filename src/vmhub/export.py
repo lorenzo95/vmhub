@@ -145,7 +145,7 @@ def export_vm(
             "created_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "host": socket.gethostname(),
             "platform": platform.platform(),
-            "image": meta.image or vm_spec.image.ref,
+            "image": vm_spec.image.ref,
             "qemu_img": disk.binary_version(),
             "podman": podman.version(),
             "was_template": meta.is_template,
@@ -251,7 +251,6 @@ def import_bundle(
         registry.create_meta(
             target_name,
             blueprint=imported_spec.blueprint,
-            image=manifest.get("image") or imported_spec.image.ref,
             is_template=bool(manifest.get("was_template")),
             notes=f"imported from {Path(archive).name}",
             **({"uuid": old_meta.get("uuid", spec.new_uuid()),

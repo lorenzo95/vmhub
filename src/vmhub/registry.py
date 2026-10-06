@@ -21,7 +21,12 @@ class VmMeta:
     mac: str = field(default_factory=spec.new_mac)
     created: float = field(default_factory=time.time)
     blueprint: str = ""
-    image: str = ""
+    # No image field. The image lives in vm.toml and only there.
+    # A second copy here went stale the moment `vmctl set image.tag=`
+    # changed the spec: the container ran the new image while `vmctl info`
+    # and the bundle manifest reported the old one. from_dict() drops the
+    # key on load and save_meta() stops rewriting it, so existing
+    # meta.json files migrate themselves on their next save.
     is_template: bool = False
     template_source: str | None = None
     dependents: list[str] = field(default_factory=list)

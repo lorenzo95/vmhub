@@ -238,3 +238,39 @@ def test_two_saves_in_one_process_do_not_share_a_scratch_file(
     assert seen[0] != seen[1], f"both saves used the same scratch file: {seen}"
     assert paths.meta_path("demo").read_text() != original
     assert list(paths.vm_dir("demo").glob("*.tmp")) == []
+
+
+def test_meta_does_not_store_the_image() -> None:
+    """The image lives in vm.toml, and only in vm.toml.
+
+    meta.json used to keep a second copy. `vmctl set <vm> image.tag=7.49`
+    rewrote vm.toml, podman ran 7.49, and `vmctl info` still reported the
+    7.50 the meta remembered -- so the report named an image the VM would
+    never boot.
+    """
+    assert "image" not in registry.VmMeta.__dataclass_fields__
+
+
+def test_legacy_meta_json_carrying_an_image_still_loads() -> None:
+    """Existing meta.json files have the key; loading one must not fail.
+
+    from_dict() filters to known fields, so the stale copy is dropped on
+    read. These files are real VMs and must keep working.
+    """
+    meta = registry.VmMeta.from_dict(
+        {"uuid": "u", "mac": "m", "image": "docker.io/qemux/qemu:7.50"}
+    )
+    assert meta.uuid == "u"
+    assert "image" not in meta.to_dict()
+
+
+def test_saving_a_meta_drops_the_legacy_image_key(project_home: Path) -> None:
+    """The stale key must not survive a rewrite, or it comes back to lie again."""
+    (project_home / "demo").mkdir()
+    (project_home / "demo" / paths.META_FILE).write_text(
+        json.dumps({"uuid": "u", "mac": "m", "image": "docker.io/qemux/qemu:7.50"})
+    )
+    registry.save_meta(registry.load_meta("demo"))
+    written = json.loads((project_home / "demo" / paths.META_FILE).read_text())
+    assert written["uuid"] == "u"
+    assert "image" not in written

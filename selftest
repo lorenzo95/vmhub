@@ -1784,6 +1784,20 @@ def main() -> int:
     check("the reference round-trips", imspec.image.ref == "registry.example:5000/qemu:1.2",
           imspec.image.ref)
 
+    # meta.json used to keep a second copy of the image. `vmctl set
+    # image.tag=` changed vm.toml and podman followed it, but `vmctl info`
+    # and the bundle manifest read the stale copy, so the report named an
+    # image the VM would never boot. One source of truth now: vm.toml.
+    im_meta = registry.load_meta(imvm)
+    check("meta.json no longer stores the image",
+          "image" not in im_meta.to_dict(), str(sorted(im_meta.to_dict())))
+    im_spec_now = registry.load_spec(imvm)
+    check("the spec is the only answer to which image this VM runs",
+          im_spec_now.image.ref == "registry.example:5000/qemu:1.2", im_spec_now.image.ref)
+    check("and it is the image podman would actually be handed",
+          podman.run_argv(im_spec_now, "u", "m", None)[-1] == im_spec_now.image.ref,
+          podman.run_argv(im_spec_now, "u", "m", None)[-1])
+
     # resources.kvm=false reached the spec and was reported in the UI, but
     # run_argv passed /dev/kvm either way: QEMU was told KVM=N and ignored
     # the device, while the container still had it.

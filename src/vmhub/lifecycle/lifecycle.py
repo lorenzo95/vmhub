@@ -102,7 +102,6 @@ def create(
     meta = registry.create_meta(
         name,
         blueprint=vm_spec.blueprint,
-        image=vm_spec.image.ref,
     )
     published = [f"{port.label} :{port.host}" for port in vm_spec.network.ports if port.host]
     progress(f"Created {name} ({', '.join(published)})")

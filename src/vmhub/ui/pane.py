@@ -1393,7 +1393,7 @@ class VmPane(Gtk.Box):
 
         details = [
             ("Container", podman.container_name(status.name)),
-            ("Image", registry.load_meta(status.name).image or "-"),
+            ("Image", registry.load_spec(status.name).image.ref),
             ("UUID", registry.load_meta(status.name).uuid),
             ("MAC", registry.load_meta(status.name).mac),
             ("Disk bus", status.disk_type),

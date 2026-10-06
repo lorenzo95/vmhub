@@ -184,7 +184,7 @@ def materialize(
     vm_spec.validate()
 
     registry.save_spec(vm_spec)
-    registry.create_meta(target, blueprint="", image=vm_spec.image.ref, notes=f"imported from libvirt domain {name}")
+    registry.create_meta(target, blueprint="", notes=f"imported from libvirt domain {name}")
 
     if move:
         progress(f"Removing the original because --move was given: {source}")

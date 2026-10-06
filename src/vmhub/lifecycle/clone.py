@@ -105,7 +105,6 @@ def clone(
     meta = registry.create_meta(
         name,
         blueprint=source_meta.blueprint,
-        image=source_meta.image,
         template_source=None if mode == "full" else source,
     )
     if mode == "linked":

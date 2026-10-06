@@ -152,7 +152,7 @@ def cmd_info(args: argparse.Namespace, out: Out) -> int:
     rows = [
         ("state", item.summary),
         ("blueprint", item.blueprint or "-"),
-        ("image", meta.image or vm_spec.image.ref),
+        ("image", vm_spec.image.ref),
         ("uuid", meta.uuid),
         ("mac", meta.mac),
         ("cpus / ram", f"{item.cpus} / {item.ram}"),
