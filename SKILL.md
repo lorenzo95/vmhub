@@ -78,6 +78,14 @@ that file, so the disk would become invisible to vmhub with no way back.
 `export` resolves any backing chain via `qemu-img convert` while it copies, so
 bundles are always standalone. It stages beside the destination, never in /tmp.
 
+Import rebuilds `meta.json` from identity alone — uuid, mac, blueprint, the
+template flag — so `snapshot_power` and `dependents` are dropped even though
+`manifest["meta"]` carries them. Confirmed by round trip: a VM exported with
+`snapshot_power = {"taken-running": true}` re-imports with `{}`. `revert()`
+then hits `recorded is None` and falls back to `was_running`, leaving the VM as
+it currently is. There is no `--restart` flag to override this; `--no-restart`
+is the only one, so do not write docs that promise otherwise.
+
 Note `podman.rm()` takes a **VM** name and adds the `vmhub-` prefix itself;
 passing a container name silently double-prefixes and removes nothing.
 

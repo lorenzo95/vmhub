@@ -358,6 +358,17 @@ verifies the checksum and assigns a **fresh UUID and MAC** by default so a moved
 VM does not collide with the original on your network; pass `--keep-identity`
 for genuine failover.
 
+Import rebuilds `meta.json` from identity alone, so **snapshot power state does
+not survive the trip**. The manifest does record it, but import restores only
+the UUID, MAC, blueprint and template flag — `snapshot_power` and `dependents`
+both come back empty. `vmctl revert` uses `snapshot_power` to put the VM back
+into the power state the snapshot was taken in; with nothing recorded it falls
+back to leaving the VM exactly as it is now. So a snapshot taken while the VM
+was running reverts to *stopped* after a re-import, even though reverting to
+that same snapshot on the original VM powers it back on. Start it yourself
+afterwards, or pass `--no-restart` to `revert` to make the stopped outcome
+explicit rather than incidental.
+
 `export` requires the VM to be stopped. It **resolves a linked clone's backing
 chain as it copies**, so the bundle is always self-contained — no separate
 `flatten` step, and no way to produce an archive that cannot be imported. That
