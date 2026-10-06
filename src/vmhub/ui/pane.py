@@ -1780,6 +1780,12 @@ class VmPane(Gtk.Box):
             placeholder="clone name",
             accept_label="Clone",
             extra=choice,
+            # extra= is here for the mode choice, not to replace the entry.
+            # Without this, TextPrompt infers entry_is_input from extra being
+            # set, builds no entry at all, and hands on_accept an empty
+            # string -- which came out as "invalid VM name: ''" with no field
+            # on screen to type into.
+            show_entry=True,
             on_accept=accept,
         )
 

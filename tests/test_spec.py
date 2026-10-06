@@ -223,6 +223,39 @@ def test_image_ref_composes_repository_and_tag() -> None:
     assert image.ref == "docker.io/qemux/qemu:latest"
 
 
+def test_name_problem_names_the_offending_character() -> None:
+    """"invalid VM name: 'test (linked)'" alone does not say what is wrong.
+
+    A user who typed "test (linked)" cannot see from the rule alone which
+    characters to remove, and the whole message reads as a verdict on the
+    clone rather than on the spelling.
+    """
+    problem = spec.name_problem("test (linked)")
+    assert "space" not in problem or "remove" in problem, problem
+    assert "remove" in problem, problem
+    for char in "()":
+        assert repr(char)[1:-1] in problem.replace("\"", "'"), problem
+
+
+def test_name_problem_says_when_the_name_is_empty() -> None:
+    """The Clone dialog used to submit exactly this."""
+    assert "empty" in spec.name_problem(""), spec.name_problem("")
+
+
+def test_name_problem_says_when_it_starts_wrong() -> None:
+    assert "starts with" in spec.name_problem("-test"), spec.name_problem("-test")
+
+
+def test_name_problem_says_when_it_is_too_long() -> None:
+    assert "63" in spec.name_problem("a" * 64), spec.name_problem("a" * 64)
+
+
+def test_a_valid_name_has_no_problem() -> None:
+    assert spec.validate_name("test-copy") == "test-copy"
+    with pytest.raises(spec.SpecError if hasattr(spec, "SpecError") else Exception):
+        spec.validate_name("test copy")
+
+
 def test_default_image_tag_is_pinned_not_latest() -> None:
     """The default tag must name a version.
 

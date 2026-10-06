@@ -363,6 +363,22 @@ def _probe(app) -> None:
         window.panes[VM]._on_clone(None)
         clone_opened = len(opened) > before
 
+        # The dialog must actually have a name field. It builds one for the
+        # linked/full choice via extra=, and TextPrompt treats any extra= as
+        # "this caller brings its own fields" -- so with nothing saying
+        # otherwise, no entry was constructed and Clone submitted an empty
+        # name, which came out as "invalid VM name: ''" with nothing on screen
+        # to type into.
+        clone_dialog = opened[-1] if opened else None
+        clone_entry = getattr(clone_dialog, "entry", None)
+        if clone_entry is not None and clone_entry.get_text() == f"{VM}-copy":
+            exercised.append("the Clone dialog has a prefilled name field")
+            print("  \033[32mPASS\033[0m  Clone dialog has a prefilled name field")
+        else:
+            shown = clone_entry.get_text() if clone_entry is not None else "no entry at all"
+            failures.append(("Clone dialog has no name field", shown))
+            print(f"  \033[31mFAIL\033[0m  Clone dialog name field: {shown!r}")
+
         # give the VM an RDP port but no account, so _on_remmina takes the prompt path
         rdp_spec = registry.load_spec(VM)
         rdp_spec.network.guest_ports = [22, 3389]

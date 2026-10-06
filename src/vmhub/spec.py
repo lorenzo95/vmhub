@@ -74,11 +74,30 @@ def new_mac() -> str:
     )
 
 
+def name_problem(name: str) -> str:
+    """What is wrong with `name`, in words.
+
+    Reporting only the rule ("use letters, digits, '-' or '_'") leaves the
+    reader to work out which character of what they typed was the problem.
+    """
+    rule = "use letters, digits, '-' or '_', starting with a letter or digit, up to 63"
+    if not name:
+        return f"the name is empty — {rule}"
+    bad = [
+        c
+        for c in dict.fromkeys(name)
+        if not (c.isascii() and (c.isalnum() or c in "-_"))
+    ]
+    if bad:
+        return f"invalid VM name: {name!r} — remove {''.join(bad)!r}; {rule}"
+    if len(name) > 63:
+        return f"invalid VM name: {name!r} — it is {len(name)} characters; {rule}"
+    return f"invalid VM name: {name!r} — it starts with {name[0]!r}; {rule}"
+
+
 def validate_name(name: str) -> str:
     if not NAME_RE.match(name or ""):
-        raise SpecError(
-            f"invalid VM name: {name!r} — use letters, digits, '-' or '_' (max 63)"
-        )
+        raise SpecError(name_problem(name))
     return name
 
 
