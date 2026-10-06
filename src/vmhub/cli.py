@@ -976,6 +976,16 @@ def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
         # qemu-img aborted the table instead of being reported in it.
         qemu_img, qemu_img_ok = str(exc), False
     has_podman = shutil.which("podman") is not None
+    # Report where the pin points and whether it is here. Deliberately
+    # verdict-free: an unpulled image is pulled on first start, so failing
+    # doctor over it would be wrong.
+    pinned_image = spec.Image().ref
+    if not has_podman:
+        pinned_image_state = "unknown"
+    elif podman.image_present(pinned_image):
+        pinned_image_state = "local"
+    else:
+        pinned_image_state = "not pulled"
     rootless = podman.is_rootless()
     has_kvm = podman.host_has_kvm()
     checks = [
@@ -987,6 +997,7 @@ def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
         ("rootless net", net_helper or "MISSING: passt (or slirp4netns)", bool(net_helper)),
         ("qemu-img", qemu_img, qemu_img_ok),
         ("host /dev/kvm", "readable" if has_kvm else "NOT ACCESSIBLE", has_kvm),
+        ("qemu image", f"{pinned_image}  ({pinned_image_state})", True),
         ("python gi/gtk", "importable" if not gui_missing else f"MISSING: {', '.join(gui_missing)}", not gui_missing),
         ("free space", spec.format_size(os.statvfs(root).f_bavail * os.statvfs(root).f_frsize) if root else "", True),
         ("init system", autostart.detect_init(), True),
@@ -1083,7 +1094,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--disk-type")
     p.add_argument("--boot-mode", choices=sorted(spec.BOOT_MODES))
     p.add_argument("--iso", help="boot image keyword or URL")
-    p.add_argument("--image", help="container image, e.g. docker.io/qemux/qemu:latest")
+    p.add_argument("--image", help=f"container image, e.g. {spec.Image().ref}")
     p.add_argument("--no-start", action="store_true")
     p.add_argument("--mark-template", action="store_true")
     p.set_defaults(func=cmd_new)

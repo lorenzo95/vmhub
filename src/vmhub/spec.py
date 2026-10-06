@@ -32,6 +32,12 @@ PERSIST_WHEN_FALSY = "persist_when_falsy"
 NET_MODES = {"user", "N"}
 EXPORT_FORMATS = ("qcow2", "raw", "vmdk", "vdi", "vhdx", "vpc")
 DEFAULT_REPO = "docker.io/qemux/qemu"
+# The tag is pinned, not "latest". "latest" moves under the VMs that are
+# already running, so a rebuild months from now can silently land on a
+# different QEMU than the one that was tested. 7.50 is the tag "latest"
+# pointed at when this was pinned -- byte-identical, so pinning changes
+# nothing that is already running, it only stops it from moving later.
+DEFAULT_TAG = "7.50"
 
 _SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGTP]?)(?:i?B)?\s*$", re.IGNORECASE)
 _UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
@@ -79,7 +85,7 @@ def validate_name(name: str) -> str:
 @dataclass
 class Image:
     repository: str = DEFAULT_REPO
-    tag: str = "latest"
+    tag: str = DEFAULT_TAG
 
     @property
     def ref(self) -> str:

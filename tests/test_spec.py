@@ -221,3 +221,37 @@ def test_env_can_switch_the_guest_agent_off() -> None:
 def test_image_ref_composes_repository_and_tag() -> None:
     image = spec.Image(repository="docker.io/qemux/qemu", tag="latest")
     assert image.ref == "docker.io/qemux/qemu:latest"
+
+
+def test_default_image_tag_is_pinned_not_latest() -> None:
+    """The default tag must name a version.
+
+    "latest" moves: a rebuild months from now pulls whatever the publisher
+    pushed last, which is not the QEMU this release was tested against, and
+    it changes under VMs that are already running.
+    """
+    assert spec.DEFAULT_TAG == "7.50"
+    assert spec.DEFAULT_TAG != "latest"
+    assert spec.DEFAULT_TAG[0].isdigit(), spec.DEFAULT_TAG
+    assert "." in spec.DEFAULT_TAG, spec.DEFAULT_TAG
+
+
+def test_default_image_ref_follows_the_pin() -> None:
+    """Blueprints carry no [image] section, so this is what a new VM gets.
+
+    alpine/debian13/win11/winserver2022 all omit [image] entirely and inherit
+    the dataclass default. If the default drifts, every blueprint drifts.
+    """
+    assert spec.Image().ref == f"docker.io/qemux/qemu:{spec.DEFAULT_TAG}"
+
+
+def test_explicit_latest_still_round_trips() -> None:
+    """Pinning the default must not forbid asking for latest on purpose.
+
+    The pin governs what a VM gets by accident, when nobody chose. A vm.toml
+    that says latest was chosen, and rewriting it would be the pin lying
+    about a decision rather than filling in an absence.
+    """
+    vm_spec = spec.VmSpec(name="demo")
+    vm_spec.image.tag = "latest"
+    assert _round_trip(vm_spec).image.tag == "latest"

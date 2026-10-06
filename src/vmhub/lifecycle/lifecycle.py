@@ -72,7 +72,8 @@ def create(
     if image is not None:
         repository, tag = spec.split_image_ref(image)
         vm_spec.image = spec.Image(
-            repository=repository or spec.DEFAULT_REPO, tag=tag or "latest"
+            repository=repository or spec.DEFAULT_REPO,
+            tag=tag or spec.DEFAULT_TAG,
         )
     progress("Allocating host ports...")
     allocated = ports.allocate_all()
