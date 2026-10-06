@@ -713,6 +713,47 @@ def _probe(app) -> None:
         "the copies block moved whole"
     )
 
+    # ---- a refresh must not overwrite a field while it is being typed in ----
+    # The poll used to write into these fields regardless of focus, and
+    # set_text() moves the caret. Typing "asda" saved "456asda" -- which is what
+    # reached the Remmina profile -- and choosing a folder in Browse looked like
+    # it had selected nothing, because the dialog took the focus and the poll put
+    # the old path straight back.
+    typing_pane = VmPane(window, VM)
+    try:
+        st = lifecycle.status(VM)
+        typing_pane.update(st)
+
+        account = typing_pane.rdp_user_entry
+        typed = ""
+        for char in "asda":
+            account.set_text(typed + char)   # one keystroke
+            typed += char
+            account.set_position(len(typed))  # caret at the end, as typing leaves it
+            typing_pane.update(st)           # the poll fires mid-word
+
+        share = typing_pane.share_entry
+        share.set_text("/tmp/picked-folder")
+        share.set_position(len("/tmp/picked-folder"))
+        typing_pane.update(st)
+
+        problems = []
+        if account.get_text() != "asda":
+            problems.append(f"typing 'asda' left {account.get_text()!r} in the field")
+        if account.get_position() != 4:
+            problems.append(f"the caret jumped to {account.get_position()}, not 4")
+        if share.get_text() != "/tmp/picked-folder":
+            problems.append(
+                f"a folder chosen in Browse was overwritten with {share.get_text()!r}"
+            )
+        if problems:
+            raise AssertionError("; ".join(problems))
+
+        exercised.append("a refresh never overwrites a field being typed in")
+        print("  \033[32mPASS\033[0m  a refresh never overwrites a field being typed in")
+    finally:
+        typing_pane.close()
+
     # ---- switching away must not stop the log for good ----
     other = next((n for n in window.order if n != VM), None)
     if other:

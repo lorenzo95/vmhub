@@ -366,6 +366,22 @@ class VmPane(Gtk.Box):
 
         dialog.choose(self.window, None, on_choice)
 
+    def _sync_entry(self, entry: Gtk.Entry, effective: str, saved: str) -> None:
+        """Show `effective` in `entry`, unless the user is editing it.
+
+        `saved` is what is on disk for this VM's own setting; `effective` is
+        what is in force, which may come from the blueprint or the app-wide
+        default instead. An entry is refreshed only when it is in step with
+        disk (no edit pending) and does not already show `effective`.
+        """
+        current = entry.get_text().strip()
+        if current == saved.strip():
+            # The field agrees with disk, so whatever was typed has been saved
+            # and the next refresh is free to write.
+            entry._vmhub_pending = False
+        elif not getattr(entry, "_vmhub_pending", False) and current != effective:
+            entry.set_text(effective)
+
     def _on_rdp_user_changed(self, entry: Gtk.Entry | None) -> None:
         """Save the account on the spot. It is one field and one keystroke to
         undo, and making it a separate step is how it went unset before."""
@@ -374,6 +390,10 @@ class VmPane(Gtk.Box):
         if entry is None or self._rdp_loading:
             return
         text = entry.get_text().strip()
+        # The field now holds an edit that disk does not have yet. Mark it, so
+        # update() leaves it alone until the save below lands -- otherwise the
+        # next poll writes the previous value back over the caret.
+        entry._vmhub_pending = True
 
         def work(_progress):
             fresh = registry.load_spec(self.vm)
@@ -392,6 +412,9 @@ class VmPane(Gtk.Box):
         # "." is how a VM opts out of a shared default. Empty cannot mean "map
         # nothing", because empty means "use the default".
         value = "" if text == "." else text
+        # Same reasoning as the account field: mark the field as holding an edit
+        # the poll must not overwrite.
+        entry._vmhub_pending = True
 
         def work(_progress):
             fresh = registry.load_spec(self.vm)
@@ -421,6 +444,11 @@ class VmPane(Gtk.Box):
                 return
             path = folder.get_path()
             if path:
+                # set_text() emits "changed", which marks the field pending and
+                # saves it. Choosing a folder used to look like it did nothing:
+                # the dialog had taken the focus, so the next poll put the old
+                # path straight back.
+                self.share_entry._vmhub_pending = True
                 self.share_entry.set_text(path)
 
         chooser.select_folder(self.window, None, done)
@@ -1286,23 +1314,38 @@ class VmPane(Gtk.Box):
         # RDP options. The fields show what is in effect, not only what this
         # VM overrides, so an inherited default is visible rather than blank.
         #
-        # set_text() emits "changed", which is the very signal these handlers
-        # save on. Without the guard, every 4-second refresh rewrote every
-        # VM's vm.toml, and two of those writes landing at once tore the file
-        # into invalid TOML -- which is how a real VM was damaged. Loading a
-        # value into a field is not the user editing it.
+        # Two separate things go wrong when a refresh writes into these fields.
+        #
+        # set_text() emits "changed", which is the signal these handlers save on,
+        # so without _rdp_loading every 4-second refresh rewrote every VM's
+        # vm.toml, and two of those writes landing at once tore the file into
+        # invalid TOML -- which is how a real VM was damaged.
+        #
+        # And set_text() moves the caret, so writing the value the field already
+        # shows is not a no-op: it is a caret jump. Guarding on keyboard focus
+        # was not enough, because the caret and the focus disagree exactly when a
+        # refresh lands between two keystrokes or after a dialog takes focus. The
+        # caret went to the start and the rest of the word was typed in front:
+        # "asda" was saved as "456asda", and that mangled name is what reached the
+        # Remmina profile. Choosing a folder in Browse went the same way -- the
+        # dialog took focus, the poll put the old path back, and it looked like
+        # the chooser had selected nothing.
+        #
+        # So track edits rather than focus. While a field holds an unsaved edit,
+        # the refresh does not touch it at all; and it never writes a value the
+        # field already shows, because a rewrite with identical text still moves
+        # the caret. _sync_entry clears the flag once the field agrees with what
+        # is on disk, so the next refresh is free to refresh again.
         self._rdp_loading = True
         try:
-            effective_user = target.user
-            if not self.rdp_user_entry.get_property("has-focus"):
-                self.rdp_user_entry.set_text(effective_user)
-            own_share = registry.load_spec(status.name).media.share_path
-            if not self.share_entry.get_property("has-focus"):
-                # Blank means "inherit the default", which is what the label
-                # below says. "." is only ever what the user types to opt out.
-                self.share_entry.set_text(own_share)
+            fresh = registry.load_spec(status.name)
+            self._sync_entry(self.rdp_user_entry, target.user, fresh.media.rdp_user)
+            # Blank means "inherit the default", which is what the label below
+            # says. "." is only ever what the user types to opt out.
+            self._sync_entry(self.share_entry, "", fresh.media.share_path)
         finally:
             self._rdp_loading = False
+        own_share = fresh.media.share_path
         inherited = settings.get("share_path")
         if own_share:
             self.share_source.set_text(f"This VM maps {own_share}.")
