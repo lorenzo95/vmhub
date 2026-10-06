@@ -19,6 +19,9 @@
 !/selftest
 !/guicheck
 !/.gitignore
+# The unit suite and its config are project files, not VM data.
+!/tests/
+!/pytest.ini
 
 # ...and drop the noise inside the directories we keep.
 __pycache__/
