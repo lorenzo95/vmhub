@@ -45,6 +45,38 @@ passed = 0
 failed: list[str] = []
 
 
+def _remmina_share_keys() -> set[str]:
+    """Share-related config keys the installed Remmina RDP plugin registers.
+
+    Read out of the plugin binary rather than a hand-written list, because a
+    hand-written list is exactly how "sharepath" survived here for so long: it
+    looked plausible and no Remmina on this machine had ever heard of it.
+
+    Only the sharing keys are collected. A full key list cannot be used to
+    validate the whole profile, because "name", "server", "port", "username"
+    and "protocol" are read by Remmina's core rather than by the RDP plugin, so
+    they would look invented. Returns an empty set when Remmina is absent, and
+    the checks that use it are skipped rather than failed.
+    """
+    candidates = [
+        Path("/usr/lib/remmina/plugins/remmina-plugin-rdp.so"),
+        *sorted(Path("/usr/lib").glob("*-linux-gnu/remmina/plugins/remmina-plugin-rdp.so")),
+    ]
+    for path in candidates:
+        try:
+            blob = path.read_bytes()
+        except OSError:
+            continue
+        tokens = {m.decode() for m in re.findall(rb"[ -~]{2,64}", blob)}
+        return {
+            t
+            for t in tokens
+            if re.fullmatch(r"[a-z][a-z0-9_]{1,24}", t)
+            and ("share" in t or "drive" in t or "folder" in t)
+        }
+    return set()
+
+
 def check(label: str, condition: bool, detail: str = "") -> None:
     global passed
     if condition:
@@ -508,8 +540,8 @@ def main() -> int:
     shared_profile = rdp.write_profile(defaults_vm)
     shared_text = shared_profile.read_text()
     check("the shared folder reaches the remmina profile",
-          "sharepath=/home/admin/Shared" in shared_text and "share=1" in shared_text,
-          [line for line in shared_text.splitlines() if "share" in line])
+          f"drive=/home/admin/Shared" in shared_text,
+          [line for line in shared_text.splitlines() if "drive" in line])
     check("the default account reaches the profile",
           "username=gero" in shared_text,
           [line for line in shared_text.splitlines() if line.startswith("username")])
@@ -523,9 +555,9 @@ def main() -> int:
           rdp.share_path(defaults_vm))
     own_text = rdp.write_profile(defaults_vm).read_text()
     check("and the override is what lands in the profile",
-          "sharepath=/home/admin/Other" in own_text
-          and "sharepath=/home/admin/Shared" not in own_text,
-          [line for line in own_text.splitlines() if "sharepath" in line])
+          "drive=/home/admin/Other" in own_text
+          and "drive=/home/admin/Shared" not in own_text,
+          [line for line in own_text.splitlines() if "drive" in line])
     check("media.share_path survives a spec round-trip",
           registry.load_spec(defaults_vm).media.share_path == "/home/admin/Other",
           registry.load_spec(defaults_vm).media.share_path)
@@ -534,8 +566,27 @@ def main() -> int:
     settings.set_value("share_path", "")
     unshared_text = rdp.write_profile(defaults_vm).read_text()
     check("an empty folder default maps nothing",
-          "sharepath=" not in unshared_text,
-          [line for line in unshared_text.splitlines() if "share" in line])
+          "drive=" not in unshared_text,
+          [line for line in unshared_text.splitlines() if "drive" in line])
+
+    # The keys the installed Remmina actually reads, read out of its own RDP
+    # plugin rather than out of what vmhub happens to write. vmhub emitted
+    # sharepath= and share=1 for a long time and every test passed, because each
+    # one asserted the keys vmhub wrote. This Remmina registers neither, so it
+    # discarded them without a word and the shared folder never arrived. Two
+    # tests that only compare vmhub to vmhub cannot see that class of bug; this
+    # one compares vmhub to the real consumer.
+    plugin_keys = _remmina_share_keys()
+    if plugin_keys:
+        check("the share key vmhub writes is one Remmina's RDP plugin reads",
+              "drive" in plugin_keys,
+              sorted(plugin_keys))
+        check("we write no share keys this Remmina has never heard of",
+              "sharepath" not in plugin_keys and "share" not in plugin_keys,
+              "this Remmina's sharing keys are: " + ", ".join(sorted(plugin_keys)))
+        check("the deprecated alias is only written for older Remmina builds",
+              f"sharefolder={rdp.share_path(defaults_vm)}" in shared_text,
+              [ln for ln in shared_text.splitlines() if "sharefolder" in ln])
     rdp.remove_profile(defaults_vm)
     lifecycle.remove(defaults_vm)
 
@@ -1083,6 +1134,20 @@ def main() -> int:
           "self.share_entry = Gtk.Entry()" in pane_src
           and "Gtk.FileDialog" in pane_src,
           "a path selector needs an entry and a Browse button")
+    # Having the widget is not the same as it working. Browse used a
+    # one-argument done(folder) callback where PyGObject calls
+    # (dialog, result), so picking a folder raised TypeError, the traceback went
+    # nowhere, and the button looked like it selected nothing -- while the check
+    # above, which only looks for the widget, passed happily.
+    browse_src = pane_src.split("def _on_share_browse", 1)[-1].split("\n    def ", 1)[0]
+    check("the Browse callback uses the async-result shape PyGObject calls",
+          "select_folder_finish(result)" in browse_src
+          and "def on_selected(source, result)" in browse_src,
+          "a one-argument callback raises before it can read the folder")
+    check("no chooser callback is left with a single argument",
+          "def done(folder)" not in pane_src
+          and "def on_selected(folder)" not in pane_src,
+          "select_folder/select pass (source, result) and need *_finish()")
     check("the Remmina button stays and explains itself",
           "self.remmina_button.set_sensitive(" in pane_src
           and "self.remmina_button.set_visible(" not in pane_src,

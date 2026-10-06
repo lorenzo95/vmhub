@@ -439,19 +439,29 @@ class VmPane(Gtk.Box):
                 # from opening.
                 pass
 
-        def done(folder) -> None:
+        def on_selected(source, result) -> None:
+            # Gtk.FileDialog is an async API: PyGObject calls this with
+            # (dialog, result) and the folder comes out of select_folder_finish.
+            # This used to be a one-argument done(folder), which raised TypeError
+            # the moment a folder was chosen -- and the traceback went nowhere,
+            # so the button looked like it selected nothing. Every other chooser
+            # in the app (ISO attach, bundle import) already had this shape.
+            try:
+                folder = chooser.select_folder_finish(result)
+            except Exception:
+                return
             if folder is None:
                 return
             path = folder.get_path()
             if path:
                 # set_text() emits "changed", which marks the field pending and
-                # saves it. Choosing a folder used to look like it did nothing:
-                # the dialog had taken the focus, so the next poll put the old
-                # path straight back.
+                # saves it. Choosing a folder also used to look like it did
+                # nothing, because the dialog had taken the focus and the poll
+                # put the old path straight back.
                 self.share_entry._vmhub_pending = True
                 self.share_entry.set_text(path)
 
-        chooser.select_folder(self.window, None, done)
+        chooser.select_folder(self.window, None, on_selected)
 
     def _refresh_notices(self, notices: list) -> None:
         """One row per notice, with the action that resolves it on the row.
