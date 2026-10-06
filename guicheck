@@ -279,6 +279,54 @@ def _probe(app) -> None:
         exercised.append("panes are pruned when a VM disappears")
         print("  \033[32mPASS\033[0m  pane pruned when the VM disappeared")
 
+    # ---- a pane that is not on screen must still refresh ----
+    # _apply_statuses refreshed only self.current, so a VM whose spec changed
+    # while another one was selected kept showing the old numbers until you
+    # switched to it. Selecting was the only other thing that updated a pane,
+    # which is why it looked like the page needed a tab switch to update.
+    otherpane = f"{VM}-otherpane"
+    lifecycle.create(otherpane, blueprint="alpine")
+    window.select_vm(otherpane)
+    settle()
+    window.select_vm(VM)
+    settle()
+    sibling = window.panes.get(otherpane)
+
+    def _rendered_host(pane):
+        # GTK4 has no get_children(): it is get_first_child()/get_next_sibling().
+        if pane is None:
+            return "(no pane)"
+        row = pane.roles_box.get_first_child()
+        while row is not None:
+            child = row.get_first_child()
+            while child is not None:
+                if isinstance(child, Gtk.Label) and child.get_text().startswith("host "):
+                    return child.get_text()
+                child = child.get_next_sibling()
+            row = row.get_next_sibling()
+        return "(no host line)"
+
+    ospec = registry.load_spec(otherpane)
+    new_host = ospec.network.by_role("web").host + 1
+    ospec.network.set_role("web", 8006, new_host)
+    registry.save_spec(ospec)
+    shown = _rendered_host(sibling)
+    window._apply_statuses(lifecycle.list_vms())
+    settle()
+    after = _rendered_host(sibling)
+    if str(new_host) in after:
+        exercised.append("an unselected VM's pane refreshes on its own")
+        print(f"  \033[32mPASS\033[0m  unselected pane refreshed {shown!r} -> {after!r}")
+    else:
+        failures.append((
+            "unselected pane stays stale",
+            f"vm.toml says {new_host}, pane shows {after!r}",
+        ))
+        print(f"  \033[31mFAIL\033[0m  unselected pane stale: shows {after!r}, "
+              f"vm.toml says {new_host}")
+    lifecycle.remove(otherpane, progress=None)
+    settle()
+
     # ---- sidebar context menu and accelerators ----
     # These live in the "row" action group, not on the window. Checking the
     # window used to pass while every item in the menu was greyed out: the

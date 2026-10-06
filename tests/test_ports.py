@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from vmhub import ports, spec
+from vmhub import paths, ports, spec
 
 
 @pytest.fixture
@@ -186,3 +186,97 @@ def test_verify_ignores_an_unallocated_host() -> None:
     """host=0 means "not assigned yet", not "port zero is busy"."""
     vm_spec = _vm_with_ports([22], [spec.Port(guest=22, host=0, role="ssh")])
     assert ports.verify(vm_spec, check_busy=True) == []
+
+
+def test_reallocate_published_moves_a_role_off_the_source_number(
+    make_vm, minimal_spec_data, always_free
+):
+    """A clone must not publish a host port its source already publishes.
+
+    This is what made the gate red: clone() allocated fresh numbers for the
+    three roles but left the source's on everything else, so a clone could
+    collide with its source. That only ever worked because start() silently
+    reassigned on the way in.
+    """
+    _vm_claiming(make_vm, minimal_spec_data, "source", 8006)
+    vm_spec = _vm_with_ports(
+        [22], [spec.Port(guest=8006, host=8006, role="web")]
+    )
+    out = ports.reallocate_published(vm_spec.network.ports)
+    assert out[0].host != 8006, out
+
+
+def test_reallocate_published_moves_a_custom_forward_off_the_source_number(
+    make_vm, minimal_spec_data, always_free
+):
+    _vm_claiming(make_vm, minimal_spec_data, "source", 5433)
+    vm_spec = _vm_with_ports(
+        [5432], [spec.Port(guest=5432, host=5433, name="Postgres")]
+    )
+    out = ports.reallocate_published(vm_spec.network.ports)
+    assert out[0].host != 5433, out
+    assert out[0].name == "Postgres", out
+
+
+def test_reallocate_published_leaves_an_unpublished_entry_alone(always_free):
+    """host=0 means the user chose not to publish it; do not resurrect it."""
+    vm_spec = _vm_with_ports(
+        [22], [spec.Port(guest=8006, host=8006, role="web"), spec.Port(guest=5432, host=0)]
+    )
+    out = ports.reallocate_published(vm_spec.network.ports)
+    assert out[1].host == 0, out
+
+
+def test_conflicts_for_names_a_port_another_vm_claims(make_vm, minimal_spec_data):
+    """Two VMs publishing one host port is a conflict to refuse, not resolve.
+
+    start() used to call ensure_for(), which rewrote vm.toml with a different
+    number. The user asked for a specific port and got another one, told only
+    in a progress line that scrolls away.
+    """
+    _vm_claiming(make_vm, minimal_spec_data, "one", 8006)
+    _vm_claiming(make_vm, minimal_spec_data, "two", 8006)
+    problems = ports.conflicts_for("two")
+    assert any("8006" in p and "one" in p for p in problems), problems
+
+
+def test_conflicts_for_names_a_port_held_by_another_process(
+    make_vm, minimal_spec_data, monkeypatch
+):
+    _vm_claiming(make_vm, minimal_spec_data, "solo", 8006)
+    monkeypatch.setattr(ports, "port_is_free", lambda *_a, **_k: False)
+    problems = ports.conflicts_for("solo")
+    assert any("bound by another process" in p for p in problems), problems
+
+
+def test_conflicts_for_is_quiet_when_every_port_is_usable(
+    make_vm, minimal_spec_data, monkeypatch
+):
+    _vm_claiming(make_vm, minimal_spec_data, "solo", 8006)
+    monkeypatch.setattr(ports, "port_is_free", lambda *_a, **_k: True)
+    assert ports.conflicts_for("solo") == []
+
+
+def test_conflicts_for_never_rewrites_the_spec(
+    make_vm, minimal_spec_data, monkeypatch
+):
+    """The whole point of splitting it out: start() may refuse, not re-pick.
+
+    If this ever writes, the guarantee that start() leaves vm.toml alone is
+    gone, and the symptom comes back as "it changed my port".
+    """
+    _vm_claiming(make_vm, minimal_spec_data, "one", 8006)
+    _vm_claiming(make_vm, minimal_spec_data, "two", 8006)
+    monkeypatch.setattr(ports, "port_is_free", lambda *_a, **_k: False)
+    before = paths.spec_path("two").read_text()
+    ports.conflicts_for("two")
+    assert paths.spec_path("two").read_text() == before
+
+
+def test_conflicts_for_excludes_the_vm_being_checked(
+    make_vm, minimal_spec_data, monkeypatch
+):
+    """A VM's own port is not a conflict with itself."""
+    _vm_claiming(make_vm, minimal_spec_data, "solo", 8006)
+    monkeypatch.setattr(ports, "port_is_free", lambda *_a, **_k: True)
+    assert ports.conflicts_for("solo") == []

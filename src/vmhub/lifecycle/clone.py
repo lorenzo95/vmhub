@@ -85,6 +85,11 @@ def clone(
         vm_spec.network.set_role("ssh", 22, allocated["ssh"])
     if 3389 in vm_spec.network.guest_ports:
         vm_spec.network.set_role("rdp", 3389, allocated["rdp"])
+    # The three roles above got fresh numbers. The clone's own forwards came
+    # across carrying the source's, and two VMs cannot both publish one host
+    # port. That used to be invisible because start() silently reassigned on
+    # the way in; it is now a refusal, so the clone has to be right here.
+    vm_spec.network.ports = ports.reallocate_published(vm_spec.network.ports)
 
     clone_disk = paths.disk_path(name)
     paths.storage_dir(name).mkdir(parents=True, exist_ok=True)

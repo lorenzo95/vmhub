@@ -1370,10 +1370,29 @@ def main() -> int:
         theirs.network.set_role(role, ports.ROLE_GUEST[role], mine.network.host_for(role))
     registry.save_spec(theirs)
     check("a forced clash is detected", bool(ports.collisions()))
-    lifecycle.start(rival, progress=None)
-    check("starting the VM repairs its own ports",
+
+    # start() used to rewrite the clashing ports and come up on different
+    # numbers. It refuses now, so the user finds out instead of getting a
+    # different port than the one they set.
+    refused = ""
+    try:
+        lifecycle.start(rival, progress=None)
+    except VmhubError as exc:
+        refused = str(exc)
+    check("starting a clashing VM refuses instead of reassigning",
+          "repair-ports" in refused, refused[:200])
+    check("the refusal names the port it would not use",
+          str(mine.network.host_for("web")) in refused, refused[:200])
+    check("and rewrote nothing, so the clash is still on disk",
+          bool(ports.collisions()), str(ports.collisions()))
+    check("no container was created for the refused start",
+          not podman.container_exists(f"vmhub-{rival}"))
+
+    # The escape hatch is the old behaviour, kept on purpose.
+    lifecycle.start(rival, progress=None, repair=True)
+    check("start --repair-ports clears the clash",
           not ports.collisions(), str(ports.collisions()))
-    check("the repaired VM kept working",
+    check("and the VM still comes up",
           podman.state(rival) == "running", podman.state(rival))
     lifecycle.stop(rival, mode="force", progress=None)
     lifecycle.remove(rival, progress=None)
@@ -1752,6 +1771,47 @@ def main() -> int:
     changes = ports.ensure_for(pvm)
     check("a clashing user port is reassigned too",
           any("Postgres 16000 ->" in c for c in changes), str(changes))
+
+    # start() used to call ensure_for() and rewrite vm.toml whenever a port was
+    # taken, so a VM came up on a number nobody chose. It refuses now, and the
+    # number on disk is left exactly as it was.
+    import socket as _socket
+    _hog = _socket.socket()
+    _hog.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    _hog.bind(("127.0.0.1", 0))
+    _hog.listen(1)
+    _hogged = _hog.getsockname()[1]
+    blocked = f"{VM}-blocked"
+    try:
+        lifecycle.create(blocked, blueprint="alpine")
+        bspec = registry.load_spec(blocked)
+        bspec.network.set_role("web", 8006, _hogged)
+        registry.save_spec(bspec)
+        before = paths.spec_path(blocked).read_text()
+        refused = ""
+        try:
+            lifecycle.start(blocked, progress=None)
+        except VmhubError as exc:
+            refused = str(exc)
+        check("start refuses a host port that is taken",
+              str(_hogged) in refused and "repair-ports" in refused, refused[:200])
+        check("and says which port and why",
+              "bound by another process" in refused, refused[:200])
+        check("and leaves the port in vm.toml exactly as the user set it",
+              paths.spec_path(blocked).read_text() == before,
+              registry.load_spec(blocked).network.by_role("web").host)
+
+        # The escape hatch still exists for anyone who wants the old behaviour.
+        lifecycle.start(blocked, progress=None, repair=True)
+        moved = registry.load_spec(blocked).network.by_role("web").host
+        check("--repair-ports still reassigns it", moved != _hogged, moved)
+    finally:
+        _hog.close()
+        if registry.exists(blocked):
+            # --repair-ports above actually started it, so stop before removing.
+            if podman.is_running(blocked):
+                lifecycle.stop(blocked, progress=None)
+            lifecycle.remove(blocked, progress=None)
     after = registry.load_spec(pvm).network
     moved_back = [p for p in after.ports if p.name == "Postgres"]
     check("the guest port is unchanged by the move",

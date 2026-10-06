@@ -299,8 +299,16 @@ class VmhubWindow(Gtk.ApplicationWindow):
         self.sidebar_empty.set_visible(not self.order)
         if self.current and self.current not in self.statuses:
             self.select_vm(None)
-        elif self.current:
-            self._update_pane(self.current)
+        else:
+            # Every open pane, not just the current one. Refreshing only
+            # self.current meant a VM that was changed while you were looking
+            # at another one -- a start that reassigned a port, a spec edit
+            # from the CLI -- kept displaying the old numbers until you
+            # selected it again. Selecting is the only other thing that
+            # updates a pane, so the symptom was "it only refreshes when I
+            # switch tabs".
+            for open_name in list(self.panes):
+                self._update_pane(open_name)
         running = sum(1 for s in self.statuses.values() if s.powered)
         self.status_strip.set_idle(f"{running} running / {len(self.statuses)} total")
 

@@ -42,6 +42,10 @@ class NoFreePort(LifecycleError):
     pass
 
 
+class PortConflict(LifecycleError):
+    pass
+
+
 class AlreadyExists(VmhubError):
     pass
 

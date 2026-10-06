@@ -218,7 +218,11 @@ def cmd_start(args: argparse.Namespace, out: Out) -> int:
     failed = 0
     for name in args.names:
         try:
-            lifecycle.start(name, progress=None if args.quiet else out.step)
+            lifecycle.start(
+                name,
+                progress=None if args.quiet else out.step,
+                repair=args.repair_ports,
+            )
             if not args.quiet:
                 out.say(out.good(f"{name} started"))
         except VmhubError as exc:
@@ -1103,6 +1107,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("names", nargs="+", help="one or more VM names")
     p.add_argument("--quiet", "-q", action="store_true", help="suppress per-VM output")
     p.add_argument("--console", action="store_true", help="open the web console")
+    p.add_argument(
+        "--repair-ports",
+        action="store_true",
+        help=(
+            "reassign host ports that are taken instead of refusing to start. "
+            "Without this, start() will not touch the ports in vm.toml."
+        ),
+    )
     p.set_defaults(func=cmd_start)
 
     p = sub.add_parser("stop", help="stop VMs (default: graceful ACPI shutdown)")

@@ -145,6 +145,32 @@ def prune_guest_forward(net: "spec.Network", guest: int) -> None:
         net.guest_ports = [p for p in net.guest_ports if int(p) != guest]
 
 
+def reallocate_published(entries: Iterable["spec.Port"]) -> list["spec.Port"]:
+    """Give every published entry a host port that is free on this machine.
+
+    For a spec copied onto the same machine -- a clone -- where the numbers on
+    it belong to the copy's source and would collide with it. Roles keep their
+    familiar base range via allocate(); the user's own forwards move to the
+    high range. An entry with host=0 was deliberately unpublished and stays
+    that way, which reallocate() above does not do.
+    """
+    claimed = set(int(p) for p in used_by_vms())
+    out: list[spec.Port] = []
+    for entry in entries:
+        if not entry.host:
+            out.append(entry)
+            continue
+        host = allocate(entry.role, also_wanted=claimed) if entry.role \
+            else allocate_any(also_wanted=claimed)
+        claimed.add(host)
+        out.append(
+            spec.Port(
+                guest=entry.guest, host=host, role=entry.role, name=entry.name
+            )
+        )
+    return out
+
+
 def reallocate(entries: Iterable["spec.Port"]) -> list["spec.Port"]:
     """Give every entry a host port on this machine.
 
@@ -174,6 +200,33 @@ def _claimed_by_others(exclude: str) -> dict[int, str]:
         for port in vm_spec.network.published():
             claimed.setdefault(port, meta.name)
     return claimed
+
+
+def conflicts_for(vm: str) -> list[str]:
+    """Which of this VM's host ports cannot be used, and why. Never writes.
+
+    Kept separate from ensure_for() so start() can refuse instead of quietly
+    picking a different number than the one in vm.toml. A port the user chose
+    is a decision; overwriting it on the way to starting is how you get told
+    your VM runs an image/port you did not ask for.
+    """
+    vm_spec = registry.load_spec(vm)
+    claimed = _claimed_by_others(vm)
+    problems: list[str] = []
+    for port in vm_spec.network.ports:
+        current = port.host
+        if not current:
+            continue
+        holder = claimed.get(current)
+        if holder is not None:
+            problems.append(
+                f"{port.label} host port {current} is claimed by VM {holder!r}"
+            )
+        elif not port_is_free(current):
+            problems.append(
+                f"{port.label} host port {current} is bound by another process"
+            )
+    return problems
 
 
 def ensure_for(vm: str) -> list[str]:

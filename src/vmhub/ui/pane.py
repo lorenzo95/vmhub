@@ -500,15 +500,25 @@ class VmPane(Gtk.Box):
             child = nxt
 
     def _refresh_ports(self) -> None:
-        self._clear_box(self.roles_box)
-        self._clear_box(self.ports_box)
         try:
             net = registry.load_spec(self.vm).network
         except VmhubError as exc:
+            self._clear_box(self.roles_box)
+            self._clear_box(self.ports_box)
+            self._ports_signature = None
             label = Gtk.Label(label=str(exc))
             label.add_css_class("hint")
             self.ports_box.append(label)
             return
+        signature = tuple(
+            (port.role or "", port.guest, port.host, port.name or "")
+            for port in net.ports
+        )
+        if signature == self._ports_signature:
+            return
+        self._ports_signature = signature
+        self._clear_box(self.roles_box)
+        self._clear_box(self.ports_box)
         for role in spec.PORT_ROLES:
             self.roles_box.append(self._role_row(role, net.by_role(role)))
         extras = [port for port in net.ports if not port.role]
@@ -1010,6 +1020,10 @@ class VmPane(Gtk.Box):
         ports_hint.set_xalign(0.0)
         box.append(ports_hint)
 
+        # Refreshed on every poll now, so remember what is on screen: a pane
+        # that rebuilds its port widgets every four seconds churns widgets for
+        # nothing and can flicker.
+        self._ports_signature: tuple | None = None
         self.roles_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.append(self.roles_box)
         self.ports_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -1211,6 +1225,7 @@ class VmPane(Gtk.Box):
             detail = row["detail"]
             detail.set_text("unknown")
             row["detach"].set_sensitive(False)
+        self._ports_signature = None
         self._clear_box(self.notice_box)
         _replace_grid(self.details_grid, [])
         self._clear_box(self.roles_box)

@@ -18,6 +18,7 @@ from ..errors import (
     DiskError,
     LifecycleError,
     NotFound,
+    PortConflict,
     QgaError,
     QmpError,
     TemplateInUse,
@@ -227,13 +228,29 @@ def _guard_locked_disk(vm: str, meta: registry.VmMeta) -> None:
         )
 
 
-def start(vm: str, *, progress: Progress = _noop) -> str:
+def start(vm: str, *, progress: Progress = _noop, repair: bool = False) -> str:
     progress = progress or _noop
     meta = registry.load_meta(vm)
     _guard_locked_disk(vm, meta)
     vm_spec = registry.load_spec(vm)
 
     if not podman.is_running(vm):
+        # Used to call ensure_for() here, which rewrote vm.toml and picked a
+        # different port than the one on file. The user was told in a progress
+        # line that scrolls away, and only saw the new number once they
+        # selected the VM again -- so it read as vmhub changing it behind
+        # their back. Refuse instead, and leave the number alone.
+        blocked = ports.conflicts_for(vm)
+        if blocked and not repair:
+            raise PortConflict(
+                f"{vm} cannot start:\n"
+                + "\n".join(f"  {b}" for b in blocked)
+                + f"\n  fix: vmctl repair-ports {vm}   "
+                f"(reassigns them and rewrites vm.toml)"
+                + f"\n       or vmctl start {vm} --repair-ports   "
+                f"(reassigns them just for this start)"
+                + f"\n       or pick a different port in the GUI's Ports tab"
+            )
         for change in ports.ensure_for(vm):
             progress(f"port repaired: {change}")
         vm_spec = registry.load_spec(vm)
