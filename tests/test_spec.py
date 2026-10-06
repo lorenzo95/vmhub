@@ -3,7 +3,7 @@
 The interesting cases are the ones where a value equals its dataclass
 default. `to_dict()` prunes anything empty, so a field set to its own
 default is indistinguishable from a field nobody touched -- unless the value
-is falsy-but-meaningful, which is why False and 0 are deliberately kept.
+is falsy-but-meaningful, which is what PERSIST_WHEN_FALSY declares.
 """
 
 from __future__ import annotations
@@ -31,25 +31,80 @@ def test_to_dict_drops_the_name() -> None:
     assert "name" not in spec.VmSpec(name="demo").to_dict()
 
 
-def test_falsy_but_meaningful_values_are_kept() -> None:
-    """False and 0 match their defaults, so pruning them silently reverts them."""
+def test_a_field_can_declare_that_its_falsy_value_is_a_decision() -> None:
+    """The declaration is what keeps these six out of the blanket rule."""
+    marked = {
+        f"{cls.__name__}.{f.name}"
+        for cls in (
+            spec.Network, spec.Resources, spec.Shutdown,
+            spec.Features, spec.Image, spec.Boot,
+            spec.Display, spec.Media, spec.Port,
+        )
+        for f in cls.__dataclass_fields__.values()
+        if f.metadata.get(spec.PERSIST_WHEN_FALSY)
+    }
+    assert marked == {
+        "Network.guest_ports",
+        "Resources.kvm",
+        "Resources.ram_check",
+        "Shutdown.timeout",
+        "Features.hv",
+        "Features.guest_agent",
+    }, marked
+
+
+@pytest.mark.parametrize(
+    ("section", "attribute", "falsy"),
+    [
+        ("features", "guest_agent", False),
+        ("features", "hv", False),
+        ("resources", "kvm", False),
+        ("resources", "ram_check", False),
+        ("shutdown", "timeout", 0),
+        ("network", "guest_ports", []),
+    ],
+)
+def test_a_marked_field_keeps_its_falsy_value(section: str, attribute: str, falsy) -> None:
+    """Dropping the key would hand back the default, so it has to be written."""
     vm_spec = spec.VmSpec(name="demo")
-    vm_spec.features.guest_agent = False
-    vm_spec.shutdown.timeout = 0
-    vm_spec.display.protected = False
-    vm_spec.resources.kvm = False
-
+    setattr(getattr(vm_spec, section), attribute, falsy)
     data = vm_spec.to_dict()
-    assert data["features"]["guest_agent"] is False
-    assert data["shutdown"]["timeout"] == 0
-    assert data["display"]["protected"] is False
-    assert data["resources"]["kvm"] is False
-
+    assert section in data, f"{section} was pruned entirely: {data}"
     back = _round_trip(vm_spec)
-    assert back.features.guest_agent is False
-    assert back.shutdown.timeout == 0
-    assert back.display.protected is False
-    assert back.resources.kvm is False
+    assert getattr(back, section).__getattribute__(attribute) == falsy
+
+
+@pytest.mark.parametrize(
+    ("section", "attribute", "value"),
+    [
+        ("display", "protected", False),
+        ("boot", "iso", ""),
+        ("media", "rdp_user", ""),
+        ("display", "audio", False),
+        ("features", "ballooning", False),
+        ("shutdown", "skip_acpi", False),
+    ],
+)
+def test_an_unmarked_field_reloads_from_its_default(section: str, attribute: str, value) -> None:
+    """Not marked because the default already is that value.
+
+    The key may be omitted, but the value the caller set must survive --
+    that is the whole point: pruning an unmarked field never reverts it.
+    """
+    vm_spec = spec.VmSpec(name="demo")
+    setattr(getattr(vm_spec, section), attribute, value)
+    back = _round_trip(vm_spec)
+    assert getattr(back, section).__getattribute__(attribute) == value
+
+
+def test_an_unmarked_falsy_value_is_left_out_of_the_file() -> None:
+    """Otherwise the declaration would document an intent and change nothing."""
+    vm_spec = spec.VmSpec(name="demo")
+    vm_spec.features.ballooning = False
+    vm_spec.media.rdp_user = ""
+    data = vm_spec.to_dict()
+    assert "ballooning" not in data.get("features", {})
+    assert "rdp_user" not in data.get("media", {})
 
 
 def test_a_round_trip_preserves_every_scalar_it_can_see() -> None:
@@ -96,28 +151,44 @@ def test_a_round_trip_preserves_the_port_table() -> None:
         ("", True),
         ([], True),
         ({}, True),
-        ("x", False),
-        ([22], False),
-        ({"a": 1}, False),
         (False, False),
         (0, False),
         (30, False),
+        ("x", False),
+        ([22], False),
+        ({"a": 1}, False),
     ],
 )
-def test_is_empty_truth_table(value: object, empty: bool) -> None:
-    """The whole reason False and 0 are kept is visible in this one function."""
+def test_is_empty_without_a_declared_field_drops_empty_containers_only(
+    value: object, empty: bool
+) -> None:
+    """A bare dict has no declaration to consult, so this is the fallback rule.
+
+    False and 0 stay: dropping them is exactly the silent revert the
+    declaration exists to prevent, and a caller who never said where the value
+    came from has not earned the right to have it discarded.
+    """
     assert spec._is_empty(value) is empty
+
+
+def test_is_empty_consults_the_declaration() -> None:
+    marked = spec.Shutdown.__dataclass_fields__["timeout"]
+    unmarked = spec.Boot.__dataclass_fields__["iso"]
+    assert spec._is_empty(0, marked) is False
+    assert spec._is_empty("", unmarked) is True
+    assert spec._is_empty(None, marked) is True
 
 
 def test_prune_keeps_a_list_whole_and_prunes_inside_it() -> None:
     """A port entry is written with only the fields it uses, but the list stays."""
-    data = {
-        "keep": [22, 3389],
-        "ports": [{"guest": 8006, "host": 8006, "role": "web"}],
-        "drop_me": {},
-        "nested": {"kept": 1, "dropped": ""},
-    }
-    pruned = spec._prune(data)
+    pruned = spec._prune(
+        {
+            "keep": [22, 3389],
+            "ports": [{"guest": 8006, "host": 8006, "role": "web"}],
+            "drop_me": {},
+            "nested": {"kept": 1, "dropped": ""},
+        }
+    )
     assert pruned["keep"] == [22, 3389]
     assert pruned["ports"] == [{"guest": 8006, "host": 8006, "role": "web"}]
     assert "drop_me" not in pruned

@@ -4,7 +4,7 @@ import os
 import re
 import tempfile
 import uuid as uuidlib
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,11 @@ BOOT_MODES = {
 }
 DISK_TYPES = {"scsi", "virtio-scsi", "blk", "virtio-blk", "ide", "sata", "nvme", "usb"}
 DISK_FMTS = {"qcow2", "raw"}
+
+# Set on a dataclass field whose falsy value is a decision rather than an
+# absence -- anything whose falsy value differs from its default, so that
+# dropping the key would hand back the default instead. See _is_empty().
+PERSIST_WHEN_FALSY = "persist_when_falsy"
 NET_MODES = {"user", "N"}
 EXPORT_FORMATS = ("qcow2", "raw", "vmdk", "vdi", "vhdx", "vpc")
 DEFAULT_REPO = "docker.io/qemux/qemu"
@@ -118,8 +123,8 @@ class Resources:
     disk: str = "64G"
     disk_type: str = "scsi"
     disk_fmt: str = "qcow2"
-    kvm: bool = True
-    ram_check: bool = True
+    kvm: bool = field(default=True, metadata={PERSIST_WHEN_FALSY: True})
+    ram_check: bool = field(default=True, metadata={PERSIST_WHEN_FALSY: True})
 
     @property
     def disk_bytes(self) -> int:
@@ -153,7 +158,10 @@ class Port:
 @dataclass
 class Network:
     mode: str = "user"
-    guest_ports: list[int] = field(default_factory=lambda: [22])
+    guest_ports: list[int] = field(
+        default_factory=lambda: [22],
+        metadata={PERSIST_WHEN_FALSY: True},
+    )
     ports: list[Port] = field(default_factory=list)
     bind: str = "127.0.0.1"
     mac: str = ""
@@ -193,7 +201,7 @@ class Display:
 
 @dataclass
 class Shutdown:
-    timeout: int = 30
+    timeout: int = field(default=30, metadata={PERSIST_WHEN_FALSY: True})
     skip_acpi: bool = False
 
     @property
@@ -222,9 +230,9 @@ class Media:
 
 @dataclass
 class Features:
-    hv: bool = True
+    hv: bool = field(default=True, metadata={PERSIST_WHEN_FALSY: True})
     ballooning: bool = False
-    guest_agent: bool = True
+    guest_agent: bool = field(default=True, metadata={PERSIST_WHEN_FALSY: True})
     tpm: bool = False
     host_share: str = ""
     extra_env: dict[str, str] = field(default_factory=dict)
@@ -296,7 +304,7 @@ class VmSpec:
         return self.media.media_path(slot)
 
     def to_dict(self) -> dict[str, Any]:
-        return _prune({k: v for k, v in asdict(self).items() if k != "name"})
+        return _prune_dataclass(self, drop_name=True)
 
     def env(self, *, uuid: str, mac: str) -> dict[str, str]:
         env: dict[str, str] = {
@@ -350,30 +358,76 @@ class VmSpec:
         return cleaned
 
 
-def _is_empty(value: Any) -> bool:
+def _is_empty(value: Any, declared: "Field[Any] | None" = None) -> bool:
     """True for values worth omitting from vm.toml.
 
-    False and 0 are deliberately NOT empty. Dropping them here meant a
-    spec that had guest_agent=False or shutdown.timeout=0 came back from
-    spec_from_dict() holding the dataclass default instead, and `vmctl set`
-    reported success while the value silently reverted. Writing the value
-    is the only way the file can distinguish 'explicitly off' from 'never
-    set', so False and 0 are kept even where they match the default.
+    A field declares that its falsy value is a decision rather than an
+    absence by carrying metadata={PERSIST_WHEN_FALSY: True}.
+    features.guest_agent defaults to True, so writing guest_agent = false is
+    the only way the file can say 'off'; drop the key and spec_from_dict()
+    hands back the default, which is how `vmctl set` could report success
+    while the value silently reverted.
+
+    Fields that do not declare it are pruned when falsy, which costs
+    nothing: media.rdp_user defaults to '', so a missing key reloads as ''.
+
+    With no field to consult -- a bare dict from a caller that never said
+    where the value came from -- nothing falsy is dropped. Not knowing the
+    provenance of a value is no reason to discard it.
     """
-    return value is None or value == "" or value == [] or value == {}
+    if value is None:
+        return True
+    if declared is None:
+        # No dataclass field to consult -- a plain dict from a caller that
+        # never declared where the value came from. Fall back to the rule
+        # this replaced: drop the empty containers, never drop False or 0.
+        return value == "" or value == [] or value == {}
+    if declared.metadata.get(PERSIST_WHEN_FALSY):
+        return False
+    # Unmarked, so the field's default is falsy too: an omitted key reloads
+    # to the same value, and writing it says nothing.
+    return not value
 
 
-def _prune_items(value: Any) -> Any:
-    """Prune inside a list of tables too, so a port entry only writes the
-    fields it actually uses. The list itself is kept whole."""
+def _prune_dataclass(obj: Any, *, drop_name: bool = False) -> dict[str, Any]:
+    """Walk a dataclass, dropping only what carries no information.
+
+    Going through asdict() instead would flatten the tree into plain dicts
+    and lose which field each key came from, which is the one thing
+    _is_empty() now needs.
+    """
+    out: dict[str, Any] = {}
+    for declared in fields(obj):
+        if drop_name and declared.name == "name":
+            continue
+        value = getattr(obj, declared.name)
+        if _is_empty(value, declared):
+            continue
+        out[declared.name] = _prune_value(value)
+    return out
+
+
+def _prune_value(value: Any) -> Any:
+    if is_dataclass(value) and not isinstance(value, type):
+        return _prune_dataclass(value)
     if isinstance(value, list):
-        return [_prune(item) if isinstance(item, dict) else item for item in value]
+        """Prune inside a list of tables too, so a port entry only writes the
+        fields it actually uses. The list itself is kept whole."""
+        return [_prune_value(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _prune_value(v) for k, v in value.items() if not _is_empty(v)}
     return value
 
 
 def _prune(data: dict[str, Any]) -> dict[str, Any]:
+    """Prune a plain dict, for callers that have no dataclass to consult.
+
+    With no declared field every falsy value is kept, so this is the
+    conservative form. to_dict() walks the dataclass instead, which is
+    where the per-field declarations actually apply.
+    """
     return {
-        key: _prune(val) if isinstance(val, dict) else _prune_items(val)
+        key: _prune_value(val)
         for key, val in data.items()
         if not _is_empty(val)
     }
