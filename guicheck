@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import os
 import re
+import tempfile
 import time
 import sys
 from pathlib import Path
@@ -23,6 +24,13 @@ os.environ["VMHUB_NO_LAUNCH"] = "1"
 # so sharing the GUI's id would make this run silently remote and exit at once
 # whenever vmhub is already open.
 os.environ["VMHUB_APP_ID"] = "dev.vmhub.GUI.Check"
+
+# The sweep exercises the preferences dialog, which writes. Point the
+# app-wide defaults at a scratch file so this run cannot touch the real one:
+# a test that edits ~/.config/vmhub/settings.toml is a test that destroys it.
+os.environ["VMHUB_CONFIG"] = str(
+    Path(tempfile.mkdtemp(prefix="vmhub-gc-cfg-")) / "settings.toml"
+)
 
 if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
     print("guicheck: no DISPLAY or WAYLAND_DISPLAY set; skipping.")
@@ -45,6 +53,7 @@ from vmhub import (  # noqa: E402
 )
 from vmhub.ui import newvm, widgets, workers  # noqa: E402
 from vmhub.ui.app import VmhubApp  # noqa: E402
+from vmhub import settings as settings_mod  # noqa: E402
 from vmhub.ui.pane import VmPane  # noqa: E402
 
 VM = "vmhub-guicheck"
@@ -421,6 +430,39 @@ def _probe(app) -> None:
                 f"that is {'enabled' if wanted else 'disabled'} exactly when "
                 "there is something to finish"
             )
+
+    # The app-wide defaults are only half a feature if they can only be reached by
+    # hand-editing TOML. Build the real dialog and save through it.
+    from vmhub.ui.prefs import PreferencesDialog  # noqa: E402
+
+    prefs = PreferencesDialog(window)
+    try:
+        entries = prefs.entries
+        if set(entries) != set(settings_mod.FIELDS):
+            failures.append((
+                "preferences dialog",
+                f"offers {sorted(entries)}, expected {sorted(settings_mod.FIELDS)}",
+            ))
+            print("  \033[31mFAIL\033[0m  the preferences dialog does not offer every setting")
+        else:
+            for key in entries:
+                entries[key].set_text(f"probe-{key}")
+            prefs._on_save(None)
+            saved = settings_mod.load()
+            if all(saved.get(key) == f"probe-{key}" for key in entries):
+                exercised.append("the preferences dialog saves the app-wide defaults")
+                print(
+                    "  \033[32mPASS\033[0m  the preferences dialog saves every "
+                    "app-wide default"
+                )
+            else:
+                failures.append(("preferences dialog", f"stored {saved}"))
+                print("  \033[31mFAIL\033[0m  the preferences dialog did not save")
+    finally:
+        prefs.close()
+        # Put the defaults back: the sweep must not leave the user's settings
+        # pointing at a probe value.
+        settings_mod.save({key: "" for key in settings_mod.FIELDS})
 
     if not pane.ports_box.get_first_child() and not pane.roles_box.get_first_child():
         failures.append(("ports table empty", "the Info tab drew no port rows"))

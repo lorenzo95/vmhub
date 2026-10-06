@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import autostart, blueprints, disk, export, iso as isomod, lifecycle, paths, podman, ports, rdp, registry, spec
+from . import autostart, blueprints, disk, export, iso as isomod, lifecycle, paths, podman, ports, rdp, registry, settings, spec
 from .errors import ProjectRootError, VmhubError
 
 DIM = "\033[2m"
@@ -770,6 +770,39 @@ def _port_by_target(net: spec.Network, target: str) -> spec.Port | None:
     return None
 
 
+def cmd_config(args: argparse.Namespace, out: Out) -> int:
+    """Print the app-wide defaults, and where they live."""
+    values = settings.load()
+    out.say(out.bold("KEY"))
+    for key, description in sorted(settings.FIELDS.items()):
+        shown = values.get(key) or out.dim("(unset)")
+        out.say(f"{key:<14} {shown}")
+        out.say(out.dim(f"               {description}"))
+    out.say()
+    out.say(out.dim(f"stored in {settings.config_path()}"))
+    return 0
+
+
+def cmd_config_set(args: argparse.Namespace, out: Out) -> int:
+    if args.key not in settings.FIELDS:
+        out.say(out.bad(f"unknown setting {args.key!r}"))
+        out.say(out.dim(f"known settings: {', '.join(sorted(settings.FIELDS))}"))
+        return 2
+    try:
+        path = settings.set_value(args.key, args.value)
+    except OSError as exc:
+        out.say(out.bad(f"could not write {settings.config_path()}: {exc}"))
+        return 1
+    out.say(f"{args.key} = {args.value or out.dim('(unset)')}")
+    out.say(out.dim(f"written to {path}"))
+    return 0
+
+
+def cmd_config_path(args: argparse.Namespace, out: Out) -> int:
+    out.say(str(settings.config_path()))
+    return 0
+
+
 def cmd_ports(args: argparse.Namespace, out: Out) -> int:
     action = getattr(args, "ports_action", "list")
     vm_spec = registry.load_spec(args.name)
@@ -1251,6 +1284,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip orphans that are still running (e.g. holding 16 GB of RAM)",
     )
     p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser(
+        "config",
+        help="show or change the app-wide defaults (RDP account, shared folder)",
+    )
+    config_sub = p.add_subparsers(dest="config_action")
+
+    sp = config_sub.add_parser("show", help="print the current defaults (default)")
+    sp.set_defaults(func=cmd_config)
+
+    sp = config_sub.add_parser("set", help="change one default")
+    sp.add_argument("key", help=f"one of: {', '.join(sorted(settings.FIELDS))}")
+    sp.add_argument("value", help="the new value; pass an empty string to unset")
+    sp.set_defaults(func=cmd_config_set)
+
+    sp = config_sub.add_parser("path", help="print where the defaults are stored")
+    sp.set_defaults(func=cmd_config_path)
+
+    # `vmctl config` on its own shows them, the way `vmctl ports <name>` lists.
+    p.set_defaults(func=cmd_config, config_action="show")
 
     p = sub.add_parser("ports", help="show or change a VM's published ports")
     p.add_argument("name", help="the VM")

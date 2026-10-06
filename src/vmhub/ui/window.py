@@ -119,6 +119,7 @@ class VmhubWindow(Gtk.ApplicationWindow):
         section.append("Doctor", "win.doctor")
         section.append("Restore running VMs", "win.restore")
         menu.append_section(None, section)
+        menu.append("Preferences…", "win.prefs")
         menu_button.set_menu_model(menu)
         self._install_actions()
 
@@ -213,12 +214,20 @@ class VmhubWindow(Gtk.ApplicationWindow):
             ("refresh", self.refresh),
             ("doctor", self._on_doctor),
             ("restore", self._on_restore),
+            ("prefs", self._on_prefs),
         ):
             action = Gio.SimpleAction.new(action_name, None)
             action.connect("activate", lambda _a, fn=handler: fn())
             group.add_action(action)
         self.win_actions = group
         self.insert_action_group("win", group)
+
+    def _on_prefs(self) -> None:
+        """Edit the app-wide defaults -- the RDP account and shared folder
+        that apply to every VM which does not set its own."""
+        from .prefs import PreferencesDialog
+
+        PreferencesDialog(self)
 
     def _install_actions(self) -> None:
         self._install_win_actions()

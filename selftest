@@ -552,6 +552,47 @@ def main() -> int:
           settings.load() == {key: "" for key in settings.FIELDS}, settings.load())
     settings.config_path().unlink()
 
+    # The defaults have to be settable without hand-editing TOML, or they are
+    # only half a feature.
+    import argparse as _cfg_argparse
+
+    def run_config(*argv) -> tuple[int, str]:
+        buf = io.StringIO()
+        handler = {
+            "show": cli.cmd_config,
+            "set": cli.cmd_config_set,
+            "path": cli.cmd_config_path,
+        }[argv[0]]
+        ns = _cfg_argparse.Namespace(
+            config_action=argv[0],
+            key=argv[1] if len(argv) > 1 else "",
+            value=argv[2] if len(argv) > 2 else "",
+        )
+        with contextlib.redirect_stdout(buf):
+            rc = handler(ns, cli.Out())
+        return rc, buf.getvalue()
+
+    rc, text = run_config("show")
+    check("vmctl config show works", rc == 0, text.strip())
+    check("config show reports every setting",
+          all(key in text for key in settings.FIELDS), text.strip())
+    rc, text = run_config("set", "rdp_username", "gero")
+    check("vmctl config set works", rc == 0, text.strip())
+    check("and the value is really stored", settings.get("rdp_username") == "gero",
+          settings.load())
+    rc, text = run_config("set", "no_such_key", "x")
+    check("an unknown key is refused with a non-zero exit", rc != 0, f"rc={rc}")
+    check("and the refusal names the key", "no_such_key" in text, text.strip())
+    rc, text = run_config("path")
+    check("vmctl config path prints the file", str(settings.config_path()) in text,
+          text.strip())
+    settings.config_path().unlink(missing_ok=True)
+
+    check("the preferences dialog is reachable from the overflow menu",
+          '"Preferences…", "win.prefs"' in
+          (paths.project_root() / "src" / "vmhub" / "ui" / "window.py").read_text(),
+          "the defaults need a way to set them the GUI can reach")
+
     section("clone modes")
     for name in registry.dependents_of(VM):
         if podman.is_running(name):
