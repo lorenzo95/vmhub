@@ -154,19 +154,37 @@ def settle_dialog() -> None:
     pump_until(lambda: False, 0.25)
 
 
+# Every VM either harness mints is throwaway by construction.
+HARNESS_PREFIXES = ("vmhub-guicheck", "vmhub-selftest", "sweepvm")
+
+
 def _cleanup() -> None:
+    """Sweep what an earlier harness run left behind.
+
+    A leftover is not the user's, and letting one sit here makes it look like
+    one: the sweep check at the end of the run would blame the GUI for it
+    going missing.
+    """
     import shutil
 
     for meta in list(registry.iter_metas()):
-        if not meta.name.startswith("vmhub-guicheck"):
+        if not meta.name.startswith(HARNESS_PREFIXES):
             continue
+        # A powered-on harness VM belongs to another process: the backend
+        # selftest runs separately and may be using it right now. Leaving it
+        # alone is correct; pulling it out from under that run is not.
+        try:
+            if lifecycle.status(meta.name).powered:
+                continue
+        except Exception:
+            pass
         try:
             lifecycle.stop(meta.name, force=True)
         except Exception:
             pass
         shutil.rmtree(paths.vm_dir(meta.name), ignore_errors=True)
     for bundle in paths.backup_dir().glob("*.vmhub.tar.gz"):
-        if bundle.name.startswith("vmhub-guicheck") or bundle.name.startswith("sweepvm"):
+        if bundle.name.startswith(HARNESS_PREFIXES):
             bundle.unlink(missing_ok=True)
 
 
@@ -191,7 +209,14 @@ def _probe(app) -> None:
     # This sweep calls every handler in the GUI, on real widgets, for real.
     # Whatever VMs exist right now belong to the user: remember them so the
     # end of the run can prove none of them was removed by the sweep.
-    preexisting = set(registry.all_names())
+    # Only the user's VMs belong in this set. _cleanup() removed the harness
+    # leftovers that were not running; anything still carrying a harness name
+    # belongs to another run and is not evidence about this sweep.
+    preexisting = {
+        name
+        for name in registry.all_names()
+        if not name.startswith(HARNESS_PREFIXES)
+    }
 
     def settle() -> None:
         """Render a snapshot synchronously; the real refresh() is async."""
