@@ -1692,14 +1692,53 @@ class VmPane(Gtk.Box):
             on_done=lambda path: self.window.report(f"Exported to {path}"),
         )
 
-    def _on_delete(self, _button) -> None:
-        dialog = Gtk.AlertDialog(
-            message=f"Delete {self.vm}?",
-            detail="This removes the VM, its container and its disk. This cannot be undone.",
-            buttons=["Cancel", "Delete"],
-            cancel_button=0,
-            default_button=1,
+    def _delete_dialog(self) -> tuple[Gtk.AlertDialog, bool]:
+        """Build the delete confirmation, and say whether it is actually blocked.
+
+        lifecycle.remove() refuses to delete a VM that is still running. The old
+        wording promised "This removes the VM, its container and its disk"
+        regardless, so deleting a running one looked like it had worked until a
+        bare "Operation failed" alert appeared with no way back from it. That is
+        what makes a working Delete look broken.
+
+        So say it before the confirmation, and in that case offer no Delete button
+        at all -- there is nothing to confirm, so the button would be a lie.
+
+        Returns the dialog and True when the VM is running and cannot be deleted.
+        """
+        status = self.status
+        if status is not None and status.powered:
+            return (
+                Gtk.AlertDialog(
+                    message=f"{self.vm} is running",
+                    detail=(
+                        "Stop it before deleting. Deleting a VM removes its container "
+                        "and its disk, and vmhub will not delete one that is still "
+                        "running."
+                    ),
+                    buttons=["Close"],
+                    default_button=0,
+                    cancel_button=0,
+                ),
+                True,
+            )
+        return (
+            Gtk.AlertDialog(
+                message=f"Delete {self.vm}?",
+                detail="This removes the VM, its container and its disk. "
+                "This cannot be undone.",
+                buttons=["Cancel", "Delete"],
+                cancel_button=0,
+                default_button=1,
+            ),
+            False,
         )
+
+    def _on_delete(self, _button) -> None:
+        dialog, blocked = self._delete_dialog()
+        if blocked:
+            dialog.show(self.window)
+            return
 
         def on_choice(_d, result) -> None:
             try:

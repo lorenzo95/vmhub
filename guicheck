@@ -596,6 +596,50 @@ def _probe(app) -> None:
             "  \033[31mFAIL\033[0m  a hidden pane stopped watching its log"
         )
 
+    # ---- deleting a running VM must say so before promising anything ----
+    # lifecycle.remove() refuses to delete a VM that is still running, so the old
+    # dialog promised "This removes the VM, its container and its disk" and then
+    # failed with a bare "Operation failed" alert. That is what makes a working
+    # Delete look broken. Measured here on the real dialog objects.
+    del_pane = VmPane(window, VM)
+    try:
+        del_pane.status = lifecycle.VmStatus(name=VM, powered=True)
+        run_dialog, run_blocked = del_pane._delete_dialog()
+        run_message = run_dialog.get_message() or ""
+        run_detail = run_dialog.get_detail() or ""
+        run_buttons = list(run_dialog.get_buttons() or [])
+
+        del_pane.status = lifecycle.VmStatus(name=VM, powered=False)
+        idle_dialog, idle_blocked = del_pane._delete_dialog()
+        idle_message = idle_dialog.get_message() or ""
+        idle_buttons = list(idle_dialog.get_buttons() or [])
+
+        problems = []
+        if not run_blocked:
+            problems.append("a running VM was not treated as undeletable")
+        if "running" not in run_message.lower():
+            problems.append(f"the running dialog never says it is running: {run_message!r}")
+        if "stop" not in run_detail.lower():
+            problems.append("the running dialog does not say to stop it first")
+        if "Delete" in run_buttons:
+            problems.append(f"a running VM still offers a Delete button: {run_buttons}")
+        if idle_blocked:
+            problems.append("a stopped VM was wrongly treated as undeletable")
+        if "Delete" not in idle_buttons:
+            problems.append(f"a stopped VM offers no Delete button: {idle_buttons}")
+        if VM not in idle_message:
+            problems.append(f"the stopped dialog does not name the VM: {idle_message!r}")
+        if problems:
+            raise AssertionError("; ".join(problems))
+
+        exercised.append("deleting a running VM says so up front, not after failing")
+        print(
+            "  \033[32mPASS\033[0m  deleting a running VM says so up front, "
+            "not after failing"
+        )
+    finally:
+        del_pane.close()
+
     # ---- switching away must not stop the log for good ----
     other = next((n for n in window.order if n != VM), None)
     if other:
