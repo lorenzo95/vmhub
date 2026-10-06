@@ -8,7 +8,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
-from .. import blueprints, disk, export, iso as isomod, lifecycle, paths, podman, rdp, registry, spec  # noqa: E402
+from .. import blueprints, disk, export, iso as isomod, lifecycle, paths, podman, rdp, registry, settings, spec  # noqa: E402
 from ..errors import VmhubError  # noqa: E402
 from . import style, widgets, workers  # noqa: E402
 
@@ -169,25 +169,59 @@ class VmPane(Gtk.Box):
         self.rdp_missing_hint.add_css_class("hint")
         self.rdp_missing_hint.set_wrap(True)
         self.rdp_missing_hint.set_xalign(0.0)
-        self.rdp_test_button = Gtk.Button(label="Test connection")
-        self.rdp_test_button.set_tooltip_text(
-            "Speak RDP to the published port and report which hop fails"
-        )
-        self.rdp_test_button.set_halign(Gtk.Align.START)
-        self.rdp_test_button.connect("clicked", self._on_test_rdp)
         self.remmina_button = Gtk.Button(label="Connect with Remmina")
         self.remmina_button.add_css_class("suggested-action")
         self.remmina_button.set_tooltip_text("Open this VM in Remmina over RDP")
         self.remmina_button.connect("clicked", self._on_remmina)
         self.remmina_button.set_halign(Gtk.Align.START)
         box.append(self.remmina_button)
-        self.rdp_user_label = Gtk.Label()
-        self.rdp_user_label.add_css_class("hint")
-        self.rdp_user_label.set_wrap(True)
-        self.rdp_user_label.set_xalign(0.0)
-        box.append(self.rdp_user_label)
-        box.append(self.rdp_test_button)
-        box.append(self.rdp_missing_hint)
+        # Stays put whether or not it can be used. It used to disappear
+        # whenever there was no RDP port or Remmina was not installed, which
+        # left nothing on screen to say the feature existed at all.
+        self.rdp_reason = Gtk.Label()
+        self.rdp_reason.add_css_class("hint")
+        self.rdp_reason.set_wrap(True)
+        self.rdp_reason.set_xalign(0.0)
+        box.append(self.rdp_reason)
+
+        # ---- RDP options ----
+        # The "Test connection" button that used to live here is gone: it spoke
+        # RDP to the port and reported into the status bar, which the 4-second
+        # poll overwrote, so in practice it said nothing. These are the two
+        # settings Remmina actually needs.
+        box.append(widgets.section("RDP options"))
+
+        self.rdp_user_entry = Gtk.Entry()
+        self.rdp_user_entry.set_hexpand(True)
+        self.rdp_user_entry.set_placeholder_text("Account you created during Windows setup")
+        self.rdp_user_entry.set_tooltip_text(
+            "Used for the Remmina profile and the RDP URI. Leave empty to fall back "
+            "to the blueprint, then to the app-wide default."
+        )
+        self.rdp_user_entry.connect("changed", self._on_rdp_user_changed)
+        box.append(widgets.field("Account", self.rdp_user_entry))
+
+        self.share_entry = Gtk.Entry()
+        self.share_entry.set_hexpand(True)
+        self.share_entry.set_placeholder_text("Folder to map into the session, e.g. ~/Shared")
+        self.share_entry.set_tooltip_text(
+            "Mapped as a drive by RDP. Leave empty to use the app-wide default; "
+            "set it to '.' to map nothing for this VM."
+        )
+        self.share_entry.connect("changed", self._on_share_changed)
+        share_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        share_row.append(self.share_entry)
+        browse = Gtk.Button(label="Browse…")
+        browse.set_tooltip_text("Pick the folder to map into every RDP session")
+        browse.connect("clicked", self._on_share_browse)
+        share_row.append(browse)
+        box.append(widgets.field("Shared folder", share_row))
+
+        self.share_source = Gtk.Label()
+        self.share_source.add_css_class("hint")
+        self.share_source.set_wrap(True)
+        self.share_source.set_xalign(0.0)
+        box.append(self.share_source)
 
         box.append(widgets.section("Install media"))
         media_hint = Gtk.Label(
@@ -198,6 +232,18 @@ class VmPane(Gtk.Box):
         media_hint.set_wrap(True)
         media_hint.set_xalign(0.0)
         box.append(media_hint)
+
+        # This used to exist only inside a notice, and a notice only appears
+        # when there is genuinely an ISO to detach or a cached fallback to
+        # drop. That is the right condition and the wrong delivery: on a VM
+        # with nothing to finish, the button simply was not there, with
+        # nothing to say so. It now sits here permanently and says why it is
+        # unavailable.
+        self.finish_install_button = Gtk.Button(label="Finish install")
+        self.finish_install_button.add_css_class("suggested-action")
+        self.finish_install_button.set_halign(Gtk.Align.START)
+        self.finish_install_button.connect("clicked", self._on_finish_install)
+        box.append(self.finish_install_button)
 
         self.notice_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.append(self.notice_box)
@@ -316,16 +362,64 @@ class VmPane(Gtk.Box):
 
         dialog.choose(self.window, None, on_choice)
 
-    def _on_test_rdp(self, _button: object = None) -> None:
+    def _on_rdp_user_changed(self, entry: Gtk.Entry | None) -> None:
+        """Save the account on the spot. It is one field and one keystroke to
+        undo, and making it a separate step is how it went unset before."""
+        # A handler sweep calls this with a placeholder argument; there is no
+        # entry to read, and there is nothing to save.
+        if entry is None:
+            return
+        text = entry.get_text().strip()
+
         def work(_progress):
-            return rdp.probe(self.vm)
+            fresh = registry.load_spec(self.vm)
+            if fresh.media.rdp_user == text:
+                return False
+            fresh.media.rdp_user = text
+            registry.save_spec(fresh)
+            return True
 
-        def done(result) -> bool:
-            ok, message = result
-            self.window.report(("connected: " if ok else "not reachable: ") + message)
-            return False
+        widgets.run_task(self.window, work, label=f"Saving RDP account for {self.vm}")
 
-        widgets.run_task(self.window, work, on_done=done, label="Testing RDP")
+    def _on_share_changed(self, entry: Gtk.Entry | None) -> None:
+        if entry is None:
+            return
+        text = entry.get_text().strip()
+        # "." is how a VM opts out of a shared default. Empty cannot mean "map
+        # nothing", because empty means "use the default".
+        value = "" if text == "." else text
+
+        def work(_progress):
+            fresh = registry.load_spec(self.vm)
+            if fresh.media.share_path == value:
+                return False
+            fresh.media.share_path = value
+            registry.save_spec(fresh)
+            return True
+
+        widgets.run_task(self.window, work, label=f"Saving shared folder for {self.vm}")
+
+    def _on_share_browse(self, _button: object = None) -> None:
+        chooser = Gtk.FileDialog(title="Folder to map into the RDP session")
+        current = self.share_entry.get_text().strip()
+        if current and current != ".":
+            try:
+                chooser.set_initial_folder(
+                    Gio.File.parse_name(str(Path(current).expanduser()))
+                )
+            except Exception:
+                # A path that no longer resolves must not stop the chooser
+                # from opening.
+                pass
+
+        def done(folder) -> None:
+            if folder is None:
+                return
+            path = folder.get_path()
+            if path:
+                self.share_entry.set_text(path)
+
+        chooser.select_folder(self.window, None, done)
 
     def _refresh_notices(self, notices: list) -> None:
         """One row per notice, with the action that resolves it on the row.
@@ -348,16 +442,9 @@ class VmPane(Gtk.Box):
         text.set_xalign(0.0)
         text.set_hexpand(True)
         row.append(text)
-        if getattr(note, "action", "") == "finish-install":
-            button = Gtk.Button(label="Finish install")
-            button.add_css_class("suggested-action")
-            button.set_tooltip_text(
-                "Detach any install ISO and drop the cached fallback image, so this "
-                "VM boots from its disk and nothing else"
-            )
-            button.set_valign(Gtk.Align.START)
-            button.connect("clicked", self._on_finish_install)
-            row.append(button)
+        # The action button that used to hang off this row moved to the
+        # Install media section, where it is always present rather than
+        # appearing and disappearing with the notice that describes it.
         return row
 
     @staticmethod
@@ -402,9 +489,9 @@ class VmPane(Gtk.Box):
             text.set_hexpand(True)
             row.append(text)
             if role == "rdp":
-                test = Gtk.Button(label="Test")
-                test.set_tooltip_text("Speak RDP to the published port")
-                test.connect("clicked", self._on_test_rdp)
+                test = Gtk.Button(label="Open in Remmina")
+                test.set_tooltip_text("Write the Remmina profile and open this VM")
+                test.connect("clicked", self._on_remmina)
                 row.append(test)
             change = Gtk.Button(label="Change…")
             change.connect("clicked", lambda _b, r=role: self._on_change_role(r))
@@ -486,8 +573,12 @@ class VmPane(Gtk.Box):
                 role, also_wanted=set(ports_mod.used_by_vms(self.vm)) | set(net.published())
             )
             net.set_role(role, guest, host)
-            if role == "rdp" and not vm_spec.media.rdp_user:
-                vm_spec.media.rdp_user = "user"
+            # No invented RDP account. This used to set media.rdp_user to the
+            # literal string "user", which meant the Remmina prompt -- the one
+            # thing that could ask for the real account -- never appeared, and
+            # the session simply failed NLA. rdp.rdp_user() falls back to the
+            # blueprint and then to the app-wide default, and stays blank
+            # rather than guessing.
             vm_spec.validate()
             registry.save_spec(vm_spec)
             progress(f"{title} will be on host {host} after the next start")
@@ -1136,20 +1227,75 @@ class VmPane(Gtk.Box):
         self.rdp_row.set_visible(has_rdp)
         if has_rdp:
             widgets.set_copy_text(self.rdp_row, target.uri())
-        self.remmina_button.set_visible(has_rdp and rdp.remmina_available())
         self.rdp_missing_hint.set_visible(not has_rdp)
-        self.rdp_test_button.set_visible(has_rdp)
-        user = registry.load_spec(status.name).media.rdp_user or ""
-        self.rdp_user_label.set_visible(has_rdp and not user)
-        if has_rdp and not user:
-            self.rdp_user_label.set_text(
-                "No RDP user is set, so the URI omits the username. Set the account you "
-                "created during Windows setup with:  vmctl set "
-                f"{status.name} media.rdp_user=YourName"
+
+        # The button never disappears; it explains itself instead. Two reasons
+        # it used to vanish without trace: no published RDP port, and Remmina
+        # not installed. On a VM with neither, there was nothing on screen to
+        # suggest the feature existed.
+        remmina_here = rdp.remmina_available()
+        self.remmina_button.set_sensitive(has_rdp and remmina_here)
+        if not has_rdp:
+            self.remmina_button.set_tooltip_text(
+                "This VM has no published RDP port. Publish one from the Ports "
+                "section and this button will open the guest."
+            )
+            self.rdp_reason.set_text(
+                "RDP is unavailable until a port is published for this VM."
+            )
+        elif not remmina_here:
+            self.remmina_button.set_tooltip_text(
+                "Remmina is not installed on this host"
+            )
+            self.rdp_reason.set_text(
+                "Remmina is not installed, so this button has nothing to open."
+            )
+        else:
+            self.remmina_button.set_tooltip_text("Open this VM in Remmina over RDP")
+            self.rdp_reason.set_text("")
+
+        # RDP options. The fields show what is in effect, not only what this
+        # VM overrides, so an inherited default is visible rather than blank.
+        effective_user = target.user
+        if not self.rdp_user_entry.get_property("has-focus"):
+            self.rdp_user_entry.set_text(effective_user)
+        own_share = registry.load_spec(status.name).media.share_path
+        if not self.share_entry.get_property("has-focus"):
+            # Blank means "inherit the default", which is what the label below
+            # says. "." is only ever what the user types to opt out.
+            self.share_entry.set_text(own_share)
+        inherited = settings.get("share_path")
+        if own_share:
+            self.share_source.set_text(f"This VM maps {own_share}.")
+        elif inherited:
+            self.share_source.set_text(
+                f"Inherited from the app-wide default: {inherited}. "
+                f"Put '.' here to map nothing for this VM."
+            )
+        else:
+            self.share_source.set_text(
+                "No folder is mapped. Set one here, or set share_path in "
+                "~/.config/vmhub/settings.toml to use the same folder everywhere."
             )
 
         self._refresh_iso_rows()
         self._refresh_notices(list(getattr(status, "notices", [])))
+
+        # Same condition the notices use, so the button and the advice can
+        # never disagree -- and when there is nothing to do it says so rather
+        # than being absent.
+        needed = bool(getattr(status, "finish_install_needed", False))
+        self.finish_install_button.set_sensitive(needed)
+        if needed:
+            self.finish_install_button.set_tooltip_text(
+                "Detach any install ISO and drop the cached fallback image, so "
+                "this VM boots from its disk and nothing else"
+            )
+        else:
+            self.finish_install_button.set_tooltip_text(
+                "Nothing to do: no install ISO is attached to this VM and no "
+                "fallback image has been cached"
+            )
 
         self._refresh_ports()
 

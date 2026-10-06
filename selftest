@@ -33,6 +33,7 @@ from vmhub import (  # noqa: E402
     qga,
     rdp,
     registry,
+    settings,
     spec,
 )
 from vmhub.errors import VmhubError  # noqa: E402
@@ -162,10 +163,19 @@ def _make_fixture_iso(path: Path) -> Path:
 
 
 def main() -> int:
+    # Point the app-wide defaults at a scratch file for the whole run. The real
+    # ~/.config/vmhub/settings.toml belongs to the user: a test must neither
+    # read it (its rdp_username would change what "no account is configured"
+    # means) nor write to it.
+    os.environ["VMHUB_CONFIG"] = str(Path(tempfile.mkdtemp(prefix="vmhub-cfg-")) / "settings.toml")
     # Every VM that exists before this run is somebody's VM, not ours. Record
     # them now and prove at the end that all of them survived: a test suite
     # that quietly removes the user's machines is worse than one that fails.
-    preexisting = set(registry.all_names())
+    # Only this run's own prefix is excluded -- a leftover from an earlier
+    # aborted run is this suite's mess to clean, not the user's VM.
+    preexisting = {
+        name for name in registry.all_names() if not name.startswith(VM)
+    }
     leftovers = [m for m in registry.iter_metas() if m.name.startswith(VM)]
     leftovers.sort(key=lambda m: (m.is_template, m.template_source is not None, m.name))
     for meta in leftovers:
@@ -464,6 +474,83 @@ def main() -> int:
     spec_rdp.network.set_role("rdp", 3389, 0)
     registry.save_spec(spec_rdp)
     check("no rdp port means unavailable", not rdp.target(VM).available)
+
+    section("app-wide defaults")
+    check("an absent settings file reads as all-empty",
+          settings.load() == {key: "" for key in settings.FIELDS}, settings.load())
+    settings.set_value("rdp_username", "gero")
+    settings.set_value("share_path", "/home/admin/Shared")
+    reread = settings.load()
+    check("a saved account default is read back",
+          reread["rdp_username"] == "gero", reread)
+    check("a saved folder default is read back",
+          reread["share_path"] == "/home/admin/Shared", reread)
+    check("the file explains itself",
+          all(d in settings.config_path().read_text() for d in settings.FIELDS.values()),
+          settings.config_path().read_text())
+
+    defaults_vm = f"{VM}-defaults"
+    lifecycle.create(defaults_vm, blueprint="alpine")
+    dspec = registry.load_spec(defaults_vm)
+    dspec.media.rdp_user = ""
+    dspec.network.guest_ports = [3389]
+    dspec.network.set_role("rdp", 3389, 13390)
+    registry.save_spec(dspec)
+    check("a VM with no account falls back to the app-wide default",
+          rdp.rdp_user(defaults_vm) == "gero", rdp.rdp_user(defaults_vm))
+    dspec.media.rdp_user = "neo"
+    registry.save_spec(dspec)
+    check("a VM's own account beats the default",
+          rdp.rdp_user(defaults_vm) == "neo", rdp.rdp_user(defaults_vm))
+    dspec.media.rdp_user = ""
+    registry.save_spec(dspec)
+
+    shared_profile = rdp.write_profile(defaults_vm)
+    shared_text = shared_profile.read_text()
+    check("the shared folder reaches the remmina profile",
+          "sharepath=/home/admin/Shared" in shared_text and "share=1" in shared_text,
+          [line for line in shared_text.splitlines() if "share" in line])
+    check("the default account reaches the profile",
+          "username=gero" in shared_text,
+          [line for line in shared_text.splitlines() if line.startswith("username")])
+    check("rdp.share_path reports the inherited default",
+          rdp.share_path(defaults_vm) == "/home/admin/Shared",
+          rdp.share_path(defaults_vm))
+    dspec.media.share_path = "/home/admin/Other"
+    registry.save_spec(dspec)
+    check("a VM's own folder overrides the default",
+          rdp.share_path(defaults_vm) == "/home/admin/Other",
+          rdp.share_path(defaults_vm))
+    own_text = rdp.write_profile(defaults_vm).read_text()
+    check("and the override is what lands in the profile",
+          "sharepath=/home/admin/Other" in own_text
+          and "sharepath=/home/admin/Shared" not in own_text,
+          [line for line in own_text.splitlines() if "sharepath" in line])
+    check("media.share_path survives a spec round-trip",
+          registry.load_spec(defaults_vm).media.share_path == "/home/admin/Other",
+          registry.load_spec(defaults_vm).media.share_path)
+    dspec.media.share_path = ""
+    registry.save_spec(dspec)
+    settings.set_value("share_path", "")
+    unshared_text = rdp.write_profile(defaults_vm).read_text()
+    check("an empty folder default maps nothing",
+          "sharepath=" not in unshared_text,
+          [line for line in unshared_text.splitlines() if "share" in line])
+    rdp.remove_profile(defaults_vm)
+    lifecycle.remove(defaults_vm)
+
+    try:
+        settings.get("port_web")
+        check("an unknown setting key is refused", False, "settings.get accepted it")
+    except KeyError as exc:
+        check("an unknown setting key is refused", "port_web" in str(exc), str(exc))
+    check("no default ports exist, because a host port can only be one VM's",
+          not any(k.startswith("port_") for k in settings.FIELDS), list(settings.FIELDS))
+
+    settings.config_path().write_text("this is not toml ][ at all")
+    check("an unreadable settings file degrades to empty",
+          settings.load() == {key: "" for key in settings.FIELDS}, settings.load())
+    settings.config_path().unlink()
 
     section("clone modes")
     for name in registry.dependents_of(VM):
@@ -873,6 +960,47 @@ def main() -> int:
           attach[:120].replace("\n", " "))
     check("Delete is a button on the pane header, not only in a menu",
           "delete_button" in (ui_dir / "pane.py").read_text())
+
+    # Publishing an RDP port used to set media.rdp_user to the literal string
+    # "user". That made the field non-empty, so the Remmina prompt -- the one
+    # thing that could ask for the real account -- could never appear, and the
+    # session failed NLA with no way to fix it from the GUI.
+    pane_src = (ui_dir / "pane.py").read_text()
+    check("publishing an RDP port does not invent an account",
+          'media.rdp_user = "user"' not in pane_src,
+          "the add-role path must not write a placeholder account")
+
+    # The Finish install button used to exist only inside a notice, so it
+    # vanished on any VM with nothing to detach, with nothing to say so.
+    check("the Finish install button is built, not only noticed",
+          "self.finish_install_button = Gtk.Button" in pane_src,
+          "pane.py must build finish_install_button unconditionally")
+    check("its sensitivity follows finish_install_needed",
+          "finish_install_needed" in pane_src,
+          "the button must be driven by status.finish_install_needed")
+
+    # "Test connection" is gone. It spoke RDP to the port and reported into the
+    # status bar, which the 4-second poll overwrote, so it said nothing in
+    # practice. The RDP options it sat next to are what a session actually
+    # needs, and those are editable fields now. Matched on the attribute, not
+    # the word "Test connection": this comment mentions that phrase.
+    check("the RDP probe button is gone from the console tab",
+          "rdp_test_button" not in pane_src,
+          "the probe button attribute must no longer exist")
+    check("nothing in the GUI still calls rdp.probe",
+          "rdp.probe(" not in pane_src,
+          "the probe button and the per-port Test button both called it")
+    check("the RDP account is an editable field",
+          "self.rdp_user_entry = Gtk.Entry()" in pane_src,
+          "the account needs a text box, not a one-shot prompt")
+    check("the shared folder is an editable field with a chooser",
+          "self.share_entry = Gtk.Entry()" in pane_src
+          and "Gtk.FileDialog" in pane_src,
+          "a path selector needs an entry and a Browse button")
+    check("the Remmina button stays and explains itself",
+          "self.remmina_button.set_sensitive(" in pane_src
+          and "self.remmina_button.set_visible(" not in pane_src,
+          "it must not vanish when it cannot be used, only say why")
 
     # A menu entry "row.delete" means "the action `delete` in the group named
     # `row`". The actions used to be added to the window instead, and a

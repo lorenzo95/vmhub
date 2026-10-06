@@ -135,6 +135,28 @@ def section(title: str) -> Gtk.Label:
     return label
 
 
+def field(label: str, widget: Gtk.Widget, hint: str = "") -> Gtk.Widget:
+    """A labelled editable control, laid out as a narrow column of rows.
+
+    key_value_grid is for facts that cannot be edited; this is for the ones
+    that can, which is why it takes the control itself rather than a string.
+    """
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    box.set_margin_top(4)
+    caption = Gtk.Label(label=label)
+    caption.add_css_class("hint")
+    caption.set_xalign(0.0)
+    box.append(caption)
+    box.append(widget)
+    if hint:
+        note = Gtk.Label(label=hint)
+        note.add_css_class("hint")
+        note.set_wrap(True)
+        note.set_xalign(0.0)
+        box.append(note)
+    return box
+
+
 def copy_row(text: str, label: str = "Copy", *, tooltip: str = "") -> Gtk.Widget:
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     entry = Gtk.Label(label=text)

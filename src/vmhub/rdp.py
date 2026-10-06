@@ -8,7 +8,7 @@ import subprocess
 from dataclasses import dataclass
 from urllib.parse import quote
 
-from . import registry
+from . import registry, settings
 from .errors import VmhubError
 
 REMMINA = "remmina"
@@ -73,10 +73,17 @@ class RdpTarget:
 
 
 def rdp_user(vm: str) -> str:
-    """The configured account, or "" when the guest's account name is unknown.
+    """The account to sign in with: this VM, then its blueprint, then the
+    app-wide default.
 
-    There is no unattended install, so vmhub cannot know the account; guessing
-    one produces a URI that looks authoritative but cannot work.
+    The order is deliberate. A VM that names its own account must not be
+    overruled by a global one, and there is no invented fallback below the
+    last step: a blank stays blank so the client prompts, rather than
+    producing a URI that looks authoritative and cannot authenticate.
+
+    This function used to invent "user" when a VM had none, which meant the
+    client never asked for a real account and NLA failed with no way to fix
+    it from the GUI.
     """
     vm_spec = registry.load_spec(vm)
     if vm_spec.media.rdp_user:
@@ -84,9 +91,26 @@ def rdp_user(vm: str) -> str:
     try:
         from . import blueprints
 
-        return blueprints.load(vm_spec.blueprint).rdp_user or ""
+        from_blueprint = blueprints.load(vm_spec.blueprint).rdp_user or ""
     except VmhubError:
-        return ""
+        from_blueprint = ""
+    if from_blueprint:
+        return from_blueprint
+    return settings.get("rdp_username")
+
+
+def share_path(vm: str) -> str:
+    """The host folder to map into this VM's RDP session.
+
+    This VM's own setting wins over the app-wide default, so one machine can
+    map something different from every other one without changing the default
+    for the rest. Empty at both levels means nothing is mapped.
+    """
+    try:
+        own = registry.load_spec(vm).media.share_path
+    except VmhubError:
+        own = ""
+    return own or settings.get("share_path")
 
 
 def target(vm: str) -> RdpTarget:
@@ -198,6 +222,15 @@ def write_profile(vm: str) -> Path:  # noqa: D401
         f"group={PROFILE_GROUP}",
     ]
     lines += [f"{key}={value}" for key, value in PROFILE_FIELDS.items()]
+
+    # Drive mapping. Remmina only offers the folder when both keys are set:
+    # sharepath names it, share turns sharing on. This VM's own setting wins
+    # over the app-wide default; with neither, the session maps nothing.
+    share = share_path(vm)
+    if share:
+        lines.append(f"sharepath={share}")
+        lines.append("share=1")
+
     path.write_text("\n".join(lines) + "\n")
     path.chmod(0o600)
     return path

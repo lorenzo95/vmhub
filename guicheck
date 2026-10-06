@@ -380,19 +380,47 @@ def _probe(app) -> None:
         exercised.append("Clone, template and Export live on Hardware")
         print("  \033[32mPASS\033[0m  Clone, template and Export live on Hardware")
 
-    # A notice is a row of its own, and its action sits on that row rather
-    # than in a paragraph somewhere above it.
+    # A notice is a row of its own, and it is text only. The action it describes
+    # used to hang off the notice itself, which meant the button existed only
+    # while that particular notice did -- so on a VM with nothing to finish,
+    # the Finish install button simply was not there, with nothing to say so.
+    # It is a permanent control in the Install media section now, which says
+    # why it is unavailable.
     plain = pane._notice_row(lifecycle.Notice("just so you know"))
     actioned = pane._notice_row(lifecycle.Notice("fixable", action="finish-install"))
+    finish_button = getattr(pane, "finish_install_button", None)
     if plain.get_first_child().get_next_sibling() is not None:
-        failures.append(("notice row", "a notice with no action grew a button"))
-        print("  \033[31mFAIL\033[0m  a notice with no action grew a button")
-    elif actioned.get_first_child().get_next_sibling() is None:
-        failures.append(("notice row", "the actionable notice has no button"))
-        print("  \033[31mFAIL\033[0m  the actionable notice has no button")
+        failures.append(("notice row", "a notice grew a button"))
+        print("  \033[31mFAIL\033[0m  a notice grew a button")
+    elif actioned.get_first_child().get_next_sibling() is not None:
+        failures.append(("notice row", "an actionable notice grew a button again"))
+        print("  \033[31mFAIL\033[0m  an actionable notice grew a button again")
+    elif finish_button is None:
+        failures.append(("finish install button", "the pane has no such button"))
+        print("  \033[31mFAIL\033[0m  the pane has no Finish install button")
     else:
-        exercised.append("a notice carries its own action")
-        print("  \033[32mPASS\033[0m  a notice carries its own action")
+        # The invariant is not "always enabled" -- a VM with nothing to detach
+        # must not offer the action. It is that the button agrees with the
+        # status it is describing, in both directions.
+        wanted = bool(getattr(pane.status, "finish_install_needed", False))
+        if finish_button.get_sensitive() != wanted:
+            failures.append((
+                "finish install button",
+                f"sensitive={finish_button.get_sensitive()} but "
+                f"finish_install_needed={wanted}",
+            ))
+            print(
+                "  \033[31mFAIL\033[0m  Finish install is "
+                f"{'enabled' if finish_button.get_sensitive() else 'disabled'} "
+                f"but finish_install_needed={wanted}"
+            )
+        else:
+            exercised.append("Finish install agrees with the VM's actual state")
+            print(
+                "  \033[32mPASS\033[0m  Finish install is a permanent control "
+                f"that is {'enabled' if wanted else 'disabled'} exactly when "
+                "there is something to finish"
+            )
 
     if not pane.ports_box.get_first_child() and not pane.roles_box.get_first_child():
         failures.append(("ports table empty", "the Info tab drew no port rows"))

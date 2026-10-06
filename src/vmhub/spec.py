@@ -205,6 +205,10 @@ class Media:
     drivers: str = ""
     rdp_user: str = ""
     rdp_password: str = ""
+    # A folder mapped into this VM's RDP session, overriding the app-wide
+    # default in settings.toml. Empty means "use the default", not "map
+    # nothing" -- mapping nothing is what an empty default means.
+    share_path: str = ""
 
     def media_path(self, slot: str) -> str:
         if slot == "install":
@@ -428,7 +432,7 @@ def spec_from_dict(data: dict, *, name: str | None = None) -> VmSpec:
         **{
             k: v
             for k, v in (data.get("media") or {}).items()
-            if k in {"install", "drivers", "rdp_user", "rdp_password"}
+            if k in {"install", "drivers", "rdp_user", "rdp_password", "share_path"}
         }
     )
     shutdown = Shutdown(
