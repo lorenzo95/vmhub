@@ -147,6 +147,61 @@ def _wait_for_socket(path: str, timeout: float = 3.0) -> bool:
     return False
 
 
+def _concurrent_saves_stay_readable(rounds: int = 120) -> tuple[bool, str]:
+    """Two saves of one VM at once must neither fail nor corrupt the spec.
+
+    The scratch file used to be named vm.toml.tmp.<pid>, unique per process
+    rather than per save. Two overlapping saves in one process therefore
+    shared one scratch path: they wrote over each other, and one save's
+    cleanup unlinked the file the other was about to rename. The spec on disk
+    could be a whole document followed by the tail of a different one -- a
+    file that parses as neither spec -- and a save could die with
+    FileNotFoundError. Both were seen in the field.
+    """
+    import threading
+
+    with tempfile.TemporaryDirectory() as scratch:
+        target = Path(scratch) / "vm.toml"
+        small = registry.load_spec(VM)
+        large = registry.load_spec(VM)
+        # Two documents far enough apart in size that their writes overlap.
+        small.network.ports = []
+        large.network.ports = [
+            spec.Port(guest=9000 + i, host=9100 + i, role="")
+            for i in range(400)
+        ]
+        spec.save(small, target)
+
+        failures: list[str] = []
+        lock = threading.Lock()
+
+        def writer(to_save) -> None:
+            try:
+                for _ in range(rounds):
+                    spec.save(to_save, target)
+            except Exception as exc:
+                with lock:
+                    failures.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [
+            threading.Thread(target=writer, args=(small,)),
+            threading.Thread(target=writer, args=(large,)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        try:
+            spec.load(target, name=VM)
+        except Exception as exc:
+            failures.append(f"final load failed: {type(exc).__name__}: {exc}")
+        leftovers = list(Path(scratch).glob("*.tmp.*"))
+        if leftovers:
+            failures.append(f"scratch files left behind: {leftovers}")
+        return not failures, "; ".join(failures[:3])
+
+
 def _profile_roundtrip(vm: str) -> bool:
     """Write a Remmina profile for a VM, then confirm removal clears it."""
     from vmhub import rdp
@@ -687,6 +742,11 @@ def main() -> int:
           str(list(paths.vm_dir(atomic_vm).iterdir())))
     check("the VM still loads after an interrupted save",
           registry.load_spec(atomic_vm).name == atomic_vm)
+
+    concurrent_ok, concurrent_why = _concurrent_saves_stay_readable()
+    check("two saves at once never corrupt or fail the spec",
+          concurrent_ok, concurrent_why)
+
     lifecycle.remove(atomic_vm)
 
     section("clone modes")

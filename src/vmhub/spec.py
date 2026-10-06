@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 import uuid as uuidlib
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -484,7 +485,21 @@ def save(spec: VmSpec, path: Path, *, header: str = "") -> None:
     # old spec nor the new one makes the VM unreadable rather than merely
     # stale. os.replace is atomic within a filesystem, so a reader sees the
     # old file or the new one and never a splice of both.
-    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    #
+    # The scratch name has to be unique per call, not per process. A refresh
+    # runs off the main loop, so two saves of one VM can overlap inside a single
+    # pid. A name carrying only the pid handed them the same scratch file: they
+    # wrote over each other, and one save's cleanup unlinked the file another was
+    # about to rename. The spec on disk could then be a whole document followed
+    # by the tail of a different one -- which parses as neither -- and a save
+    # could fail outright with FileNotFoundError.
+    # mkstemp mints a name nothing else can predict, including another
+    # save in this same process a microsecond later.
+    handle, scratch = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".tmp."
+    )
+    os.close(handle)
+    tmp = Path(scratch)
     try:
         tmp.write_text(body)
         os.replace(tmp, path)
