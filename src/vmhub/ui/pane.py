@@ -48,7 +48,8 @@ class VmPane(Gtk.Box):
         self.append(self.notebook)
         self._build_console_tab()
         self._build_hardware_tab()
-        self._build_info_tab()
+        self._build_ports_tab()
+        self._build_details_tab()
         self._build_snapshots_tab()
         self._build_logs_tab()
 
@@ -952,40 +953,15 @@ class VmPane(Gtk.Box):
         apply_hint.set_xalign(0.0)
         box.append(apply_hint)
 
-        box.append(widgets.section("Copies of this VM"))
-        self.template_hint = Gtk.Label()
-        self.template_hint.set_wrap(True)
-        self.template_hint.set_xalign(0.0)
-        self.template_hint.add_css_class("hint")
-        box.append(self.template_hint)
-        share_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.clone_button = Gtk.Button(label="Clone…")
-        self.clone_button.set_tooltip_text("Clone this VM (uses its disk as the source)")
-        self.clone_button.connect("clicked", self._on_clone)
-        self.template_button = Gtk.Button(label="Mark as template")
-        self.template_button.connect("clicked", self._on_toggle_template)
-        export_button = Gtk.Button(label="Export bundle…")
-        export_button.set_tooltip_text(
-            "Write a self-contained bundle -- standalone disk, manifest, checksums "
-            "-- that another machine can import"
-        )
-        export_button.connect("clicked", self._on_export)
-        share_row.append(self.clone_button)
-        share_row.append(self.template_button)
-        share_row.append(export_button)
-        share_row.set_halign(Gtk.Align.START)
-        box.append(share_row)
-
         self._add_tab("Hardware", widgets.scroll(box))
 
-    def _build_info_tab(self) -> None:
+    def _build_ports_tab(self) -> None:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_margin_top(14)
         box.set_margin_bottom(14)
         box.set_margin_start(14)
         box.set_margin_end(14)
 
-        box.append(widgets.section("Ports"))
         ports_hint = Gtk.Label(
             label="Each forward sends a port on this machine to a port inside the VM. "
             "Web console, SSH and RDP are set up for you; anything else you add is "
@@ -1008,10 +984,23 @@ class VmPane(Gtk.Box):
         add_button.connect("clicked", self._on_add_port)
         box.append(add_button)
 
-        box.append(widgets.section("Details"))
+        self._add_tab("Ports", widgets.scroll(box))
+
+    def _build_details_tab(self) -> None:
+        # Ports used to share one tab with this, called "Info". Port forwarding is
+        # the only part of it you edit, and it is long enough -- a row per role, a
+        # row per custom forward, a hint and a button -- that sharing a tab with
+        # six read-only fields meant scrolling past all of them to change one
+        # number. The name was the tell: "Info" describes neither half.
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(14)
+        box.set_margin_bottom(14)
+        box.set_margin_start(14)
+        box.set_margin_end(14)
+
         self.details_grid = widgets.key_value_grid([])
         box.append(self.details_grid)
-        self._add_tab("Info", widgets.scroll(box))
+        self._add_tab("Details", widgets.scroll(box))
 
     def _build_snapshots_tab(self) -> None:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -1036,7 +1025,44 @@ class VmPane(Gtk.Box):
         self.snapshot_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.snapshot_list.add_css_class("vmlist")
         box.append(widgets.scroll(self.snapshot_list))
-        self._add_tab("Snapshots", box)
+
+        # The whole "Copies of this VM" block moved here from Hardware, not just
+        # the Clone button. Moving only the button left a heading on Hardware that
+        # existed purely to justify the leftovers, and put the template switch on
+        # the other tab from the thing it exists for: marking a template is
+        # precisely what makes a clone cheap.
+        box.append(widgets.section("Copies of this VM"))
+        self.template_hint = Gtk.Label()
+        self.template_hint.set_wrap(True)
+        self.template_hint.set_xalign(0.0)
+        self.template_hint.add_css_class("hint")
+        box.append(self.template_hint)
+
+        copies_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.clone_button = Gtk.Button(label="Clone…")
+        self.clone_button.set_tooltip_text("Clone this VM (uses its disk as the source)")
+        self.clone_button.connect("clicked", self._on_clone)
+        self.template_button = Gtk.Button(label="Mark as template")
+        self.template_button.connect("clicked", self._on_toggle_template)
+        export_button = Gtk.Button(label="Export bundle…")
+        export_button.set_tooltip_text(
+            "Write a self-contained bundle -- standalone disk, manifest, checksums "
+            "-- that another machine can import"
+        )
+        export_button.connect("clicked", self._on_export)
+        copies_row.append(self.clone_button)
+        copies_row.append(self.template_button)
+        copies_row.append(export_button)
+        copies_row.set_halign(Gtk.Align.START)
+        box.append(copies_row)
+
+        self.clone_hint = Gtk.Label()
+        self.clone_hint.add_css_class("hint")
+        self.clone_hint.set_wrap(True)
+        self.clone_hint.set_xalign(0.0)
+        box.append(self.clone_hint)
+
+        self._add_tab("Snapshots", widgets.scroll(box))
 
     def _build_logs_tab(self) -> None:
         self.log_view = Gtk.TextView()
@@ -1349,6 +1375,23 @@ class VmPane(Gtk.Box):
         else:
             self.snapshot_info.set_text(
                 "No snapshots. Snapshots are copy-on-write, so they are cheap and instant."
+            )
+
+        if status.is_template:
+            self.clone_hint.set_text(
+                "Cloning a template is instant: the clone shares this disk until one "
+                "of them is deleted, and neither can run while the other holds it."
+            )
+        elif status.template_source:
+            self.clone_hint.set_text(
+                f"A linked clone of {status.template_source} shares its disk, which is why "
+                "it can be made instantly and why neither can run while the other does."
+            )
+        else:
+            self.clone_hint.set_text(
+                "Cloning copies this disk. A plain copy is standalone and costs real "
+                "space; marking this VM a template first lets the clone share its disk "
+                "instead, which is instant and nearly free."
             )
 
         if status.is_template:

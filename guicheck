@@ -349,19 +349,28 @@ def _probe(app) -> None:
             yield from _walk(child)
             child = child.get_next_sibling()
 
-    # The ports table and the details grid moved off Hardware and Console
-    # onto an Info tab of their own.
+    # The ports table and the details grid moved off Hardware and Console onto
+    # tabs of their own. They used to share one tab called "Info", which named
+    # neither half and made port forwarding mean scrolling past six read-only
+    # fields; they are now "Ports" and "Details".
     pane = window.panes[VM]
     titles = [
         pane.notebook.get_tab_label(pane.notebook.get_nth_page(i)).get_text()
         for i in range(pane.notebook.get_n_pages())
     ]
-    if "Info" not in titles:
-        failures.append(("Info tab missing", str(titles)))
-        print(f"  \033[31mFAIL\033[0m  no Info tab; tabs are {titles}")
+    missing = [t for t in ("Ports", "Details") if t not in titles]
+    if missing:
+        failures.append((f"{missing} tab missing", str(titles)))
+        print(f"  \033[31mFAIL\033[0m  no {missing} tab; tabs are {titles}")
     else:
-        exercised.append("the Info tab exists")
-        print("  \033[32mPASS\033[0m  the Info tab exists")
+        exercised.append("the Ports and Details tabs exist")
+        print("  \033[32mPASS\033[0m  the Ports and Details tabs exist")
+    if "Info" in titles:
+        failures.append(("Info tab still there", str(titles)))
+        print("  \033[31mFAIL\033[0m  the combined Info tab is still present")
+    else:
+        exercised.append("the combined Info tab is gone")
+        print("  \033[32mPASS\033[0m  the combined Info tab is gone")
     # The Actions tab is gone; what it held now lives where it is used.
     if "Actions" in titles:
         failures.append(("Actions tab still there", str(titles)))
@@ -378,16 +387,15 @@ def _probe(app) -> None:
         if "Hardware" in titles
         else set()
     )
-    missing = {"Clone\u2026", "Mark as template", "Export bundle\u2026"} - hardware
-    if missing:
-        failures.append((
-            "Hardware lost a button",
-            f"missing {sorted(missing)}, found {sorted(hardware)}",
-        ))
-        print(f"  \033[31mFAIL\033[0m  Hardware is missing {sorted(missing)}")
+    leaked = {"Clone\u2026", "Mark as template", "Export bundle\u2026"} & hardware
+    if leaked:
+        # Any of these on Hardware means the copies block was left behind.
+        found = sorted(str(label) for label in leaked)
+        failures.append(("Hardware kept a copy control", str(found)))
+        print(f"  \033[31mFAIL\033[0m  Hardware still has {found}")
     else:
-        exercised.append("Clone, template and Export live on Hardware")
-        print("  \033[32mPASS\033[0m  Clone, template and Export live on Hardware")
+        exercised.append("Hardware no longer carries the copies block")
+        print("  \033[32mPASS\033[0m  Hardware no longer carries the copies block")
 
     # A notice is a row of its own, and it is text only. The action it describes
     # used to hang off the notice itself, which meant the button existed only
@@ -639,6 +647,71 @@ def _probe(app) -> None:
         )
     finally:
         del_pane.close()
+
+    # ---- Ports and Details are separate tabs; Clone lives with Snapshots ----
+    # Measured by walking the real widget tree, because tab names alone would
+    # pass even if everything still lived on one page.
+    def descends(widget, ancestor) -> bool:
+        node = widget
+        while node is not None:
+            if node is ancestor:
+                return True
+            node = node.get_parent()
+        return False
+
+    pane = window.panes[VM]
+    settle()
+    # get_tab_label_text() looks like it should take a page index, but PyGObject
+    # binds it to a signature that wants a Gtk.Widget and raises "Expected
+    # Gtk.Widget, but got int". Ask each page for its label widget instead, which
+    # is the form the tab check above already uses.
+    titles = [
+        pane.notebook.get_tab_label(pane.notebook.get_nth_page(i)).get_text()
+        for i in range(pane.notebook.get_n_pages())
+    ]
+    pages = {
+        title: pane.notebook.get_nth_page(i) for i, title in enumerate(titles)
+    }
+
+    problems = []
+    if "Ports" not in pages:
+        problems.append(f"no Ports tab: {titles}")
+    if "Details" not in pages:
+        problems.append(f"no Details tab: {titles}")
+    if "Info" in pages:
+        problems.append(f"the old combined Info tab is still there: {titles}")
+    if problems:
+        raise AssertionError("; ".join(problems))
+
+    if descends(pane.details_grid, pages["Ports"]):
+        problems.append("Details still shares the Ports tab")
+    if not descends(pane.details_grid, pages["Details"]):
+        problems.append("the Details grid is not on the Details tab")
+    if not descends(pane.ports_box, pages["Ports"]):
+        problems.append("the port list is not on the Ports tab")
+    if not descends(pane.clone_button, pages["Snapshots"]):
+        problems.append("Clone is not on the Snapshots tab")
+    if descends(pane.clone_button, pages["Hardware"]):
+        problems.append("Clone is still on the Hardware tab")
+    # The whole copies block travels together. Marking a template is what makes
+    # a clone cheap, so splitting the switch from the thing it exists for is the
+    # regression this guards against.
+    for label, widget in (
+        ("Mark as template", pane.template_button),
+        ("the template explanation", pane.template_hint),
+    ):
+        if not descends(widget, pages["Snapshots"]):
+            problems.append(f"{label} is not on the Snapshots tab")
+        if descends(widget, pages["Hardware"]):
+            problems.append(f"{label} is still on the Hardware tab")
+    if problems:
+        raise AssertionError("; ".join(problems))
+
+    exercised.append("Ports and Details are separate tabs, the copies block moved whole")
+    print(
+        "  \033[32mPASS\033[0m  Ports and Details are separate tabs, "
+        "the copies block moved whole"
+    )
 
     # ---- switching away must not stop the log for good ----
     other = next((n for n in window.order if n != VM), None)
