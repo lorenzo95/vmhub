@@ -217,7 +217,15 @@ class VmhubWindow(Gtk.ApplicationWindow):
             ("prefs", self._on_prefs),
         ):
             action = Gio.SimpleAction.new(action_name, None)
-            action.connect("activate", lambda _a, fn=handler: fn())
+            # "activate" passes (action, parameter). A one-positional lambda
+            # binds fn to that parameter instead of falling back to the
+            # handler default -- and the parameter is None for a
+            # parameterless action -- so fn() raised
+            # "TypeError: 'NoneType' object is not callable" and every item in
+            # this group, Preferences included, did nothing when clicked.
+            # The two sibling registrations below take two positionals for
+            # the same reason.
+            action.connect("activate", lambda _a, _p, fn=handler: fn())
             group.add_action(action)
         self.win_actions = group
         self.insert_action_group("win", group)

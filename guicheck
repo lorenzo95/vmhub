@@ -279,6 +279,54 @@ def _probe(app) -> None:
         exercised.append("panes are pruned when a VM disappears")
         print("  \033[32mPASS\033[0m  pane pruned when the VM disappeared")
 
+    # ---- a registered action must actually CALL its handler ----
+    # Every win.* item was registered and resolvable and raised
+    # "TypeError: 'NoneType' object is not callable" on click, because the
+    # lambda was written for a one-argument signal and "activate" passes two.
+    # Checking that an action is registered proves nothing about this, which
+    # is why the existing "actions are registered" checks all passed while
+    # Preferences, Doctor, Restore and the overflow refresh were dead.
+    import gi as _gi
+    from gi.repository import GLib as _GLib
+    fired = []
+    originals = {}
+    # Record the ACTION name, not the attribute name: the guard below compares
+    # against win.<name>, and logging "_on_prefs" against "prefs" read three
+    # working handlers as missing.
+    for _attr, _action_name in (
+        ("refresh", "refresh"),
+        ("_on_doctor", "doctor"),
+        ("_on_restore", "restore"),
+        ("_on_prefs", "prefs"),
+    ):
+        originals[_attr] = getattr(window, _attr)
+        setattr(window, _attr, (lambda a: (lambda *_x: fired.append(a)))(_action_name))
+    poll_tag = getattr(window, "_refresh_tag", 0)
+    if poll_tag:
+        _GLib.source_remove(poll_tag)   # the 4s poll would fake a "refresh"
+        window._refresh_tag = 0
+    try:
+        window._install_win_actions()
+        settle()
+        for _name in ("refresh", "doctor", "restore", "prefs"):
+            window.win_actions.lookup_action(_name).activate(None)
+            settle()
+        never_fired = [n for n in ("refresh", "doctor", "restore", "prefs")
+                       if n not in fired]
+    finally:
+        for _attr, _fn in originals.items():
+            setattr(window, _attr, _fn)
+        window._install_win_actions()
+    if never_fired:
+        failures.append((
+            "a win.* action did not call its handler",
+            f"never fired: {never_fired}; fired: {fired}",
+        ))
+        print(f"  \033[31mFAIL\033[0m  win.* handlers never ran: {never_fired}")
+    else:
+        exercised.append("every win.* action calls its handler")
+        print("  \033[32mPASS\033[0m  all four win.* actions called their handler")
+
     # ---- a dialog that can be opened must actually appear ----
     # Preferences was wired into the menu, not greyed out, and never
     # presented: get_visible() and get_mapped() were both False, so clicking
