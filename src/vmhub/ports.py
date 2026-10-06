@@ -21,7 +21,7 @@ def port_is_free(port: int, host: str = PROBE_HOST) -> bool:
     return True
 
 
-def used_by_vms(exclude: str | None = None) -> dict[str, int]:
+def used_by_vms(exclude: str | None = None) -> dict[str, str]:
     used: dict[str, int] = {}
     for meta in registry.iter_metas():
         if exclude and meta.name == exclude:

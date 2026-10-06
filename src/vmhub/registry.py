@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -78,9 +79,20 @@ def load_meta(name: str) -> VmMeta:
 def save_meta(meta: VmMeta) -> VmMeta:
     path = paths.meta_path(meta.name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(meta.to_dict(), indent=2, sort_keys=True) + "\n")
-    os.replace(tmp, path)
+    # Write beside the target and rename over it, so a reader sees the old
+    # meta.json or the new one and never a splice of both. The scratch name
+    # has to be unique per call: a refresh runs off the main loop, so two
+    # saves of one VM can overlap inside a single pid, and a fixed name hands
+    # them the same file.
+    handle, scratch = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".tmp.")
+    os.close(handle)
+    tmp = Path(scratch)
+    try:
+        tmp.write_text(json.dumps(meta.to_dict(), indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    finally:
+        # A failed rename leaves the scratch file behind; it is not the meta.
+        tmp.unlink(missing_ok=True)
     return meta
 
 
