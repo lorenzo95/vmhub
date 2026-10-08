@@ -263,7 +263,11 @@ def cmd_stop_all(args: argparse.Namespace, out: Out) -> int:
             if not args.quiet:
                 out.step(f"stopping {item.name}")
             try:
-                lifecycle.stop(item.name, mode=args.mode or ("force" if args.force else None))
+                lifecycle.stop(
+                    item.name,
+                    mode=args.mode or ("force" if args.force else None),
+                    preserve_run_state=args.preserve_run_state,
+                )
             except VmhubError as exc:
                 failed += 1
                 if not args.quiet:
@@ -272,10 +276,14 @@ def cmd_stop_all(args: argparse.Namespace, out: Out) -> int:
 
 
 def cmd_restore(args: argparse.Namespace, out: Out) -> int:
-    restored = lifecycle.restore_run_state(progress=out.step)
-    if not restored and not args.quiet:
+    # A restore that brought nothing back is not a success: the boot hook reads
+    # this exit status to decide whether to try again, and "nothing to restore"
+    # is indistinguishable from "every VM failed" unless we say so here.
+    failures: list[str] = []
+    restored = lifecycle.restore_run_state(progress=out.step, failures=failures)
+    if not restored and not failures and not args.quiet:
         out.step("nothing to restore")
-    return 0
+    return 1 if failures else 0
 
 
 def cmd_rm(args: argparse.Namespace, out: Out) -> int:
@@ -1137,6 +1145,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", choices=list(lifecycle.STOP_MODES))
     p.add_argument("--force", action="store_true", help="alias for --mode force")
     p.add_argument("--quiet", "-q", action="store_true")
+    p.add_argument(
+        "--preserve-run-state", action="store_true",
+        help="stop the VMs but leave meta.last_run_state as it was, so a "
+             "shutdown stop does not cancel `vmctl restore` on the next boot",
+    )
     p.set_defaults(func=cmd_stop_all)
 
     p = sub.add_parser("restore", help="restart VMs that were running at last shutdown")

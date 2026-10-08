@@ -342,7 +342,9 @@ def _startup_failure(vm: str) -> str:
 STOP_MODES = ("guest", "graceful", "power", "force")
 
 
-def _mark_stopped(vm: str) -> None:
+def _mark_stopped(vm: str, *, preserve_run_state: bool = False) -> None:
+    if preserve_run_state:
+        return
     if not registry.exists(vm):
         return
     meta = registry.load_meta(vm)
@@ -356,6 +358,7 @@ def stop(
     *,
     force: bool = False,
     mode: str | None = None,
+    preserve_run_state: bool = False,
     progress: Progress = _noop,
 ) -> str:
     """Stop a VM.
@@ -371,6 +374,14 @@ def stop(
               chance to flush its filesystems.
     force     SIGKILL the container. Nothing is flushed anywhere and no cleanup
               runs; the guest filesystem may be left inconsistent.
+
+    preserve_run_state
+              Stop the container but leave meta.last_run_state alone. Use this
+              when the stop is not the user's decision -- above all at shutdown.
+              Writing "stopped" there is what tells the boot hook there is
+              nothing to restore, so a shutdown that stops every VM also
+              cancels autostart for the next boot. A user who typed `vmctl stop`
+              does want that, and gets it by default.
     """
     progress = progress or _noop
     if mode is None:
@@ -378,7 +389,7 @@ def stop(
     if mode not in STOP_MODES:
         raise LifecycleError(f"unknown stop mode {mode!r} (expected one of {', '.join(STOP_MODES)})")
 
-    _mark_stopped(vm)
+    _mark_stopped(vm, preserve_run_state=preserve_run_state)
     if not podman.exists(vm):
         progress(f"{vm} has no container")
         return mode
@@ -510,7 +521,11 @@ def resize(vm: str, size: str, *, progress: Progress = _noop) -> None:
     )
 
 
-def restore_run_state(progress: Progress = _noop) -> list[str]:
+def restore_run_state(
+    progress: Progress = _noop,
+    *,
+    failures: list[str] | None = None,
+) -> list[str]:
     progress = progress or _noop
     restored: list[str] = []
     for meta in registry.iter_metas():
@@ -523,13 +538,19 @@ def restore_run_state(progress: Progress = _noop) -> list[str]:
             restored.append(meta.name)
         except Exception as exc:
             progress(f"could not restore {meta.name}: {exc}")
+            if failures is not None:
+                failures.append(meta.name)
     if restored:
         progress(f"Restored {len(restored)} previously running VM(s): {', '.join(restored)}")
     return restored
 
 
 def stop_all(
-    *, force: bool = False, mode: str | None = None, progress: Progress = _noop
+    *,
+    force: bool = False,
+    mode: str | None = None,
+    preserve_run_state: bool = False,
+    progress: Progress = _noop,
 ) -> list[str]:
     progress = progress or _noop
     stopped: list[str] = []
@@ -537,7 +558,13 @@ def stop_all(
         if not status.powered:
             continue
         try:
-            stop(status.name, force=force, mode=mode, progress=progress)
+            stop(
+                status.name,
+                force=force,
+                mode=mode,
+                preserve_run_state=preserve_run_state,
+                progress=progress,
+            )
             stopped.append(status.name)
         except VmhubError as exc:
             progress(f"could not stop {status.name}: {exc}")

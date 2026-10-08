@@ -81,7 +81,7 @@ RemainAfterExit=yes
 WorkingDirectory=@PROJECTDIR@
 Environment=VMHUB_HOME=@PROJECTDIR@
 ExecStart=@VMCTL@ restore
-ExecStop=@VMCTL@ stop-all --quiet
+ExecStop=@VMCTL@ stop-all --quiet --preserve-run-state
 
 [Install]
 WantedBy=default.target
@@ -113,11 +113,33 @@ PROJECT="@PROJECTDIR@"
 # to ~/vms. The hook therefore died with "not a vmhub project root:
 # /home/admin" on every boot. Both the cd and VMHUB_HOME below are there so
 # the working directory cannot matter.
+#
+# /run/user/$uid does not exist yet when this runs. /run is a tmpfs that init
+# populates, and the per-user directory under it is created by the first login
+# -- which has not happened at runlevel 5 on a machine nobody has sat down at.
+# Rootless podman cannot even read its own configuration without it, and says
+# so instead of saying why: "Failed to obtain podman configuration: lstat
+# /run/user: no such file or directory". restore_run_state() catches that per
+# VM, prints "could not restore winni: ..." next to "nothing to restore", and
+# the machine comes up with every VM down and no reason on the console.
+#
+# Creating it here is what pam_systemd/logind would do at login, and it is
+# idempotent: if the user is already logged in the directory is there and this
+# is a no-op.
+ensure_runtime_dir() {
+    [ -d "/run/user/$1" ] && return 0
+    mkdir -p "/run/user/$1" 2>/dev/null || return 1
+    chown "$OWNER" "/run/user/$1" 2>/dev/null || return 1
+    chmod 700 "/run/user/$1" 2>/dev/null || return 1
+    return 0
+}
+
 run_as_owner() {
     uid=$(id -u "$OWNER" 2>/dev/null) || {
         echo "vmhub: user '$OWNER' does not exist" >&2
         return 1
     }
+    ensure_runtime_dir "$uid" || echo "vmhub: could not create /run/user/$uid" >&2
     su - "$OWNER" -c "cd \"$PROJECT\" && VMHUB_HOME=\"$PROJECT\" XDG_RUNTIME_DIR=/run/user/$uid $*"
 }
 
@@ -125,14 +147,43 @@ run_as_owner() {
 # branch used to swallow its failure and exit 0, so a hook that did nothing at
 # all reported success -- which is what made this take a reboot and a report
 # to find.
+#
+# The stop branch keeps last_run_state, because stopping the VMs at shutdown is
+# what the host forces on us, not something you asked for -- and that flag is
+# the only thing the start branch above has to go on. Writing "stopped" to it
+# is exactly how this hook used to defeat itself: K01vmhub stopped every VM,
+# each stop recorded last_run_state=stopped, and the next boot then reported
+# "nothing to restore" and left everything down. The guests still get their
+# ACPI shutdown; only the bookkeeping survives it.
 case "$1" in
   start)
     echo "vmhub: restoring VMs as $OWNER"
-    run_as_owner "$VMCTL restore"
+    # This fires seconds into the boot, and seconds into the boot rootless
+    # podman is not reliably usable: there is no /run/user, udev has not
+    # applied its /dev/kvm ACL, and there is no network for pasta. The same
+    # command succeeds minutes later. So try, and when a VM does not come back,
+    # wait and try again rather than reporting a clean boot that left every VM
+    # down. `restore` exits non-zero if anything failed to restore, which is
+    # the only way this loop can tell "fine" from "not yet".
+    attempt=1
+    while [ "$attempt" -le 5 ]; do
+        if run_as_owner "$VMCTL restore"; then
+            break
+        fi
+        attempt=$((attempt + 1))
+        if [ "$attempt" -le 5 ]; then
+            echo "vmhub: restore attempt $((attempt - 1)) left VMs down; retrying in 10s" >&2
+            sleep 10
+        fi
+    done
+    if [ "$attempt" -gt 5 ]; then
+        echo "vmhub: gave up after 5 attempts; some VMs are still down" >&2
+        exit 1
+    fi
     ;;
   stop)
     echo "vmhub: stopping VMs"
-    run_as_owner "$VMCTL stop-all --quiet"
+    run_as_owner "$VMCTL stop-all --quiet --preserve-run-state"
     ;;
   restart|reload)
     "$0" stop

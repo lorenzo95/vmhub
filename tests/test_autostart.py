@@ -6,11 +6,28 @@ it, and its single fallback is hardcoded to ~/vms. The hook therefore failed
 on every boot -- and because each branch ended in `|| true` followed by
 `exit 0`, it failed *successfully*, which is why it took a reboot and a
 report to find.
+
+The second half of the file covers the other way this hook could fail to
+work: run perfectly, and have nothing to do. `restore_run_state` starts only
+the VMs whose meta says `last_run_state == "running"`, and a plain `stop`
+rewrites that to "stopped". The hook's own stop branch runs at shutdown, so
+it used to overwrite the record of what was running and then start, at the
+next boot, with an empty list -- reporting "nothing to restore" and leaving
+every VM down.
 """
 
 from __future__ import annotations
 
-from vmhub import autostart
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+from vmhub import autostart, registry
+
+# The package re-exports the public lifecycle API; _mark_stopped is private to
+# the inner module, and stop_all's globals resolve there too, so patching the
+# package attribute would not affect what stop_all actually calls.
+from vmhub.lifecycle import lifecycle as lc
 
 
 def _code_lines(text: str) -> list[str]:
@@ -71,3 +88,112 @@ def test_both_templates_name_a_real_project() -> None:
             assert "@OWNER@" not in text, text
     finally:
         os.environ.pop("VMHUB_HOME", None)
+
+
+def _running_vm(root: Path, name: str = "demo") -> str:
+    """A VM on disk whose meta says it was running when we last looked."""
+    vm_dir = root / name
+    vm_dir.mkdir(parents=True, exist_ok=True)
+    (vm_dir / "meta.json").write_text(
+        json.dumps({"uuid": "u", "mac": "m", "last_run_state": "running"})
+    )
+    return name
+
+
+def _run_state(name: str) -> str:
+    return registry.load_meta(name).last_run_state
+
+
+def test_a_shutdown_stop_leaves_the_boot_restore_signal_alone(project_home: Path) -> None:
+    """The whole point: stop the container, keep the record of it."""
+    vm = _running_vm(project_home)
+    lc._mark_stopped(vm, preserve_run_state=True)
+    assert _run_state(vm) == "running"
+
+
+def test_a_stop_the_user_asked_for_still_records_stopped(project_home: Path) -> None:
+    """The fix must not leak into ordinary use -- `vmctl stop` means stop."""
+    vm = _running_vm(project_home)
+    lc._mark_stopped(vm)
+    assert _run_state(vm) == "stopped"
+
+
+def test_stop_all_forwards_preserve_run_state(monkeypatch) -> None:
+    """stop_all is what the shutdown branch calls, so the flag has to reach stop()."""
+    seen: list[bool] = []
+    monkeypatch.setattr(
+        lc, "list_vms", lambda: [SimpleNamespace(name="demo", powered=True)]
+    )
+    monkeypatch.setattr(
+        lc, "stop", lambda vm, **kw: seen.append(kw.get("preserve_run_state", False)),
+    )
+
+    lc.stop_all(preserve_run_state=True)
+    assert seen == [True]
+
+    seen.clear()
+    lc.stop_all()
+    assert seen == [False]
+
+
+def test_both_templates_stop_without_cancelling_the_next_boot() -> None:
+    """A hook whose stop branch drops the flag silently disables itself."""
+    sysv = "\n".join(_code_lines(autostart.sysvinit_script_text()))
+    assert "stop-all --quiet --preserve-run-state" in sysv, sysv
+
+    unit = "\n".join(_code_lines(autostart.systemd_unit_text()))
+    assert "stop-all --quiet --preserve-run-state" in unit, unit
+
+
+def test_sysvinit_hook_creates_the_runtime_dir_podman_needs() -> None:
+    """At boot /run/user/<uid> does not exist, and rootless podman then fails
+    every single call with 'Failed to obtain podman configuration: lstat
+    /run/user: no such file or directory' -- which restore_run_state() reports
+    per VM and then calls 'nothing to restore'. The VM owner is not logged in
+    yet at runlevel 5, so nothing else will create it."""
+    code = "\n".join(_code_lines(autostart.sysvinit_script_text()))
+    assert "mkdir -p" in code, code
+    assert "chown" in code, code
+    assert "chmod 700" in code, code
+    # It has to happen before the su that runs podman, not after.
+    assert code.index("mkdir -p") < code.index("su - "), code
+
+
+def test_sysvinit_hook_retries_because_boot_is_not_ready_yet() -> None:
+    """Rootless podman is unusable seconds into a boot and fine minutes later.
+    Without a retry the hook reports a clean start and leaves every VM down,
+    which is exactly the failure it was installed to prevent."""
+    code = "\n".join(_code_lines(autostart.sysvinit_script_text()))
+    assert "restore" in code, code
+    # A bounded loop, and it has to give up rather than spin forever.
+    assert "while [ \"$attempt\" -le 5 ]" in code, code
+    assert "sleep 10" in code, code
+    assert "exit 1" in code, code
+
+
+def test_restore_reports_failure_so_the_hook_can_retry(monkeypatch) -> None:
+    """`restore` exiting 0 when every VM failed is what made a broken boot
+    indistinguishable from a working one."""
+    from types import SimpleNamespace
+
+    from vmhub import cli
+
+    seen: list[list[str]] = []
+
+    def fake_restore(progress=None, failures=None):
+        assert failures is not None, "cmd_restore must pass a failure sink"
+        seen.append(failures)
+        failures.append("winni")
+        return []
+
+    monkeypatch.setattr(cli.lifecycle, "restore_run_state", fake_restore)
+    out = SimpleNamespace(step=lambda *_a, **_k: None, say=lambda *_a, **_k: None)
+    args = SimpleNamespace(quiet=True)
+
+    assert cli.cmd_restore(args, out) == 1
+    assert seen == [["winni"]]
+
+    monkeypatch.setattr(
+        cli.lifecycle, "restore_run_state", lambda progress=None, failures=None: []
+    )
+    assert cli.cmd_restore(args, out) == 0
