@@ -521,6 +521,21 @@ def resize(vm: str, size: str, *, progress: Progress = _noop) -> None:
     )
 
 
+# Names the test harnesses create. These land in the same registry as anything
+# else and carry last_run_state like any other VM, so an interrupted or crashed
+# test run leaves them looking like VMs somebody left running. Restoring one at
+# boot is wrong twice over: it wastes the boot hook's retry budget on something
+# the user never asked for, and a harness VM with a stale host port fails every
+# time, which makes the hook report "gave up after 5 attempts" and look broken
+# even though the user's own VMs came back fine. Same tuple the harnesses
+# themselves use to decide what is theirs to clean up.
+HARNESS_PREFIXES = ("vmhub-guicheck", "vmhub-selftest", "sweepvm")
+
+
+def is_harness(name: str) -> bool:
+    return name.startswith(HARNESS_PREFIXES)
+
+
 def restore_run_state(
     progress: Progress = _noop,
     *,
@@ -530,6 +545,8 @@ def restore_run_state(
     restored: list[str] = []
     for meta in registry.iter_metas():
         if meta.last_run_state != "running":
+            continue
+        if is_harness(meta.name):
             continue
         if podman.is_running(meta.name):
             continue

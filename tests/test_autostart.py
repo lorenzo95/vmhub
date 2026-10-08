@@ -171,6 +171,50 @@ def test_sysvinit_hook_retries_because_boot_is_not_ready_yet() -> None:
     assert "exit 1" in code, code
 
 
+def test_sysvinit_hook_writes_to_syslog_not_just_the_console() -> None:
+    """boot.log stops being written ~5s into this host's boot and rsyslogd
+    starts ~7s in, so a hook running at +5s that only prints leaves no trace
+    anywhere. That is what made this take two rounds of guessing."""
+    code = "\n".join(_code_lines(autostart.sysvinit_script_text()))
+    assert "logger -t vmhub" in code, code
+    # and it must log what the command actually said, not just that it ran
+    assert 'logger -t vmhub -- "$out"' in code, code
+
+
+def test_sysvinit_hook_waits_for_kvm_before_restoring() -> None:
+    """udev creates /dev/kvm at boot and applies the owner's ACL seconds later.
+    QEMU without KVM starts, prints 'KVM acceleration is not available', and
+    the container is dead 0.1s later -- which reads as 'the VM did not come
+    back'. The hook runs at boot+5s and loses that race every time."""
+    code = "\n".join(_code_lines(autostart.sysvinit_script_text()))
+    assert "wait_for_kvm" in code, code
+    assert "test -r /dev/kvm -a -w /dev/kvm" in code, code
+    # ...and must not sit waiting on a host that has no KVM at all.
+    assert "[ -e /dev/kvm ] || return 0" in code, code
+    # it has to happen before the restore loop
+    assert code.index("wait_for_kvm || log") < code.index("attempt=1"), code
+
+
+def test_restore_never_starts_the_test_harness(monkeypatch) -> None:
+    """An interrupted test run leaves harness VMs in the registry looking like
+    VMs somebody left running. Restoring one wastes the boot hook's retry budget
+    and, if it has a stale host port, fails every attempt -- so the hook reports
+    'gave up after 5 attempts' while the user's own VMs are actually fine."""
+    started: list[str] = []
+
+    def fake_metas():
+        for name in ("vmhub-selftest", "vmhub-selftest-full", "vmhub-guicheck-live",
+                     "sweepvm", "winni"):
+            yield SimpleNamespace(name=name, last_run_state="running")
+
+    monkeypatch.setattr(lc.registry, "iter_metas", fake_metas)
+    monkeypatch.setattr(lc.podman, "is_running", lambda vm: False)
+    monkeypatch.setattr(lc, "start", lambda vm, progress=None: started.append(vm))
+
+    assert lc.restore_run_state() == ["winni"]
+    assert started == ["winni"]
+
+
 def test_restore_reports_failure_so_the_hook_can_retry(monkeypatch) -> None:
     """`restore` exiting 0 when every VM failed is what made a broken boot
     indistinguishable from a working one."""

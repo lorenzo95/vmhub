@@ -134,13 +134,60 @@ ensure_runtime_dir() {
     return 0
 }
 
+# Say everything twice: to the console, and to syslog under the "vmhub" tag.
+#
+# The console is not a record. /var/log/boot.log on this host stops being
+# written about five seconds into the boot -- long before rsyslogd is up -- so
+# a hook that runs at +5s and prints a failure leaves no trace anywhere on the
+# machine. rsyslogd starts around +7s, so `logger` from inside the hook lands
+# in /var/log/syslog and survives the boot. Without this, every question about
+# "did it run, and what did it say" has to be answered with another reboot and
+# a marker file.
+log() {
+    echo "vmhub: $*"
+    logger -t vmhub -- "$*" 2>/dev/null
+}
+
+# Wait for /dev/kvm to be usable by $OWNER before starting anything.
+#
+# udev creates /dev/kvm early in the boot and applies the owner's access ACL a
+# couple of seconds later. QEMU without KVM does not boot these VMs: it starts,
+# prints "KVM acceleration is not available (/dev/kvm is unwriteable)", and the
+# container is gone about a tenth of a second later. This hook fires at boot+5s
+# and loses that race every time, and it looks exactly like "the VM did not come
+# back". Checking beats retrying here, because the condition is knowable and
+# resolves itself within seconds -- the retry loop below was only ever masking
+# it, and on a slower boot it can burn all five attempts and still lose.
+#
+# A host with no /dev/kvm at all is not waiting for anything, so return at once
+# rather than adding 30s to every boot on a machine that will never have one.
+wait_for_kvm() {
+    [ -e /dev/kvm ] || return 0
+    waited=0
+    while [ "$waited" -lt 30 ]; do
+        if su - "$OWNER" -c "test -r /dev/kvm -a -w /dev/kvm" 2>/dev/null; then
+            return 0
+        fi
+        waited=$((waited + 1))
+        sleep 1
+    done
+    return 1
+}
+
 run_as_owner() {
     uid=$(id -u "$OWNER" 2>/dev/null) || {
-        echo "vmhub: user '$OWNER' does not exist" >&2
+        log "user '$OWNER' does not exist"
         return 1
     }
-    ensure_runtime_dir "$uid" || echo "vmhub: could not create /run/user/$uid" >&2
-    su - "$OWNER" -c "cd \"$PROJECT\" && VMHUB_HOME=\"$PROJECT\" XDG_RUNTIME_DIR=/run/user/$uid $*"
+    ensure_runtime_dir "$uid" || log "could not create /run/user/$uid"
+    out=$(su - "$OWNER" -c "cd \"$PROJECT\" && VMHUB_HOME=\"$PROJECT\" XDG_RUNTIME_DIR=/run/user/$uid $*" 2>&1)
+    rc=$?
+    if [ -n "$out" ]; then
+        echo "$out"
+        logger -t vmhub -- "$out" 2>/dev/null
+    fi
+    log "$1 -> exit $rc"
+    return $rc
 }
 
 # No `|| true` anywhere below, and the case's status is propagated. Every
@@ -157,14 +204,12 @@ run_as_owner() {
 # ACPI shutdown; only the bookkeeping survives it.
 case "$1" in
   start)
-    echo "vmhub: restoring VMs as $OWNER"
-    # This fires seconds into the boot, and seconds into the boot rootless
-    # podman is not reliably usable: there is no /run/user, udev has not
-    # applied its /dev/kvm ACL, and there is no network for pasta. The same
-    # command succeeds minutes later. So try, and when a VM does not come back,
-    # wait and try again rather than reporting a clean boot that left every VM
-    # down. `restore` exits non-zero if anything failed to restore, which is
-    # the only way this loop can tell "fine" from "not yet".
+    log "restoring VMs as $OWNER"
+    # Rootless podman and QEMU both need the boot to have caught up first; see
+    # ensure_runtime_dir and wait_for_kvm. These two waits are why this hook
+    # works, and the retry loop is the backstop for whatever is left.
+    uid=$(id -u "$OWNER" 2>/dev/null) && ensure_runtime_dir "$uid"
+    wait_for_kvm || log "/dev/kvm still not usable by $OWNER after 30s; VMs may fail to start"
     attempt=1
     while [ "$attempt" -le 5 ]; do
         if run_as_owner "$VMCTL restore"; then
@@ -172,17 +217,17 @@ case "$1" in
         fi
         attempt=$((attempt + 1))
         if [ "$attempt" -le 5 ]; then
-            echo "vmhub: restore attempt $((attempt - 1)) left VMs down; retrying in 10s" >&2
+            log "restore attempt $((attempt - 1)) left VMs down; retrying in 10s"
             sleep 10
         fi
     done
     if [ "$attempt" -gt 5 ]; then
-        echo "vmhub: gave up after 5 attempts; some VMs are still down" >&2
+        log "gave up after 5 attempts; some VMs are still down"
         exit 1
     fi
     ;;
   stop)
-    echo "vmhub: stopping VMs"
+    log "stopping VMs"
     run_as_owner "$VMCTL stop-all --quiet --preserve-run-state"
     ;;
   restart|reload)
