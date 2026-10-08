@@ -29,6 +29,7 @@ from .lifecycle import (
     start,
     stop,
     stop_all,
+    wait_until_podman_can_run,
 )
 
 from .media import attach_iso, detach_iso, iso_status
@@ -87,6 +88,7 @@ __all__ = [
     "remove",
     "resize",
     "restore_run_state",
+    "wait_until_podman_can_run",
     "status",
     "list_vms",
     "console_url",

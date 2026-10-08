@@ -215,6 +215,98 @@ def test_restore_never_starts_the_test_harness(monkeypatch) -> None:
     assert started == ["winni"]
 
 
+def test_install_enables_lingering_instead_of_only_hinting_at_it(monkeypatch) -> None:
+    """The unit enables and starts perfectly and still does nothing at boot.
+
+    systemd starts a user's manager on login and tears it down at logout, so
+    with lingering off there is no user manager at boot at all. The symptom is
+    a machine that came up fine days ago and simply stopped restoring.
+    """
+    from types import SimpleNamespace
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        autostart.shutil, "which", lambda name: "/usr/bin/loginctl" if name == "loginctl" else None
+    )
+    monkeypatch.setattr(
+        autostart.subprocess,
+        "run",
+        lambda *a, **k: (calls.append(list(a[0])) or SimpleNamespace(returncode=0, stdout="Linger=yes", stderr="")),
+    )
+    monkeypatch.setattr(autostart, "_systemd_unit_path", lambda: Path(autostart.__file__))
+
+    line = autostart._enable_linger()
+    assert ["loginctl", "enable-linger", "admin"] in calls, calls
+    assert "runs at boot" in line, line
+
+
+def test_install_says_plainly_when_lingering_could_not_be_enabled(monkeypatch) -> None:
+    """A hint that scrolls past is not the same as a warning that will not work."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        autostart.shutil, "which", lambda name: "/usr/bin/loginctl" if name == "loginctl" else None
+    )
+    monkeypatch.setattr(
+        autostart.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="Access denied"),
+    )
+    line = autostart._enable_linger()
+    assert "NOT come back at boot" in line, line
+    assert "sudo loginctl enable-linger" in line, line
+
+
+def test_unit_goes_to_the_vm_owners_home_not_roots(monkeypatch) -> None:
+    """`sudo vmctl autostart install` sets HOME=/root. Path.home() then writes
+    the unit into /root/.config/systemd/user/ and enables it in root's user
+    manager, while OWNER=admin is baked into the unit. Every message says it
+    worked and nothing happens at boot -- which is what it did."""
+    monkeypatch.setattr(autostart, "_vm_owner", lambda: "admin")
+    monkeypatch.setattr(autostart.pwd, "getpwnam", lambda name: SimpleNamespace(pw_dir="/home/admin"))
+    assert autostart._systemd_unit_path() == Path("/home/admin/.config/systemd/user/vmhub.service")
+
+    # ...and it must follow the owner, not the caller's HOME
+    monkeypatch.setattr(autostart.pwd, "getpwnam", lambda name: SimpleNamespace(pw_dir="/home/somebody-else"))
+    assert "/home/somebody-else" in str(autostart._session_autostart_path())
+
+
+def test_systemctl_user_calls_go_to_the_owners_manager(monkeypatch) -> None:
+    """Under sudo, `systemctl --user` is root's user manager -- so enabling the
+    unit there reports success and never runs it. Drop to the owner, and pass
+    XDG_RUNTIME_DIR through env because sudo's env_reset strips it."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(autostart.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(autostart, "_vm_owner", lambda: "admin")
+    monkeypatch.setattr(autostart.pwd, "getpwnam", lambda n: SimpleNamespace(pw_uid=1000))
+    monkeypatch.setattr(
+        autostart.subprocess,
+        "run",
+        lambda *a, **k: (calls.append(list(a[0])) or SimpleNamespace(returncode=0, stdout="", stderr="")),
+    )
+
+    autostart._user_systemctl(["enable", "--now", "vmhub.service"])
+    assert calls[0][:4] == ["sudo", "-u", "admin", "env"], calls[0]
+    assert "XDG_RUNTIME_DIR=/run/user/1000" in calls[0], calls[0]
+    assert calls[0][-4:] == ["--user", "enable", "--now", "vmhub.service"], calls[0]
+
+    # already the owner: no sudo dance, no runtime dir games
+    monkeypatch.setattr(autostart.os, "geteuid", lambda: 1000)
+    autostart._user_systemctl(["daemon-reload"])
+    assert calls[1] == ["systemctl", "--user", "daemon-reload"], calls[1]
+
+
+def test_restore_waits_for_the_boot_to_be_ready(monkeypatch) -> None:
+    """/run/user/<uid> and the /dev/kvm ACL both arrive after the boot hook."""
+    waited: list[int] = []
+    monkeypatch.setattr(lc.time, "sleep", lambda s: waited.append(s))
+    monkeypatch.setattr(lc.os.path, "isdir", lambda p: True)  # runtime dir exists
+    monkeypatch.setattr(lc.Path, "exists", lambda self: False)  # no /dev/kvm on this host
+
+    assert lc.wait_until_podman_can_run(timeout=0) == []
+    assert waited == []
+
+
 def test_restore_reports_failure_so_the_hook_can_retry(monkeypatch) -> None:
     """`restore` exiting 0 when every VM failed is what made a broken boot
     indistinguishable from a working one."""

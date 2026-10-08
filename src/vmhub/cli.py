@@ -276,6 +276,13 @@ def cmd_stop_all(args: argparse.Namespace, out: Out) -> int:
 
 
 def cmd_restore(args: argparse.Namespace, out: Out) -> int:
+    # A restore that runs seconds into the boot races /run/user/<uid> (created by
+    # the first login) and the access ACL on /dev/kvm (applied by udev a moment
+    # after it creates the node). Losing either of those races looks exactly like
+    # "the VM did not come back", so wait for them here rather than in whichever
+    # init script happens to be installed.
+    for problem in lifecycle.wait_until_podman_can_run():
+        out.say(out.warn(f"  {problem}"))
     # A restore that brought nothing back is not a success: the boot hook reads
     # this exit status to decide whether to try again, and "nothing to restore"
     # is indistinguishable from "every VM failed" unless we say so here.

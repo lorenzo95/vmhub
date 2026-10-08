@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 import shutil
 import subprocess
 from pathlib import Path
@@ -10,7 +11,6 @@ from .errors import LifecycleError
 
 SYSTEMD_UNIT_NAME = "vmhub.service"
 SYSVINIT_SCRIPT = "/etc/init.d/vmhub"
-AUTOSTART_DESKTOP = Path.home() / ".config" / "autostart" / "vmhub.desktop"
 LINGER_HINT = (
     "systemd user services stop when you log out unless lingering is enabled.\n"
     "  sudo loginctl enable-linger $USER"
@@ -33,8 +33,27 @@ def detect_init() -> str:
     return "none"
 
 
+def _owner_home() -> Path:
+    """The VM owner's home -- not whoever happens to be running the installer.
+
+    `sudo vmctl autostart install` sets HOME=/root, so Path.home() resolves to
+    root and the unit gets written to /root/.config/systemd/user/ and enabled in
+    *root's* user manager, while OWNER=admin is baked into the unit itself.
+    Every message says it worked, and nothing at all happens at boot.
+    """
+    owner = _vm_owner()
+    try:
+        return Path(pwd.getpwnam(owner).pw_dir)
+    except KeyError:
+        return Path.home()
+
+
+def _session_autostart_path() -> Path:
+    return _owner_home() / ".config" / "autostart" / "vmhub.desktop"
+
+
 def _systemd_unit_path() -> Path:
-    return Path.home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT_NAME
+    return _owner_home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT_NAME
 
 
 def _vm_owner() -> str:
@@ -275,6 +294,78 @@ def _enable_failure(result: subprocess.CompletedProcess) -> str:
     )
 
 
+def _linger_state() -> str:
+    """yes / no / unknown -- whether a user manager exists at boot for this user."""
+    if shutil.which("loginctl") is None:
+        return "unknown (no loginctl)"
+    result = subprocess.run(
+        ["loginctl", "show-user", _vm_owner(), "-p", "Linger"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return "unknown"
+    return result.stdout.strip().split("=", 1)[-1] or "unknown"
+
+
+def _enable_linger() -> str:
+    """Make the user unit able to run at boot, not only at login.
+
+    systemd starts a user's manager on login and tears it down at logout. With
+    lingering off there is no user manager at boot at all, so the unit cannot
+    run at boot -- which is the entire reason anyone installs it. The unit
+    enables and starts fine and looks healthy right up until the next reboot,
+    which is why this used to be a hint in the output rather than a step: the
+    symptom shows up days later and nowhere near here.
+    """
+    user = _vm_owner()
+    if shutil.which("loginctl") is None:
+        return (
+            "loginctl not found, so lingering cannot be enabled: the unit will "
+            "only run while you are logged in. Boot restore needs "
+            "`loginctl enable-linger`."
+        )
+    result = subprocess.run(
+        ["loginctl", "enable-linger", user], capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        return f"enabled lingering for {user}, so the unit also runs at boot"
+    detail = (result.stderr or result.stdout or "").strip() or f"exit {result.returncode}"
+    return (
+        f"could not enable lingering for {user} ({detail}). Until that is done "
+        f"the unit only runs while you are logged in, so VMs will NOT come back "
+        f"at boot. Run: sudo loginctl enable-linger {user}"
+    )
+
+
+def _user_systemctl(args: list[str]) -> subprocess.CompletedProcess:
+    """Run `systemctl --user` as the VM owner, whoever is doing the installing.
+
+    Under sudo, `systemctl --user` connects to *root's* user manager, so it
+    enables the unit in a place that will never run it -- and reports success
+    while doing so. The unit lives in the owner's ~/.config, so the enable
+    must happen in the owner's manager too.
+    """
+    if os.geteuid() != 0:
+        return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+    owner = _vm_owner()
+    runtime = None
+    try:
+        runtime = f"/run/user/{pwd.getpwnam(owner).pw_uid}"
+    except KeyError:
+        pass
+    # sudo's env_reset strips XDG_RUNTIME_DIR, and `systemctl --user` without it
+    # cannot find the bus -- so pass it through `env` rather than inheriting it.
+    prefix = ["sudo", "-u", owner]
+    if runtime:
+        prefix += ["env", f"XDG_RUNTIME_DIR={runtime}"]
+    return subprocess.run(
+        [*prefix, "systemctl", "--user", *args],
+        capture_output=True,
+        text=True,
+    )
+
+
 def install(*, target: str | None = None, gui: bool = False) -> list[str]:
     chosen = target or detect_init()
     done: list[str] = []
@@ -285,20 +376,18 @@ def install(*, target: str | None = None, gui: bool = False) -> list[str]:
         unit.write_text(systemd_unit_text())
         done.append(f"wrote {unit}")
         if shutil.which("systemctl"):
-            subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-            result = subprocess.run(
-                ["systemctl", "--user", "enable", "--now", SYSTEMD_UNIT_NAME],
-                capture_output=True,
-                text=True,
-            )
+            _user_systemctl(["daemon-reload"])
+            result = _user_systemctl(["enable", "--now", SYSTEMD_UNIT_NAME])
             if result.returncode == 0:
                 done.append("enabled and started vmhub.service")
             else:
                 done.append(_enable_failure(result))
-                done.append(f"run manually: systemctl --user enable --now {SYSTEMD_UNIT_NAME}")
+                done.append(
+                    f"run manually: systemctl --user enable --now {SYSTEMD_UNIT_NAME}"
+                )
         else:
             done.append("systemctl not found; unit written but not enabled")
-        done.append(LINGER_HINT)
+        done.append(_enable_linger())
 
     elif chosen == "sysvinit":
         script = Path(SYSVINIT_SCRIPT)
@@ -335,9 +424,10 @@ def install(*, target: str | None = None, gui: bool = False) -> list[str]:
 
 
 def _install_session() -> list[str]:
-    AUTOSTART_DESKTOP.parent.mkdir(parents=True, exist_ok=True)
-    AUTOSTART_DESKTOP.write_text(desktop_entry_text())
-    return [f"wrote {AUTOSTART_DESKTOP} (GUI starts with your desktop session)"]
+    desktop = _session_autostart_path()
+    desktop.parent.mkdir(parents=True, exist_ok=True)
+    desktop.write_text(desktop_entry_text())
+    return [f"wrote {desktop} (GUI starts with your desktop session)"]
 
 
 def uninstall(*, target: str | None = None) -> list[str]:
@@ -371,9 +461,10 @@ def uninstall(*, target: str | None = None) -> list[str]:
     else:
         done.append(f"nothing to remove for target {chosen}")
 
-    if AUTOSTART_DESKTOP.is_file():
-        AUTOSTART_DESKTOP.unlink()
-        done.append(f"removed {AUTOSTART_DESKTOP}")
+    desktop = _session_autostart_path()
+    if desktop.is_file():
+        desktop.unlink()
+        done.append(f"removed {desktop}")
     return done
 
 
@@ -383,7 +474,7 @@ def status() -> dict[str, object]:
         "init": chosen,
         "systemd_unit": _systemd_unit_path().is_file(),
         "sysvinit_script": Path(SYSVINIT_SCRIPT).is_file(),
-        "session_autostart": AUTOSTART_DESKTOP.is_file(),
+        "session_autostart": _session_autostart_path().is_file(),
         "vmctl": vmctl_path().is_file(),
         "gui": gui_path().is_file(),
     }
@@ -394,4 +485,8 @@ def status() -> dict[str, object]:
             text=True,
         )
         result["systemd_enabled"] = (proc.stdout or proc.stderr).strip()
+    if chosen == "systemd":
+        # Without this the unit is enabled and healthy and still does nothing at
+        # boot, which is the single most confusing way this can fail.
+        result["linger"] = _linger_state()
     return result

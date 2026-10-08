@@ -7,7 +7,7 @@ grouping and the import list are new.
 
 from __future__ import annotations
 
-import shutil, time
+import getpass, os, shutil, time
 
 from pathlib import Path
 
@@ -534,6 +534,56 @@ HARNESS_PREFIXES = ("vmhub-guicheck", "vmhub-selftest", "sweepvm")
 
 def is_harness(name: str) -> bool:
     return name.startswith(HARNESS_PREFIXES)
+
+
+BOOT_READY_TIMEOUT = 30
+
+
+def wait_until_podman_can_run(timeout: int = BOOT_READY_TIMEOUT) -> list[str]:
+    """Block until this process can actually drive rootless podman.
+
+    A restore that runs seconds into the boot is racing two things the boot has
+    not finished doing yet:
+
+    /run/user/<uid> is created by the first login. Until then every podman call
+    fails with "Failed to obtain podman configuration: lstat /run/user: no such
+    file or directory".
+
+    The access ACL on /dev/kvm, which udev applies a couple of seconds after it
+    creates the node. Until then QEMU does not boot these VMs at all: it starts,
+    prints "KVM acceleration is not available (/dev/kvm is unwriteable)", and
+    the container is gone about a tenth of a second later -- which reads as
+    "the VM did not come back".
+
+    Both settle on their own within seconds. A host with no /dev/kvm never will
+    get one, so it is not waited for. Returns whatever is still wrong, for the
+    caller to report rather than swallow.
+
+    The sysvinit hook does the same two waits in shell. They are left there
+    because a hook that depends on this command already working is not a hook.
+    """
+    problems: list[str] = []
+
+    runtime = f"/run/user/{os.getuid()}"
+    if not os.path.isdir(runtime):
+        try:
+            os.makedirs(runtime, mode=0o700, exist_ok=True)
+            os.chown(runtime, os.getuid(), os.getgid())
+        except OSError as exc:
+            problems.append(f"could not create {runtime}: {exc}")
+
+    kvm = Path("/dev/kvm")
+    if kvm.exists():
+        usable = lambda: os.access(kvm, os.R_OK | os.W_OK)  # noqa: E731
+        deadline = time.monotonic() + timeout
+        while not usable() and time.monotonic() < deadline:
+            time.sleep(1)
+        if not usable():
+            problems.append(
+                f"{kvm} is still not readable and writable by "
+                f"{getpass.getuser()} after {timeout}s; VMs will not start"
+            )
+    return problems
 
 
 def restore_run_state(
