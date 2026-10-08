@@ -61,6 +61,7 @@ def _render(template: str) -> str:
         .replace("@GUI@", str(gui_path()))
         .replace("@README@", str(paths.project_root() / "README.md"))
         .replace("@OWNER@", _vm_owner())
+        .replace("@PROJECTDIR@", str(paths.project_root()))
     )
 
 
@@ -74,6 +75,11 @@ After=default.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# systemd's default working directory is "/", and project_root() only walks
+# upward from the cwd -- so without this the unit failed with "not a vmhub
+# project root: /" on exactly the machines where it is installed.
+WorkingDirectory=@PROJECTDIR@
+Environment=VMHUB_HOME=@PROJECTDIR@
 ExecStart=@VMCTL@ restore
 ExecStop=@VMCTL@ stop-all --quiet
 
@@ -96,39 +102,51 @@ def sysvinit_script_text() -> str:
 ### END INIT INFO
 VMCTL=@VMCTL@
 OWNER="@OWNER@"
+PROJECT="@PROJECTDIR@"
 
 # Run as the VM owner, not as root: rootless podman keeps its containers under
 # the owner's home and XDG_RUNTIME_DIR, so `id -un` here would be root at boot.
+#
+# `su -` gives a LOGIN SHELL in $OWNER's home. project_root() only walks
+# upward from the cwd, so from /home/admin it can never reach
+# /home/admin/vmhub, which is below it, and its single fallback is hardcoded
+# to ~/vms. The hook therefore died with "not a vmhub project root:
+# /home/admin" on every boot. Both the cd and VMHUB_HOME below are there so
+# the working directory cannot matter.
 run_as_owner() {
     uid=$(id -u "$OWNER" 2>/dev/null) || {
         echo "vmhub: user '$OWNER' does not exist" >&2
         return 1
     }
-    su - "$OWNER" -c "XDG_RUNTIME_DIR=/run/user/$uid $*"
+    su - "$OWNER" -c "cd \"$PROJECT\" && VMHUB_HOME=\"$PROJECT\" XDG_RUNTIME_DIR=/run/user/$uid $*"
 }
 
+# No `|| true` anywhere below, and the case's status is propagated. Every
+# branch used to swallow its failure and exit 0, so a hook that did nothing at
+# all reported success -- which is what made this take a reboot and a report
+# to find.
 case "$1" in
   start)
     echo "vmhub: restoring VMs as $OWNER"
-    run_as_owner "$VMCTL restore" || true
+    run_as_owner "$VMCTL restore"
     ;;
   stop)
     echo "vmhub: stopping VMs"
-    run_as_owner "$VMCTL stop-all --quiet" || true
+    run_as_owner "$VMCTL stop-all --quiet"
     ;;
   restart|reload)
     "$0" stop
     "$0" start
     ;;
   status)
-    run_as_owner "$VMCTL ls --quiet" || true
+    run_as_owner "$VMCTL ls --quiet"
     ;;
   *)
     echo "Usage: $0 {start|stop|restart|status}" >&2
     exit 2
     ;;
 esac
-exit 0
+exit $?
 """
     )
 
