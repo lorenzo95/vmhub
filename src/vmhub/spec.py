@@ -157,7 +157,7 @@ class Resources:
 
 
 PORT_ROLES = ("web", "ssh", "rdp")
-PORT_KEYS = {"guest", "host", "role", "name"}
+PORT_KEYS = {"guest", "host", "role", "name", "bind"}
 
 
 @dataclass
@@ -174,6 +174,9 @@ class Port:
     host: int = 0
     role: str = ""
     name: str = ""
+    # Empty means "use network.bind". A per-port override is set when a
+    # single port needs to differ (e.g. web 127.0.0.1, game 0.0.0.0).
+    bind: str = ""
 
     @property
     def label(self) -> str:
@@ -189,6 +192,25 @@ class Network:
     )
     ports: list[Port] = field(default_factory=list)
     bind: str = "127.0.0.1"
+    # True (the default) keeps pasta host-passthrough: the container
+    # can reach the internet (so it can download Alpine or whatever
+    # boot.iso the blueprint names) and the guest shares that
+    # network, seeing the host IP. False opts into a podman
+    # `--internal` network: the container has no gateway, so the
+    # guest has no route to the internet, but the host->guest -p
+    # forwards still work via rootless port forwarding.
+    #
+    # Marked PERSIST_WHEN_FALSY so the chosen value round-trips
+    # through vm.toml: a missing key would hand back the default
+    # (True), silently reopening the host to the guest.
+    #
+    # The default is True because the qemux container downloads
+    # Alpine on first start; False breaks that path. Users who
+    # provide their own boot.iso -- or import a disk -- can flip
+    # to False for isolation.
+    internet: bool = field(
+        default=True, metadata={PERSIST_WHEN_FALSY: True}
+    )
     mac: str = ""
     ip: str = ""
 
@@ -300,6 +322,13 @@ class VmSpec:
                 raise SpecError(f"network.ports: guest port out of range: {port.guest}")
             if port.host and not 1 <= int(port.host) <= 65535:
                 raise SpecError(f"network.ports: host port out of range: {port.host}")
+            if port.bind and not _is_bind_address(port.bind):
+                msg = (
+                    f"network.ports: {port.label} bind={port.bind!r} "
+                    "is not a valid address (use an IP or leave empty "
+                    "to inherit network.bind)"
+                )
+                raise SpecError(msg)
             if port.role and port.role not in PORT_ROLES:
                 raise SpecError(
                     f"network.ports: {port.label} has unknown role {port.role!r}; "
@@ -414,6 +443,29 @@ def _is_empty(value: Any, declared: "Field[Any] | None" = None) -> bool:
     return not value
 
 
+_BIND_RE = re.compile(
+    r"^(?:"
+    r"\*|"                                          # any address (0.0.0.0)
+    r"(?:\d{1,3}\.){3}\d{1,3}"                    # IPv4 dotted-quad
+    r")$"
+)
+
+
+def _is_bind_address(text: str) -> bool:
+    """True if `text` is something podman will accept as a -p bind.
+
+    Only IPv4 dotted-quads and "*" pass. hostnames and IPv6 are out:
+    podman takes the bind as a literal address in the published-port
+    syntax, and resolving a name here would split the wrong knob from
+    the one we already have to keep stable.
+    """
+    if not _BIND_RE.match(text):
+        return False
+    if text == "*":
+        return True
+    return all(0 <= int(octet) <= 255 for octet in text.split("."))
+
+
 def _prune_dataclass(obj: Any, *, drop_name: bool = False) -> dict[str, Any]:
     """Walk a dataclass, dropping only what carries no information.
 
@@ -494,7 +546,7 @@ def spec_from_dict(data: dict, *, name: str | None = None) -> VmSpec:
     )
     net_data = data.get("network") or {}
     network = Network(
-        **{k: v for k, v in net_data.items() if k in {"mode", "guest_ports", "bind", "mac", "ip"}}
+        **{k: v for k, v in net_data.items() if k in {"mode", "guest_ports", "bind", "mac", "ip", "internet"}}
     )
     network.ports = [
         Port(**{k: v for k, v in entry.items() if k in PORT_KEYS})

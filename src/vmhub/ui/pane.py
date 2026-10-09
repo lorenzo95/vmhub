@@ -510,13 +510,18 @@ class VmPane(Gtk.Box):
             label.add_css_class("hint")
             self.ports_box.append(label)
             return
-        signature = tuple(
-            (port.role or "", port.guest, port.host, port.name or "")
-            for port in net.ports
+        signature = (
+            net.internet,
+            tuple(
+                (port.role or "", port.guest, port.host, port.name or "", port.bind)
+                for port in net.ports
+            ),
         )
         if signature == self._ports_signature:
             return
         self._ports_signature = signature
+        if self.internet_check.get_active() != net.internet:
+            self.internet_check.set_active(net.internet)
         self._clear_box(self.roles_box)
         self._clear_box(self.ports_box)
         for role in spec.PORT_ROLES:
@@ -854,6 +859,20 @@ class VmPane(Gtk.Box):
 
         widgets.run_task(self.window, work, label="Saving the port")
 
+    def _on_internet_toggled(self, button: Gtk.CheckButton) -> None:
+        def work(progress):
+            vm_spec = registry.load_spec(self.vm)
+            vm_spec.network.internet = button.get_active()
+            vm_spec.validate()
+            registry.save_spec(vm_spec)
+            if vm_spec.network.internet:
+                progress("guest will reach the internet after the next start")
+            else:
+                progress("guest will be on the isolated network after the next start")
+            return True
+
+        widgets.run_task(self.window, work, label="Saving the network mode")
+
     def _on_remove_port(self, port: spec.Port | None = None) -> None:
         if port is None:
             return
@@ -1019,6 +1038,22 @@ class VmPane(Gtk.Box):
         ports_hint.set_wrap(True)
         ports_hint.set_xalign(0.0)
         box.append(ports_hint)
+
+        # Internet access toggle. Off is the safe default: the guest is
+        # placed on a podman --internal network and has no route out.
+        # On keeps the pasta host-passthrough behavior (guest sees the
+        # host IP and can reach the LAN and the internet). A click flips
+        # network.internet, which the recreate check picks up on next
+        # start.
+        self.internet_check = Gtk.CheckButton(
+            label="Allow internet access from the guest",
+        )
+        self.internet_check.set_tooltip_text(
+            "Off (default): the guest can only reach this host. "
+            "On: the guest shares the host network and can reach the internet."
+        )
+        self.internet_check.connect("toggled", self._on_internet_toggled)
+        box.append(self.internet_check)
 
         # Refreshed on every poll now, so remember what is on screen: a pane
         # that rebuilds its port widgets every four seconds churns widgets for

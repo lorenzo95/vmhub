@@ -45,6 +45,7 @@ def test_a_field_can_declare_that_its_falsy_value_is_a_decision() -> None:
     }
     assert marked == {
         "Network.guest_ports",
+        "Network.internet",
         "Resources.kvm",
         "Resources.ram_check",
         "Shutdown.timeout",
@@ -62,6 +63,8 @@ def test_a_field_can_declare_that_its_falsy_value_is_a_decision() -> None:
         ("resources", "ram_check", False),
         ("shutdown", "timeout", 0),
         ("network", "guest_ports", []),
+    ("network", "internet", False),
+    ("network", "internet", True),
     ],
 )
 def test_a_marked_field_keeps_its_falsy_value(section: str, attribute: str, falsy) -> None:
@@ -288,3 +291,91 @@ def test_explicit_latest_still_round_trips() -> None:
     vm_spec = spec.VmSpec(name="demo")
     vm_spec.image.tag = "latest"
     assert _round_trip(vm_spec).image.tag == "latest"
+
+
+def test_a_per_port_bind_round_trips() -> None:
+    """Port.bind is empty by default and survives a write-then-reload.
+
+    Empty is the "use network.bind" signal; a non-empty override must come
+    back identically. Anything that lost the bind between to_dict() and
+    spec_from_dict() would silently fall back to the global bind on the
+    next start.
+    """
+    from vmhub import spec as spec_mod
+
+    vm_spec = spec.VmSpec(name="demo")
+    vm_spec.network.ports = [
+        spec.Port(guest=8006, host=8006, role="web", bind=""),
+        spec.Port(guest=22, host=2222, role="ssh", bind="0.0.0.0"),
+        spec.Port(guest=80, host=8080, name="http", bind="127.0.0.1"),
+    ]
+    back = spec_mod.spec_from_dict(vm_spec.to_dict(), name=vm_spec.name)
+    binds = [p.bind for p in back.network.ports]
+    assert binds == ["", "0.0.0.0", "127.0.0.1"]
+
+
+def test_an_empty_port_bind_does_not_get_written() -> None:
+    """The empty string is the "use network.bind" sentinel and is also the
+    default, so writing it would be noise that no reader relies on.
+    """
+    from vmhub import spec as spec_mod
+
+    vm_spec = spec.VmSpec(name="demo")
+    vm_spec.network.ports = [spec.Port(guest=8006, host=8006, role="web", bind="")]
+    data = vm_spec.to_dict()
+    assert data["network"]["ports"][0].get("bind", "") == ""
+
+
+def test_network_internet_default_is_on() -> None:
+    """The default is internet=True: the qemux container needs the
+    internet on first start to download Alpine (or whatever the
+    blueprint names as boot.iso). A user who wants isolation opts
+    in with network.internet=false.
+
+    PERSIST_WHEN_FALSY still has to be on the field, so the
+    chosen value round-trips through vm.toml -- otherwise a
+    missing key would silently reopen the host to the guest.
+    """
+    from vmhub import spec as spec_mod
+
+    assert spec.VmSpec(name="demo").network.internet is True
+    data = spec.VmSpec(name="demo").to_dict()
+    assert data["network"]["internet"] is True
+
+
+def test_validate_rejects_a_garbage_bind() -> None:
+    """A bind the kernel would reject has to fail at validate(), not at
+    podman -p, which surfaces as a less helpful error three layers down.
+    """
+    from vmhub import spec as spec_mod
+
+    vm_spec = spec.VmSpec(name="demo")
+    vm_spec.network.ports = [spec.Port(guest=80, host=8080, name="x", bind="not-an-ip")]
+    with pytest.raises(spec.SpecError):
+        vm_spec.validate()
+
+
+def test_validate_accepts_a_well_formed_bind() -> None:
+    """127.0.0.1, 0.0.0.0 and "*" are the only binds a podman -p will take;
+    they all have to clear the validator.
+    """
+    from vmhub import spec as spec_mod
+
+    for bind in ("127.0.0.1", "0.0.0.0", "*"):
+        vm_spec = spec.VmSpec(name="demo")
+        vm_spec.network.ports = [spec.Port(guest=80, host=8080, name="x", bind=bind)]
+        vm_spec.validate()  # must not raise
+
+
+def test_is_bind_address_distinguishes_ipv4_from_garbage() -> None:
+    from vmhub import spec as spec_mod
+
+    assert spec_mod._is_bind_address("0.0.0.0") is True
+    assert spec_mod._is_bind_address("127.0.0.1") is True
+    assert spec_mod._is_bind_address("192.168.1.229") is True
+    assert spec_mod._is_bind_address("*") is True
+    assert spec_mod._is_bind_address("") is False
+    assert spec_mod._is_bind_address("example.com") is False
+    assert spec_mod._is_bind_address("::1") is False
+    assert spec_mod._is_bind_address("256.0.0.1") is False
+    assert spec_mod._is_bind_address("1.2.3") is False

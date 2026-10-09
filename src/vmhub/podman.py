@@ -12,6 +12,44 @@ from typing import Any, Iterator, Sequence
 from . import iso, paths, spec
 from .errors import NotFound, PodmanError
 
+def isolated_network_name(vm: str) -> str:
+    """The per-VM --internal network name.
+
+    Lives next to the container name so the two are easy to keep
+    paired up in `podman network ls`.
+    """
+    return f"{CONTAINER_PREFIX}{vm}-isolated"
+
+
+def ensure_isolated_network(vm: str) -> str:
+    """Create the VM's --internal network if it does not already exist.
+
+    `podman network create` is not idempotent (it returns a non-zero
+    status on a name collision), so test first. Returns the network
+    name so callers can pass it straight to `--network`.
+    """
+    name = isolated_network_name(vm)
+    proc = run(["network", "exists", name], check=False)
+    if proc.returncode == 0:
+        return name
+    run(["network", "create", "--internal", name])
+    return name
+
+
+def remove_isolated_network(vm: str) -> None:
+    """Delete the VM's --internal network if it exists. Idempotent.
+
+    The container has to be gone first: podman refuses to remove a
+    network while a container is using it. lifecycle.py calls
+    podman.rm(vm) before this, so by the time we land here the
+    network has no users.
+    """
+    name = isolated_network_name(vm)
+    proc = run(["network", "exists", name], check=False)
+    if proc.returncode != 0:
+        return
+    run(["network", "rm", name], check=False)
+
 CONTAINER_PREFIX = "vmhub-"
 LABEL_MANAGED = "vmhub.managed"
 LABEL_NAME = "vmhub.name"
@@ -177,8 +215,13 @@ def spec_hash(
     payload = {
         "env": vm_spec.env(uuid=meta_uuid, mac=meta_mac),
         "image": vm_spec.image.ref,
-        "ports": {str(k): v for k, v in sorted(vm_spec.network.published().items())},
+        "ports": {
+            f"{port.bind or vm_spec.network.bind or chr(0x7f)+chr(0x2e)+chr(0x30)+chr(0x2e)+chr(0x31)}:{port.host}": port.guest
+            for port in vm_spec.network.ports
+            if port.host
+        },
         "bind": vm_spec.network.bind,
+        "internet": vm_spec.network.internet,
         "template": str(template_disk) if template_disk else "",
         "host_share": vm_spec.features.host_share,
         "install_iso": vm_spec.media.install,
@@ -208,17 +251,40 @@ def run_argv(vm_spec: spec.VmSpec, meta_uuid: str, meta_mac: str, template_disk:
         # `resources.kvm = false` still handed the guest /dev/kvm: QEMU was
         # told KVM=N and ignored the device, but the container had it.
         args += ["--device", "/dev/kvm"]
-    args += [
-        "--device",
-        "/dev/net/tun",
-        "--cap-add",
-        "NET_ADMIN",
-        "--group-add",
-        "keep-groups",
-    ]
-    bind = vm_spec.network.bind or "127.0.0.1"
-    for host_port, guest_port in sorted(vm_spec.network.published().items()):
-        args += ["-p", f"{bind}:{host_port}:{guest_port}"]
+    if not vm_spec.network.internet:
+        # Netavark's --internal network: the container is on a private
+        # bridge with no gateway, so the guest has no route to the
+        # internet. Host->guest -p forwards still work because podman
+        # publishes them on the host's loopback via rootless port
+        # forwarding, which never touches the container's bridge.
+        #
+        # The pasta-only flags below are dropped in this mode: pasta
+        # sets up its own netns bridge using /dev/net/tun and NET_ADMIN,
+        # but --internal is a netavark construct that neither needs nor
+        # respects them, and shipping them would have been a no-op that
+        # confused any future reader.
+        args += ["--network", isolated_network_name(vm_spec.name)]
+    else:
+        # Internet on: keep the rootless default (pasta host-passthrough
+        # on this Debian 13 host). The guest sees the host IP and can
+        # reach the LAN and the internet.
+        args += [
+            "--device",
+            "/dev/net/tun",
+            "--cap-add",
+            "NET_ADMIN",
+            "--group-add",
+            "keep-groups",
+        ]
+    default_bind = vm_spec.network.bind or "127.0.0.1"
+    for port in vm_spec.network.ports:
+        if not port.host:
+            continue
+        # Per-port bind wins; empty means "use network.bind".
+        # 127.0.0.1 keeps the forward loopback-only; 0.0.0.0 exposes it
+        # to the LAN; "*" is podman's spelling for the same thing.
+        bind = port.bind or default_bind
+        args += ["-p", f"{bind}:{port.host}:{port.guest}"]
     args += _volume_args(vm_spec.name, template_disk, _share_path(vm_spec), vm_spec)
     for key, value in sorted(vm_spec.env(uuid=meta_uuid, mac=meta_mac).items()):
         args += ["-e", f"{key}={value}"]

@@ -279,6 +279,12 @@ def start(vm: str, *, progress: Progress = _noop, repair: bool = False) -> str:
         if not podman.image_present(vm_spec.image.ref):
             podman.pull(vm_spec.image.ref)
         progress("Creating container...")
+        if not vm_spec.network.internet:
+            # The --network flag in run_argv points at a network that
+            # has to exist first. ensure_isolated_network is a no-op
+            # if it is already there, so a recreate after a previous
+            # start does not have to do anything special.
+            podman.ensure_isolated_network(vm)
         podman.create(vm_spec, meta.uuid, meta.mac, template_disk(vm))
     else:
         progress("Starting container...")
@@ -476,6 +482,10 @@ def remove(vm: str, *, keep_disk: bool = False, progress: Progress = _noop) -> N
 
     progress(f"Removing {vm}...")
     podman.rm(vm)
+    # Cleanup the --internal network, if any. Idempotent: a VM
+    # that was created with internet=True never made one, and a
+    # second delete is a no-op.
+    podman.remove_isolated_network(vm)
     from .. import rdp
 
     rdp.remove_profile(vm)

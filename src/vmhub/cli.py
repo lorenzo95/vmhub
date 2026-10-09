@@ -168,9 +168,10 @@ def cmd_info(args: argparse.Namespace, out: Out) -> int:
         ("guest ports", ", ".join(str(p) for p in item.guest_ports) or "-"),
         ("snapshots", ", ".join(item.snapshots) or "-"),
         ("boot media", item.boot_image or "-"),
+        ("internet", "allowed" if vm_spec.network.internet else "blocked (--internal)"),
         ("peer dial", ", ".join(item.peer_targets)
             if item.peer_targets
-            else "loopback only (set network.bind=0.0.0.0 to expose)"),
+            else f"loopback only (set network.bind=0.0.0.0 to expose, or a per-port --bind)"),
         ("shutdown", f"timeout {vm_spec.shutdown.timeout}s"
             + (", no ACPI" if vm_spec.shutdown.skip_acpi else ", ACPI")),
         ("disk has data", "yes" if item.has_disk_data else "no (not installed yet)"),
@@ -846,8 +847,9 @@ def cmd_ports(args: argparse.Namespace, out: Out) -> int:
             else:
                 note = out.good("free")
             role = f"  [{port.role}]" if port.role else ""
+            bind = f"  bind={port.bind}" if port.bind else ""
             left = f"{port.host if port.host else '-':>5} -> {port.guest:<6}"
-            out.say(f"{left}  {port.label}{role}  {note}")
+            out.say(f"{left}  {port.label}{role}{bind}  {note}")
         forward = ", ".join(str(p) for p in sorted(net.guest_ports)) or "none"
         out.say(out.dim(f"  guest ports forwarded to the host: {forward}"))
         return 0
@@ -876,7 +878,8 @@ def cmd_ports(args: argparse.Namespace, out: Out) -> int:
                 if role
                 else ports.allocate_any(also_wanted=avoid)
             )
-        net.ports.append(spec.Port(guest=guest, host=host, role=role, name=args.label))
+        bind = getattr(args, "bind", "") or ""
+        net.ports.append(spec.Port(guest=guest, host=host, role=role, name=args.label, bind=bind))
         # A guest service the container is not forwarding never answers, so
         # turn the forwarding on now rather than leaving a port that only
         # looks live. The web console is the container's own listener and has
@@ -909,14 +912,19 @@ def cmd_ports(args: argparse.Namespace, out: Out) -> int:
         return 0
 
     # action == "set"
-    if not args.host and not args.guest:
-        print(out.bad("give the new host port with --host, or the guest port with --guest"))
+    if not args.host and not args.guest and getattr(args, "bind", None) is None:
+        print(out.bad("give the new host port with --host, the guest port with --guest, or a per-port --bind"))
         return 2
     new_host = int(args.host) if args.host else port.host
     new_guest = int(args.guest) if args.guest else port.guest
-    if new_host == port.host and new_guest == port.guest:
-        out.say(out.dim(f"{port.label} is already host {port.host} to guest {port.guest}"))
+    new_bind = getattr(args, "bind", None)
+    if (new_host == port.host and new_guest == port.guest
+            and (new_bind is None or new_bind == port.bind)):
+        out.say(out.dim(f"{port.label} is already host {port.host} to guest {port.guest}"
+            + (f" bind={port.bind}" if port.bind else "")))
         return 0
+    if new_bind is not None:
+        port.bind = new_bind
     if ports.host_taken_by_other(net, new_host, exclude=port):
         print(out.bad(f"host port {new_host} is already published by this VM"))
         return 1
@@ -1360,6 +1368,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--host", type=int, help="host port (default: the first free one)")
     sp.add_argument("--name", dest="label", default="", help="label shown for the entry")
     sp.add_argument(
+        "--bind", default="",
+        help="per-port bind address (127.0.0.1, 0.0.0.0, or *). Default: use network.bind. 0.0.0.0 exposes the port outside this host.",
+    )
+    sp.add_argument(
         "--as", dest="role", choices=list(spec.PORT_ROLES),
         help="treat this as vmhub's web, ssh or rdp port",
     )
@@ -1375,6 +1387,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--guest", type=int,
         help="the new guest port -- use this to correct a mistyped guest number",
+    )
+    sp.add_argument(
+        "--bind", default=None,
+        help="the new per-port bind address (use empty string to inherit network.bind)",
     )
     sp.set_defaults(func=cmd_ports)
 
