@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 from typing import Callable
 
 import gi
@@ -206,14 +205,44 @@ def scroll(child: Gtk.Widget) -> Gtk.ScrolledWindow:
     return window
 
 
-def open_url(url: str) -> None:
+def open_url(url: str, *, report: Callable[[str], None] | None = None) -> None:
+    """Hand a URL to the desktop, and say so when that fails.
+
+    `report` receives the reason. It is a callback and not a return
+    value because Gtk.UriLauncher.launch() is asynchronous: the
+    failure arrives after this function has already returned, so
+    there is nothing to return it in.
+
+    Both of these used to be silent. launch() was called with three
+    Nones, which passes no callback, so the GError was thrown away
+    and a launch that failed raised nothing and showed nothing. And
+    the else branch -- which ran only when xdg-open was absent, and
+    then executed xdg-open -- could only ever raise FileNotFound
+    Error. There was no case where it worked.
+    """
     if os.environ.get("VMHUB_NO_LAUNCH"):
         return
-    launcher = shutil.which("xdg-open")
-    if launcher:
-        Gtk.UriLauncher.new(url).launch(None, None, None)
-    else:
-        subprocess.Popen(["xdg-open", url])
+    say = report if report is not None else (lambda _message: None)
+
+    if shutil.which("xdg-open") is None and shutil.which("gio") is None:
+        # Nothing on this machine can hand a URL to a browser, so
+        # say what to do about it rather than failing on launch().
+        say(
+            f"Cannot open a browser: neither xdg-open nor gio is "
+            f"installed. Open this by hand: {url}"
+        )
+        return
+
+    def launched(launcher, result, _url: str = url) -> None:
+        try:
+            launcher.launch_finish(result)
+        except GLib.Error as exc:
+            # The commonest cause is no handler registered for the
+            # scheme, which is why the URL is repeated here: the user
+            # still has to reach it somehow.
+            say(f"Could not open the console ({exc.message}). Open by hand: {_url}")
+
+    Gtk.UriLauncher.new(url).launch(None, None, launched)
 
 
 def filter_store(name: str, patterns: list[str]) -> Gio.ListStore:

@@ -430,7 +430,7 @@ class VmhubWindow(Gtk.ApplicationWindow):
         if action_name == "console":
             url = lifecycle.console_url(name)
             if url:
-                widgets.open_url(url)
+                widgets.open_url(url, report=self.report)
             return
         if action_name == "start":
             widgets.run_task(

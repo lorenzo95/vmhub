@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import os
 import re
+import shutil
 import tempfile
 import time
 import sys
@@ -1491,6 +1492,95 @@ def _probe(app) -> None:
     prompt.accept_button.emit("clicked")
     check("TextPrompt returns the typed text", lambda: _assert(typed == ["guicheck"], typed))
 
+    # ---- a URL that cannot be opened must say so ----
+    # open_url is the only path to a browser, and it used to fail two
+    # ways that both looked like success: the else branch shelled out to
+    # xdg-open exactly when which() had said it was absent, and the live
+    # branch passed three Nones to launch(), discarding the GError.
+    #
+    # This harness runs with VMHUB_NO_LAUNCH=1, so open_url returns on its
+    # first line and has never been reached. Clear it around both checks
+    # and restore it after, or an assertion here would pass or fail for
+    # the wrong reason entirely.
+    saved_flag = os.environ.pop("VMHUB_NO_LAUNCH", None)
+    try:
+        # No launcher on PATH: report the URL rather than fall through to
+        # a branch that shells out to the program which() just said is
+        # missing. Stub the module attribute, not shutil.which itself --
+        # widgets.shutil IS the shutil module, so assigning through it
+        # would replace which() for the whole process.
+        real_shutil = widgets.shutil
+        widgets.shutil = _NoLauncher()
+        try:
+            nothing_installed: list[str] = []
+            widgets.open_url(
+                "http://127.0.0.1:1/console", report=nothing_installed.append
+            )
+        finally:
+            widgets.shutil = real_shutil
+        check(
+            "with no launcher installed, open_url reports instead of raising",
+            lambda: _assert(
+                bool(nothing_installed), f"nothing reported: {nothing_installed}"
+            ),
+        )
+        check(
+            "and the report repeats the URL so it can still be reached",
+            lambda: _assert(
+                any("127.0.0.1:1" in m for m in nothing_installed),
+                f"none of {nothing_installed} repeats the URL",
+            ),
+        )
+
+        # The silent-launch defect itself. UriLauncher.launch() is async
+        # and under Xvfb its callback never runs, so assert the wiring
+        # rather than the outcome: launch() must be handed a callback,
+        # because that is what carries the GError. Substituting the class
+        # makes that deterministic and needs no portal.
+        real_launcher = widgets.Gtk.UriLauncher
+        seen: list[object] = []
+
+        class _RecordingLauncher:
+            """Records what open_url hands launch().
+
+            UriLauncher.new is a static factory, so the stand-in needs
+            a new() too -- open_url calls Gtk.UriLauncher.new(url) and
+            never constructs the class directly.
+            """
+
+            def __init__(self, uri):
+                seen.append(uri)
+
+            @staticmethod
+            def new(uri):
+                return _RecordingLauncher(uri)
+
+            def launch(self, cancellable, parent, callback):
+                seen.append(callback)
+
+        widgets.Gtk.UriLauncher = _RecordingLauncher
+        try:
+            widgets.open_url("http://127.0.0.1:8006/", report=lambda _m: None)
+        finally:
+            widgets.Gtk.UriLauncher = real_launcher
+        check(
+            "open_url hands launch() a callback so a GError is not discarded",
+            lambda: _assert(
+                len(seen) == 2 and callable(seen[1]),
+                f"launch() got {seen!r}; a None callback discards the error",
+            ),
+        )
+        check(
+            "open_url no longer shells out to a launcher it just found missing",
+            lambda: _assert(
+                "subprocess" not in _widgets_source(),
+                "widgets still imports subprocess for the old dead branch",
+            ),
+        )
+    finally:
+        if saved_flag is not None:
+            os.environ["VMHUB_NO_LAUNCH"] = saved_flag
+
     # ---- closing the window is the one thing that does stop a log timer ----
     # Kept out of the sweep above, and asserted here on a pane that is known to
     # be watching: a timer left running past app shutdown keeps the VM name and
@@ -1539,6 +1629,22 @@ def _probe(app) -> None:
             print(f"    - {label}: {err}")
     else:
         print(f"\033[32mall {len(exercised)} GUI checks passed\033[0m")
+
+
+class _NoLauncher:
+    """A stand-in for the shutil module whose which() finds nothing."""
+
+    @staticmethod
+    def which(_name, *_args, **_kwargs):
+        return None
+
+
+def _widgets_source() -> str:
+    from vmhub.ui import widgets as widgets_mod
+
+    import inspect as _inspect
+
+    return _inspect.getsource(widgets_mod)
 
 
 def _assert(condition: bool, value: object) -> None:

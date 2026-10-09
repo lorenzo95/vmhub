@@ -2022,7 +2022,11 @@ class VmPane(Gtk.Box):
 
     def _on_open_console(self, _button) -> None:
         if self.status and self.status.console_url:
-            widgets.open_url(self.status.console_url)
+            # report= so a browser that refuses the URL says so
+            # instead of the button doing nothing at all.
+            widgets.open_url(
+                self.status.console_url, report=self.window.report
+            )
 
     def close(self) -> None:
         self._stop_follow()
