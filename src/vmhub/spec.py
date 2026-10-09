@@ -39,6 +39,20 @@ DEFAULT_REPO = "docker.io/qemux/qemu"
 # nothing that is already running, it only stops it from moving later.
 DEFAULT_TAG = "7.50"
 
+# The lowest host port vmhub will publish. vmhub runs rootless, as a
+# normal user, so binding a host port below this needs
+# CAP_NET_BIND_SERVICE, which an unprivileged process has no way to
+# get. net.ipv4.ip_unprivileged_port_start names the real floor and
+# is 1024 on a stock Debian. Measured on this host: host port 1023 is
+# refused with "Permission denied" and 1024 is accepted, so this is
+# the boundary and not a guess.
+#
+# Only HOST ports. A guest port has no such limit: the forwarder binds
+# the guest port inside the container's own netns, where binding 80
+# works fine. Rejecting guest port 80 would refuse a perfectly
+# ordinary VM with a web server on it.
+MIN_HOST_PORT = 1024
+
 _SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGTP]?)(?:i?B)?\s*$", re.IGNORECASE)
 _UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
 
@@ -320,8 +334,13 @@ class VmSpec:
         for port in self.network.ports:
             if not 1 <= int(port.guest) <= 65535:
                 raise SpecError(f"network.ports: guest port out of range: {port.guest}")
-            if port.host and not 1 <= int(port.host) <= 65535:
-                raise SpecError(f"network.ports: host port out of range: {port.host}")
+            if port.host and not MIN_HOST_PORT <= int(port.host) <= 65535:
+                raise SpecError(
+                    f"network.ports: host port out of range: {port.host} "
+                    f"(must be {MIN_HOST_PORT}-65535 -- vmhub runs as a "
+                    f"normal user, so it cannot publish a port below "
+                    f"{MIN_HOST_PORT}; the guest port is not restricted)"
+                )
             if port.bind and not _is_bind_address(port.bind):
                 msg = (
                     f"network.ports: {port.label} bind={port.bind!r} "

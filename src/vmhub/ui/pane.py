@@ -17,6 +17,13 @@ DISK_TYPES = ["scsi", "blk", "ide", "sata", "nvme"]
 # The three ports vmhub drives itself: the title shown for the row, and the
 # guest port behind it. web is the container's own display rather than a
 # guest service, which is why it is never gated on network.guest_ports.
+# The one bind value the "Expose on the network" checkbox means, and
+# the set of spellings that count as it. "*" is podman's own way of
+# writing the same thing, so a spec written by hand with "*" shows the
+# box ticked rather than silently reading as not-exposed.
+EXPOSED_BIND = "0.0.0.0"
+EXPOSED_BINDS = frozenset({"0.0.0.0", "*"})
+
 ROLE_ROWS = {
     "web": ("Web console", 8006),
     "ssh": ("SSH", 22),
@@ -593,7 +600,9 @@ class VmPane(Gtk.Box):
         row.append(remove)
         return row
 
-    def _parse_port(self, text: str, what: str, *, blank_ok: bool = False) -> int | None:
+    def _parse_port(
+        self, text: str, what: str, *, blank_ok: bool = False, floor: int = 1
+    ) -> int | None:
         """A port the user typed, or None after saying what was wrong."""
         raw = text.strip()
         if not raw:
@@ -606,8 +615,26 @@ class VmPane(Gtk.Box):
         except ValueError:
             self.window.report(f"{raw!r} is not a {what}.")
             return None
-        if not 1 <= port <= 65535:
-            self.window.report(f"A {what} must be between 1 and 65535, not {port}.")
+        if port < floor:
+            # Say the floor and the reason, not just the rule. "between
+            # 1 and 65535" was true and useless: a host port of 80 is
+            # refused by the kernel because vmhub is not root, and the
+            # user has no way to act on a bare range.
+            if floor > 1:
+                self.window.report(
+                    f"A {what} must be {floor} or higher. vmhub runs as a "
+                    f"normal user, so it cannot publish a port below {floor} "
+                    f"(the port inside the VM is not restricted)."
+                )
+            else:
+                self.window.report(
+                    f"A {what} must be between 1 and 65535, not {port}."
+                )
+            return None
+        if port > 65535:
+            self.window.report(
+                f"A {what} must be between {floor} and 65535, not {port}."
+            )
             return None
         return port
 
@@ -651,10 +678,11 @@ class VmPane(Gtk.Box):
         guest: int = 0,
         host: int = 0,
         name: str = "",
+        bind: str = "",
         show_label: bool,
         host_optional: bool,
         prefill: bool = True,
-        on_save: Callable[[int, int, str], None],
+        on_save: Callable[[int, int, str, str], None],
     ) -> None:
         """Ask for a port's guest number, host number and label.
 
@@ -669,6 +697,19 @@ class VmPane(Gtk.Box):
         host_entry.set_name("vmhub.port.host")
         name_entry = Gtk.Entry()
         name_entry.set_name("vmhub.port.name")
+        # The whole per-port bind UI. Only two states are worth
+        # offering: this machine only, or anything that can reach
+        # this host. Unchecked leaves bind="" so the entry inherits
+        # network.bind (127.0.0.1 by default) rather than writing a
+        # redundant "127.0.0.1" into every port in vm.toml.
+        expose_check = Gtk.CheckButton(label="Expose on the network")
+        expose_check.set_name("vmhub.port.expose")
+        expose_check.set_active(bind in EXPOSED_BINDS)
+        expose_check.set_tooltip_text(
+            "Off: only this machine can reach the port. "
+            "On: anything that can reach this host on the network "
+            "(0.0.0.0) can, not just your own machine."
+        )
         if prefill:
             guest_entry.set_text(str(guest) if guest else "")
             host_entry.set_text(str(host) if host else "")
@@ -682,6 +723,7 @@ class VmPane(Gtk.Box):
         rows = [("Guest port", guest_entry), ("Host port", host_entry)]
         if show_label:
             rows.insert(1, ("Label", name_entry))
+        rows.append(("Reachable from", expose_check))
         grid = Gtk.Grid(column_spacing=8, row_spacing=6)
         for row, (caption, entry) in enumerate(rows):
             key = Gtk.Label(label=caption)
@@ -696,12 +738,19 @@ class VmPane(Gtk.Box):
             if new_guest is None:
                 return
             new_host = self._parse_port(
-                host_entry.get_text(), "host port", blank_ok=host_optional
+                host_entry.get_text(),
+                "host port",
+                blank_ok=host_optional,
+                floor=spec.MIN_HOST_PORT,
             )
             if new_host is None:
                 return
             new_name = name_entry.get_text().strip() if show_label else name
-            on_save(new_guest, new_host, new_name)
+            # Checked means "not just this machine", which is one bind
+            # value. Unchecked means "inherit", so the port is not
+            # pinned to an address that network.bind already decides.
+            new_bind = EXPOSED_BIND if expose_check.get_active() else ""
+            on_save(new_guest, new_host, new_name, new_bind)
 
         dialog = widgets.prompt_text(
             self.window, heading, body, on_accept=accept, extra=grid, accept_label="Save"
@@ -720,12 +769,17 @@ class VmPane(Gtk.Box):
             "The port inside the VM, and the port on this machine that reaches it.",
             guest=port.guest if port else default_guest,
             host=port.host if port else 0,
+            bind=port.bind if port else "",
             show_label=False,
             host_optional=False,
-            on_save=lambda guest, host, _name: self._apply_role_edit(role, guest, host),
+            on_save=lambda guest, host, _name, bind: self._apply_role_edit(
+                role, guest, host, bind
+            ),
         )
 
-    def _apply_role_edit(self, role: str, guest: int, host: int) -> None:
+    def _apply_role_edit(
+        self, role: str, guest: int, host: int, bind: str = ""
+    ) -> None:
         title, _default_guest = ROLE_ROWS[role]
 
         def work(progress):
@@ -738,10 +792,13 @@ class VmPane(Gtk.Box):
             if ports_mod.host_taken_by_other(net, host, exclude=entry):
                 raise VmhubError(f"host port {host} is already published by this VM")
             if entry is None:
-                net.ports.append(spec.Port(guest=guest, host=host, role=role))
+                net.ports.append(
+                    spec.Port(guest=guest, host=host, role=role, bind=bind)
+                )
             else:
                 entry.guest = guest
                 entry.host = host
+                entry.bind = bind
             if role != "web" and guest not in net.guest_ports:
                 net.guest_ports = sorted({*net.guest_ports, guest})
             if old_guest and old_guest != guest:
@@ -775,7 +832,7 @@ class VmPane(Gtk.Box):
         widgets.run_task(self.window, work, label="Removing a port")
 
     def _on_add_port(self, _button: object = None) -> None:
-        def on_save(guest: int, host: int, name: str) -> None:
+        def on_save(guest: int, host: int, name: str, bind: str = "") -> None:
             def work(progress):
                 from .. import ports as ports_mod
 
@@ -793,7 +850,9 @@ class VmPane(Gtk.Box):
                     chosen = ports_mod.allocate_any(
                         also_wanted=set(ports_mod.used_by_vms(self.vm)) | set(net.published())
                     )
-                net.ports.append(spec.Port(guest=guest, host=chosen, name=name))
+                net.ports.append(
+                    spec.Port(guest=guest, host=chosen, name=name, bind=bind)
+                )
                 # Forward it in the same breath, so the row is not a promise
                 # the container has no way to keep.
                 net.guest_ports = sorted({*net.guest_ports, guest})
@@ -823,15 +882,21 @@ class VmPane(Gtk.Box):
             guest=guest,
             host=old_host,
             name=name,
+            bind=port.bind,
             show_label=True,
             host_optional=False,
-            on_save=lambda new_guest, new_host, new_name: self._apply_port_edit(
-                (guest, old_host, name), new_guest, new_host, new_name
+            on_save=lambda new_guest, new_host, new_name, new_bind: self._apply_port_edit(
+                (guest, old_host, name), new_guest, new_host, new_name, new_bind
             ),
         )
 
     def _apply_port_edit(
-        self, expected: tuple[int, int, str], guest: int, host: int, name: str
+        self,
+        expected: tuple[int, int, str],
+        guest: int,
+        host: int,
+        name: str,
+        bind: str = "",
     ) -> None:
         old_guest, old_host, old_name = expected
 
@@ -848,6 +913,7 @@ class VmPane(Gtk.Box):
             entry.guest = guest
             entry.host = host
             entry.name = name
+            entry.bind = bind
             if guest not in net.guest_ports:
                 net.guest_ports = sorted({*net.guest_ports, guest})
             if old_guest != guest:
