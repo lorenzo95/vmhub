@@ -258,6 +258,29 @@ def write_profile(vm: str) -> Path:  # noqa: D401
     return path
 
 
+def refresh_profile(vm: str) -> Path | None:
+    """Bring an existing .remmina profile back in step with the spec.
+
+    The profile is derived state -- name, server, username, drive -- and is
+    only written on launch, so after editing the account or the shared folder
+    on disk it still says what it said last time you connected.
+
+    Only an existing profile is rewritten. Saving a setting must not drop an
+    entry into Remmina's connection list for a VM nobody has connected to.
+
+    Returns the path refreshed, or None when there was nothing to do.
+    """
+    if not profile_path(vm).exists():
+        return None
+    try:
+        return write_profile(vm)
+    except VmhubError:
+        # It had a port when it was written and does not now, so it could
+        # only fail to connect. Drop it rather than leave it in the list.
+        remove_profile(vm)
+        return None
+
+
 def remove_profile(vm: str) -> bool:
     path = profile_path(vm)
     if path.is_file():

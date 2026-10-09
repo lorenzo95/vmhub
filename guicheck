@@ -1724,6 +1724,199 @@ def _probe(app) -> None:
     if registry.exists(scope_vm):
         lifecycle.remove(scope_vm)
 
+    # ---- the RDP settings commit on Save, not on every keystroke ----
+    # Each field used to queue its own read-modify-write of the whole
+    # vm.toml, one per letter typed, and two landing out of order left the
+    # older text on disk. It also persisted half a word if the app went away
+    # mid-type. Now nothing is written until Save, and Save writes both
+    # fields together -- they belong together because they both go into the
+    # one .remmina profile Remmina actually reads.
+    from vmhub import rdp as rdp_mod
+
+    save_vm = f"{VM}-rdpsave"
+    lifecycle.create(save_vm, blueprint="alpine")
+    save_path = paths.spec_path(save_vm)
+    starting = registry.load_spec(save_vm)
+    starting.network.ports = [
+        spec.Port(guest=3389, host=3399, role="rdp", bind="")
+    ]
+    starting.media.rdp_user = "old-account"
+    starting.media.share_path = ""
+    starting.validate()
+    registry.save_spec(starting)
+
+    # Register the pane the way the app does. A VmPane built by hand never
+    # lands in window.panes and self.current is never its VM, so select_vm
+    # could not treat it as the pane being left -- which is exactly how this
+    # check first "passed" against unfixed code.
+    window.select_vm(save_vm)
+    save_pane = window.panes[save_vm]
+    save_button = find_named(save_pane, "vmhub.rdp.save")
+    profile_file = rdp_mod.profile_path(save_vm)
+
+    def _saved() -> spec.VmSpec:
+        return registry.load_spec(save_vm)
+
+    check(
+        "the RDP Save starts disabled",
+        lambda: _assert(
+            save_button is not None and not save_button.get_sensitive(),
+            "the Save button is missing, or armed before anything was edited",
+        ),
+    )
+
+    before_typing = save_path.read_text()
+    save_pane.rdp_user_entry.set_text("typed-account")
+    save_pane.share_entry.set_text("/tmp/shared-typed")
+    pump_until(lambda: False, 0.4)
+    check(
+        "typing does not write the spec",
+        lambda: _assert(
+            save_path.read_text() == before_typing,
+            "vm.toml changed while typing, before any Save",
+        ),
+    )
+    check(
+        "typing arms the Save",
+        lambda: _assert(
+            save_button is not None and save_button.get_sensitive(),
+            "the Save button stayed disabled after an edit",
+        ),
+    )
+
+    # The poll runs every few seconds and used to be what put the old value
+    # back over the caret.
+    save_pane._sync_entry(save_pane.rdp_user_entry, "from-blueprint")
+    save_pane._sync_entry(save_pane.share_entry, "/from/default")
+    check(
+        "a refresh does not overwrite an unsaved edit",
+        lambda: _assert(
+            save_pane.rdp_user_entry.get_text() == "typed-account"
+            and save_pane.share_entry.get_text() == "/tmp/shared-typed",
+            f"the poll wrote "
+            f"{save_pane.rdp_user_entry.get_text()!r} / "
+            f"{save_pane.share_entry.get_text()!r} over the edit",
+        ),
+    )
+
+    # And no profile may be invented for a VM nobody has connected to.
+    check(
+        "Save does not invent a Remmina profile",
+        lambda: _assert(
+            not profile_file.exists(),
+            f"a profile appeared at {profile_file} for a VM never connected to",
+        ),
+    )
+
+    writes: list[str] = []
+    real_save_spec = registry.save_spec
+
+    def counting_save(vm_spec, *args, **kwargs):
+        writes.append(getattr(vm_spec, "name", "?"))
+        return real_save_spec(vm_spec, *args, **kwargs)
+
+    registry.save_spec = counting_save
+    try:
+        save_pane._on_save_rdp()
+        pump_until(
+            lambda: _saved().media.rdp_user == "typed-account", 4.0
+        )
+    finally:
+        registry.save_spec = real_save_spec
+
+    landed = _saved()
+    check(
+        "Save writes the account and the folder together",
+        lambda: _assert(
+            landed.media.rdp_user == "typed-account"
+            and landed.media.share_path == "/tmp/shared-typed",
+            f"account={landed.media.rdp_user!r} "
+            f"share={landed.media.share_path!r}",
+        ),
+    )
+    check(
+        "both fields cost one write, not two",
+        lambda: _assert(len(writes) == 1, f"{len(writes)} writes for two fields: {writes}"),
+    )
+    # Gate on the button, not on the spec: work() writes the spec before the
+    # completion callback runs, so the pump above returns while Save is still
+    # armed and the check below is racing the main loop rather than the save.
+    pump_until(
+        lambda: save_button is not None and not save_button.get_sensitive(),
+        4.0,
+    )
+    check(
+        "Save disarms itself once it has landed",
+        lambda: _assert(
+            save_button is not None and not save_button.get_sensitive(),
+            "the Save button stayed armed after a successful save",
+        ),
+    )
+
+    # Now the reason the button exists: the profile on disk is derived state
+    # that is only rewritten on launch, so it keeps saying what it said last
+    # time you connected until something puts it back in step.
+    rdp_mod.write_profile(save_vm)
+    check(
+        "the profile the launch wrote carries the account",
+        lambda: _assert(
+            "username=typed-account" in profile_file.read_text(),
+            profile_file.read_text(),
+        ),
+    )
+    save_pane.rdp_user_entry.set_text("second-account")
+    save_pane._on_save_rdp()
+    pump_until(
+        lambda: save_button is not None and not save_button.get_sensitive(),
+        4.0,
+    )
+    check(
+        "Save brings an existing profile back in step",
+        lambda: _assert(
+            "username=second-account" in profile_file.read_text()
+            and "drive=/tmp/shared-typed" in profile_file.read_text(),
+            profile_file.read_text(),
+        ),
+    )
+
+    # Leaving a VM has to release an unsaved edit. Panes are cached, so a
+    # dirty flag that outlives the pane being on screen froze the Account
+    # field for the rest of the session -- the value came back only on a GUI
+    # restart, which is when every cached pane is thrown away. Driven through
+    # select_vm on purpose: calling the pane's method directly would pass even
+    # with the call site removed from the window.
+    save_pane.rdp_user_entry.set_text("typed-then-walked-away")
+    for _ in range(4):
+        GLib.MainContext.default().iteration(True)
+    window.select_vm(VM)
+    window.select_vm(save_vm)
+    pump_until(
+        lambda: save_pane.rdp_user_entry.get_text() == "second-account", 4.0
+    )
+    check(
+        "leaving a VM releases an unsaved RDP edit",
+        lambda: _assert(
+            save_pane.rdp_user_entry.get_text() == "second-account",
+            f"the field still says "
+            f"{save_pane.rdp_user_entry.get_text()!r}; it only came back on a "
+            "GUI restart",
+        ),
+    )
+    check(
+        "and Save is disarmed once the edit is released",
+        lambda: _assert(
+            save_button is not None and not save_button.get_sensitive(),
+            "Save stayed armed after the pane was left and returned to",
+        ),
+    )
+
+    save_pane.close()
+    window.panes.pop(save_vm, None)
+    if profile_file.exists():
+        profile_file.unlink()
+    if registry.exists(save_vm):
+        lifecycle.remove(save_vm)
+
     # ---- closing the window is the one thing that does stop a log timer ----
     # Kept out of the sweep above, and asserted here on a pane that is known to
     # be watching: a timer left running past app shutdown keeps the VM name and

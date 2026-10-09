@@ -250,6 +250,29 @@ class VmPane(Gtk.Box):
         self.share_source.set_wrap(True)
         self.share_source.set_xalign(0.0)
         box.append(self.share_source)
+
+        # One Save for both fields. They used to save themselves on every
+        # keystroke, so each letter queued its own read-modify-write of the
+        # whole vm.toml and two of them landing out of order left the older
+        # text on disk. It also meant quitting mid-word persisted half of it.
+        # They commit together because they are written together: both go
+        # into the one .remmina profile Remmina actually reads.
+        self._rdp_dirty = False
+        self._rdp_save = Gtk.Button(label="Save")
+        self._rdp_save.set_name("vmhub.rdp.save")
+        self._rdp_save.set_tooltip_text(
+            "Write these two settings to vm.toml, and bring this VM's Remmina "
+            "profile back in step with them if it has one."
+        )
+        self._rdp_save.set_sensitive(False)
+        self._rdp_save.connect("clicked", self._on_save_rdp)
+        save_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        save_row.append(self._rdp_save)
+        self._rdp_status = Gtk.Label(label="")
+        self._rdp_status.add_css_class("hint")
+        save_row.append(self._rdp_status)
+        box.append(widgets.field("Save", save_row))
+
         # Set while a refresh pushes values into the entries, so those writes
         # are not mistaken for the user editing them.
         self._rdp_loading = False
@@ -393,65 +416,106 @@ class VmPane(Gtk.Box):
 
         dialog.choose(self.window, None, on_choice)
 
-    def _sync_entry(self, entry: Gtk.Entry, effective: str, saved: str) -> None:
-        """Show `effective` in `entry`, unless the user is editing it.
+    def _sync_entry(self, entry: Gtk.Entry, effective: str) -> None:
+        """Show `effective` in `entry`, unless there is an unsaved edit.
 
-        `saved` is what is on disk for this VM's own setting; `effective` is
-        what is in force, which may come from the blueprint or the app-wide
-        default instead. An entry is refreshed only when it is in step with
-        disk (no edit pending) and does not already show `effective`.
+        `effective` is what is in force, which may come from the blueprint or
+        the app-wide default rather than from this VM's own setting.
+
+        While a field holds an edit the poll must not touch it at all. A
+        rewrite with identical text still moves the caret, which is how "asda"
+        once got saved as "456asda".
+
+        The flag this used was per-entry and was cleared as soon as the text
+        happened to match disk, so a save that failed left the field marked
+        dirty forever and exempt from every later refresh. It is now one
+        pane-wide flag and only Save clears it.
         """
-        current = entry.get_text().strip()
-        if current == saved.strip():
-            # The field agrees with disk, so whatever was typed has been saved
-            # and the next refresh is free to write.
-            entry._vmhub_pending = False
-        elif not getattr(entry, "_vmhub_pending", False) and current != effective:
+        if self._rdp_dirty:
+            return
+        if entry.get_text().strip() != effective:
             entry.set_text(effective)
 
-    def _on_rdp_user_changed(self, entry: Gtk.Entry | None) -> None:
-        """Save the account on the spot. It is one field and one keystroke to
-        undo, and making it a separate step is how it went unset before."""
-        # A handler sweep calls this with a placeholder argument; there is no
-        # entry to read, and there is nothing to save.
-        if entry is None or self._rdp_loading:
+    def _rdp_mark_dirty(self) -> None:
+        """Note that a field holds an edit the poll must leave alone."""
+        self._rdp_dirty = True
+        self._rdp_save.set_sensitive(True)
+        self._rdp_status.set_text("not saved yet")
+
+    def _rdp_values(self) -> tuple[str, str]:
+        """The two settings as they should be written.
+
+        "." is how a VM opts out of a shared default. Empty cannot mean "map
+        nothing", because empty means "use the default".
+        """
+        share = self.share_entry.get_text().strip()
+        return self.rdp_user_entry.get_text().strip(), ("" if share == "." else share)
+
+    def _on_save_rdp(self, _button: object = None) -> None:
+        """Write both fields in one save, then re-derive the profile.
+
+        One save, not one per field and not one per keystroke. It is also the
+        only thing that clears the dirty flag, so the poll cannot put the old
+        value back over an edit on its way to or from here.
+        """
+        if not self._rdp_dirty:
             return
-        text = entry.get_text().strip()
-        # The field now holds an edit that disk does not have yet. Mark it, so
-        # update() leaves it alone until the save below lands -- otherwise the
-        # next poll writes the previous value back over the caret.
-        entry._vmhub_pending = True
+        vm = self.vm
+        user, share = self._rdp_values()
 
         def work(_progress):
-            fresh = registry.load_spec(self.vm)
-            if fresh.media.rdp_user == text:
-                return False
-            fresh.media.rdp_user = text
-            registry.save_spec(fresh)
+            fresh = registry.load_spec(vm)
+            if fresh.media.rdp_user != user or fresh.media.share_path != share:
+                fresh.media.rdp_user = user
+                fresh.media.share_path = share
+                registry.save_spec(fresh)
+            # Refreshed even when the spec was already right: the profile on
+            # disk is derived state and may predate this edit.
+            refreshed = rdp.refresh_profile(vm)
+            self._rdp_profile_note = refreshed is not None
             return True
 
-        widgets.run_task(self.window, work, label=f"Saving RDP account for {self.vm}")
+        def done(_result):
+            self._rdp_dirty = False
+            self._rdp_save.set_sensitive(False)
+            self._rdp_status.set_text(
+                "saved; profile updated"
+                if getattr(self, "_rdp_profile_note", False)
+                else "saved"
+            )
+
+        def failed(exc):
+            # run_task only calls one error handler, so this replaces the
+            # default one and has to take the status entry back itself.
+            status = getattr(self.window, "_vmhub_status", None)
+            if status is not None:
+                status.pop()
+            # The edit stays on screen. Freezing the field on top of a failed
+            # save is what left it permanently out of step with the spec.
+            self.window.report(f"Could not save the RDP settings for {vm}: {exc}")
+
+        widgets.run_task(
+            self.window,
+            work,
+            on_done=done,
+            on_error=failed,
+            label=f"Saving RDP settings for {vm}",
+        )
+
+    def _on_rdp_user_changed(self, entry: Gtk.Entry | None) -> None:
+        """Note the edit; Save commits it.
+
+        A handler sweep calls this with a placeholder argument. There is no
+        entry to read, and so nothing to note.
+        """
+        if entry is None or self._rdp_loading:
+            return
+        self._rdp_mark_dirty()
 
     def _on_share_changed(self, entry: Gtk.Entry | None) -> None:
         if entry is None or self._rdp_loading:
             return
-        text = entry.get_text().strip()
-        # "." is how a VM opts out of a shared default. Empty cannot mean "map
-        # nothing", because empty means "use the default".
-        value = "" if text == "." else text
-        # Same reasoning as the account field: mark the field as holding an edit
-        # the poll must not overwrite.
-        entry._vmhub_pending = True
-
-        def work(_progress):
-            fresh = registry.load_spec(self.vm)
-            if fresh.media.share_path == value:
-                return False
-            fresh.media.share_path = value
-            registry.save_spec(fresh)
-            return True
-
-        widgets.run_task(self.window, work, label=f"Saving shared folder for {self.vm}")
+        self._rdp_mark_dirty()
 
     def _on_share_browse(self, _button: object = None) -> None:
         chooser = Gtk.FileDialog(title="Folder to map into the RDP session")
@@ -481,11 +545,10 @@ class VmPane(Gtk.Box):
                 return
             path = folder.get_path()
             if path:
-                # set_text() emits "changed", which marks the field pending and
-                # saves it. Choosing a folder also used to look like it did
-                # nothing, because the dialog had taken the focus and the poll
-                # put the old path straight back.
-                self.share_entry._vmhub_pending = True
+                # set_text() emits "changed", which marks the field dirty and
+                # arms Save. Choosing a folder used to look like it did nothing,
+                # because the dialog took the focus and the poll put the old
+                # path straight back over it.
                 self.share_entry.set_text(path)
 
         chooser.select_folder(self.window, None, on_selected)
@@ -1532,10 +1595,10 @@ class VmPane(Gtk.Box):
         self._rdp_loading = True
         try:
             fresh = registry.load_spec(status.name)
-            self._sync_entry(self.rdp_user_entry, target.user, fresh.media.rdp_user)
+            self._sync_entry(self.rdp_user_entry, target.user)
             # Blank means "inherit the default", which is what the label below
             # says. "." is only ever what the user types to opt out.
-            self._sync_entry(self.share_entry, "", fresh.media.share_path)
+            self._sync_entry(self.share_entry, "")
         finally:
             self._rdp_loading = False
         own_share = fresh.media.share_path
@@ -2058,7 +2121,29 @@ class VmPane(Gtk.Box):
                 self.status.console_url, report=self.window.report
             )
 
+    def _on_deselected(self) -> None:
+        """Let go of an unsaved edit once this pane is no longer on screen.
+
+        The dirty flag stops the poll writing into the fields, so a pane that
+        kept it showed a stale account for the rest of the session: it came
+        back only when the GUI was restarted and every cached pane was thrown
+        away. Leaving a VM is where an unsaved edit goes now that Save is
+        explicit, so say so, then let the fields resync from the spec.
+
+        Clearing the flag here is also what keeps the message to one: a second
+        call, from close() or from a later switch, sees nothing pending.
+        """
+        if not self._rdp_dirty:
+            return
+        self._rdp_dirty = False
+        self._rdp_save.set_sensitive(False)
+        self._rdp_status.set_text("")
+        self.window.report(
+            f"{self.vm}: the RDP account or shared folder was not saved"
+        )
+
     def close(self) -> None:
+        self._on_deselected()
         self._stop_follow()
 
 

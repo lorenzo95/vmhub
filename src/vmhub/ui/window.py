@@ -479,6 +479,9 @@ class VmhubWindow(Gtk.ApplicationWindow):
         leaving = self.panes.get(self.current) if self.current else None
         if leaving is not None:
             self._tab = leaving.notebook.get_current_page()
+            # The pane stays cached, so an unsaved RDP edit has to be let go
+            # here or its field is frozen for the rest of the session.
+            leaving._on_deselected()
         self.current = name
         if not name:
             self.content.set_visible_child_name("empty")
