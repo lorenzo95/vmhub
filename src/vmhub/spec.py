@@ -53,6 +53,25 @@ DEFAULT_TAG = "7.50"
 # ordinary VM with a web server on it.
 MIN_HOST_PORT = 1024
 
+# Where a port is published when nothing says otherwise. Loopback,
+# so a forward is reachable from this machine only unless a spec
+# asks for more.
+LOOPBACK_BIND = "127.0.0.1"
+
+
+def effective_bind(port: Port, network_bind: str) -> str:
+    """The host address this port is really published on.
+
+    A per-port bind wins. An empty one inherits network_bind, and
+    an empty network_bind falls back to loopback. This was written
+    out three times -- twice in podman and once in the ports table
+    -- which is exactly how a table ends up telling you a port is
+    local while the container is publishing it to the LAN. One
+    answer, used by both.
+    """
+    return port.bind or network_bind or LOOPBACK_BIND
+
+
 _SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGTP]?)(?:i?B)?\s*$", re.IGNORECASE)
 _UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
 

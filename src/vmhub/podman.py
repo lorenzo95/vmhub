@@ -216,7 +216,7 @@ def spec_hash(
         "env": vm_spec.env(uuid=meta_uuid, mac=meta_mac),
         "image": vm_spec.image.ref,
         "ports": {
-            f"{port.bind or vm_spec.network.bind or chr(0x7f)+chr(0x2e)+chr(0x30)+chr(0x2e)+chr(0x31)}:{port.host}": port.guest
+            f"{spec.effective_bind(port, vm_spec.network.bind)}:{port.host}": port.guest
             for port in vm_spec.network.ports
             if port.host
         },
@@ -276,14 +276,15 @@ def run_argv(vm_spec: spec.VmSpec, meta_uuid: str, meta_mac: str, template_disk:
             "--group-add",
             "keep-groups",
         ]
-    default_bind = vm_spec.network.bind or "127.0.0.1"
     for port in vm_spec.network.ports:
         if not port.host:
             continue
-        # Per-port bind wins; empty means "use network.bind".
-        # 127.0.0.1 keeps the forward loopback-only; 0.0.0.0 exposes it
-        # to the LAN; "*" is podman's spelling for the same thing.
-        bind = port.bind or default_bind
+        # spec.effective_bind is the one place this is worked out, so
+        # the -p given here and the scope shown in the ports table
+        # cannot drift apart. 127.0.0.1 keeps the forward
+        # loopback-only; 0.0.0.0 exposes it to the LAN; "*" is
+        # podman's own spelling of the same thing.
+        bind = spec.effective_bind(port, vm_spec.network.bind)
         args += ["-p", f"{bind}:{port.host}:{port.guest}"]
     args += _volume_args(vm_spec.name, template_disk, _share_path(vm_spec), vm_spec)
     for key, value in sorted(vm_spec.env(uuid=meta_uuid, mac=meta_mac).items()):

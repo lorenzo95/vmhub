@@ -24,6 +24,29 @@ DISK_TYPES = ["scsi", "blk", "ide", "sata", "nvme"]
 EXPOSED_BIND = "0.0.0.0"
 EXPOSED_BINDS = frozenset({"0.0.0.0", "*"})
 
+
+def scope_label(bind: str) -> Gtk.Label:
+    """Say how far a published port reaches, without opening a dialog.
+
+    The exposure lived only in a checkbox inside the Change dialog,
+    so the table could not tell you which of your ports were open
+    to the network until you went and looked at every one.
+    """
+    exposed = bind in EXPOSED_BINDS
+    label = Gtk.Label(label="Exposed" if exposed else "Localhost only")
+    label.set_name("vmhub.port.scope")
+    label.add_css_class("warning" if exposed else "hint")
+    label.set_xalign(0.0)
+    label.set_tooltip_text(
+        f"published on host {bind}: "
+        + (
+            "anything that can reach this machine can reach it"
+            if exposed
+            else "only this machine can reach it"
+        )
+    )
+    return label
+
 ROLE_ROWS = {
     "web": ("Web console", 8006),
     "ssh": ("SSH", 22),
@@ -519,6 +542,9 @@ class VmPane(Gtk.Box):
             return
         signature = (
             net.internet,
+            # net.bind is here because a port with no bind of its own
+            # inherits it, and the row shows the inherited value.
+            net.bind,
             tuple(
                 (port.role or "", port.guest, port.host, port.name or "", port.bind)
                 for port in net.ports
@@ -542,14 +568,18 @@ class VmPane(Gtk.Box):
         self._clear_box(self.roles_box)
         self._clear_box(self.ports_box)
         for role in spec.PORT_ROLES:
-            self.roles_box.append(self._role_row(role, net.by_role(role)))
+            self.roles_box.append(
+                self._role_row(role, net.by_role(role), net.bind)
+            )
         extras = [port for port in net.ports if not port.role]
         if extras:
             self.ports_box.append(widgets.section("Also forwarding"))
         for port in extras:
-            self.ports_box.append(self._port_row(port))
+            self.ports_box.append(self._port_row(port, net.bind))
 
-    def _role_row(self, role: str, port: spec.Port | None) -> Gtk.Widget:
+    def _role_row(
+        self, role: str, port: spec.Port | None, net_bind: str
+    ) -> Gtk.Widget:
         title, guest = ROLE_ROWS[role]
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         name = Gtk.Label(label=title)
@@ -562,6 +592,7 @@ class VmPane(Gtk.Box):
             text.set_xalign(0.0)
             text.set_hexpand(True)
             row.append(text)
+            row.append(scope_label(spec.effective_bind(port, net_bind)))
             if role == "rdp":
                 test = Gtk.Button(label="Open in Remmina")
                 test.set_tooltip_text("Write the Remmina profile and open this VM")
@@ -586,7 +617,7 @@ class VmPane(Gtk.Box):
             row.append(add)
         return row
 
-    def _port_row(self, port: spec.Port) -> Gtk.Widget:
+    def _port_row(self, port: spec.Port, net_bind: str) -> Gtk.Widget:
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         name = Gtk.Label(label=port.name or f"guest {port.guest}")
         name.set_xalign(0.0)
@@ -606,6 +637,8 @@ class VmPane(Gtk.Box):
         remove.connect("clicked", lambda _b, p=port: self._on_remove_port(p))
         row.append(name)
         row.append(text)
+        if port.host:
+            row.append(scope_label(spec.effective_bind(port, net_bind)))
         row.append(change)
         row.append(remove)
         return row

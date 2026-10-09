@@ -1581,6 +1581,149 @@ def _probe(app) -> None:
         if saved_flag is not None:
             os.environ["VMHUB_NO_LAUNCH"] = saved_flag
 
+    # ---- the ports table says how far each published port reaches ----
+    # Exposure lived only in a checkbox inside the Change dialog, so the
+    # table could not answer "which of my ports are open to the network"
+    # without opening Change once per row. The label is only worth having
+    # if it matches the -p podman is really given, so most of what follows
+    # is that agreement rather than the wording.
+    scope_vm = f"{VM}-scope"
+    lifecycle.create(scope_vm, blueprint="alpine")
+    scope_pane = VmPane(window, scope_vm)
+
+    def _write_scope_spec(network_bind: str, ssh_bind: str, extra_bind: str) -> None:
+        vm_spec = registry.load_spec(scope_vm)
+        vm_spec.network.bind = network_bind
+        vm_spec.network.ports = [
+            spec.Port(guest=22, host=2222, role="ssh", bind=ssh_bind),
+            spec.Port(guest=8080, host=18080, name="extra", bind=extra_bind),
+        ]
+        vm_spec.validate()
+        registry.save_spec(vm_spec)
+
+    def _row_scopes() -> tuple[list[str], list[str]]:
+        """The scope text on each role row and each extra row."""
+        scope_pane._refresh_ports()
+        roles = [
+            w.get_label()
+            for w in _walk(scope_pane.roles_box)
+            if w.get_name() == "vmhub.port.scope"
+        ]
+        extras = [
+            w.get_label()
+            for w in _walk(scope_pane.ports_box)
+            if w.get_name() == "vmhub.port.scope"
+        ]
+        return roles, extras
+
+    def _expected_scopes() -> list[str]:
+        """What the rows should say, worked out from podman's own argv."""
+        argv = podman.run_argv(registry.load_spec(scope_vm), "uuid", "mac", None)
+        out = []
+        for i, arg in enumerate(argv):
+            if arg != "-p":
+                continue
+            bind = argv[i + 1].split(":")[0]
+            out.append(
+                # Spelled out here on purpose. Inside _probe the name
+                # "pane" is a local holding one VmPane instance, and it
+                # shadows the ui.pane module of the same name.
+                "Exposed" if bind in ("0.0.0.0", "*") else "Localhost only"
+            )
+        return sorted(out)
+
+    _write_scope_spec("127.0.0.1", "", "0.0.0.0")
+    roles, extras = _row_scopes()
+    check(
+        "every published port says how far it reaches",
+        lambda: _assert(
+            roles == ["Localhost only"] and extras == ["Exposed"],
+            f"the ssh row says {roles}, the extra row says {extras}",
+        ),
+    )
+    check(
+        "what the row says is what podman is actually given",
+        lambda: _assert(
+            sorted(roles + extras) == _expected_scopes(),
+            f"rows say {sorted(roles + extras)}, argv implies "
+            f"{_expected_scopes()}",
+        ),
+    )
+
+    # A port with no bind of its own inherits network.bind, so a
+    # network-wide exposure reaches ports that never mention it. Reading
+    # only port.bind calls these local while podman publishes them to the
+    # LAN. It also proves _refresh_ports notices network.bind: without it
+    # in the signature the refresh below returns early and the row is
+    # still saying "Localhost only".
+    _write_scope_spec("0.0.0.0", "", "0.0.0.0")
+    roles, extras = _row_scopes()
+    check(
+        "a port that inherits a network-wide exposure says so",
+        lambda: _assert(
+            roles == ["Exposed"] and extras == ["Exposed"],
+            f"the ssh row still says {roles} after network.bind went to "
+            "0.0.0.0",
+        ),
+    )
+
+    # And the other direction: a network-wide loopback bind does not drag
+    # a per-port 0.0.0.0 back to local.
+    _write_scope_spec("127.0.0.1", "", "0.0.0.0")
+    roles, extras = _row_scopes()
+    check(
+        "a per-port exposure survives a loopback network bind",
+        lambda: _assert(
+            roles == ["Localhost only"] and extras == ["Exposed"],
+            f"the ssh row says {roles}, the extra row says {extras}",
+        ),
+    )
+
+    # The flow the user actually complained about: tick the box once and
+    # the table says so, with no need to reopen anything.
+    edit_dialogs: list = []
+    saved_present = widgets.TextPrompt.present
+    widgets.TextPrompt.present = lambda self: (
+        edit_dialogs.append(self), saved_present(self)
+    )[1]
+    try:
+        extra_port = registry.load_spec(scope_vm).network.ports[1]
+        scope_pane._on_change_port(extra_port)
+        dialog = edit_dialogs[-1] if edit_dialogs else None
+        expose_box = find_named(dialog, "vmhub.port.expose")
+        if expose_box is None:
+            check(
+                "ticking the expose box updates the row",
+                lambda: _assert(
+                    False, "the Change dialog opened without its expose checkbox"
+                ),
+            )
+        else:
+            expose_box.set_active(False)
+            settle_dialog()
+            dialog.accept_button.emit("clicked")
+            pump_until(
+                lambda: registry.load_spec(scope_vm)
+                .network.ports[1]
+                .bind
+                == ""
+            )
+            roles, extras = _row_scopes()
+            check(
+                "ticking the expose box updates the row without reopening it",
+                lambda: _assert(
+                    extras == ["Localhost only"],
+                    f"after unticking, the extra row says {extras}",
+                ),
+            )
+    finally:
+        widgets.TextPrompt.present = saved_present
+
+    scope_pane.close()
+    window.panes.pop(scope_vm, None)
+    if registry.exists(scope_vm):
+        lifecycle.remove(scope_vm)
+
     # ---- closing the window is the one thing that does stop a log timer ----
     # Kept out of the sweep above, and asserted here on a pane that is known to
     # be watching: a timer left running past app shutdown keeps the VM name and
