@@ -696,6 +696,72 @@ def _probe(app) -> None:
             "  \033[31mFAIL\033[0m  selecting a VM asked to save its spec: "
             f"{writes}"
         )
+    # ---- the internet checkbox must not save the spec it was built from ----
+    # set_active() emits "toggled", so a refresh that populates the
+    # checkbox from the spec also calls the handler that writes it.
+    # That made selecting a VM rewrite vm.toml. The handler also has to
+    # ignore a widget nobody has populated yet: a Gtk.CheckButton
+    # defaults to False, and the sweep above reaches every _on* handler
+    # with None for a parameter it has no value for, so the checkbox
+    # could be read before it meant anything. That is what put
+    # internet = false into a real VM's spec and put it on an
+    # --internal network with no gateway.
+    victim_spec = paths.spec_path(victim)
+    before_refresh = victim_spec.read_text()
+    fresh_pane = VmPane(window, victim)
+    fresh_pane._refresh_ports()
+    check(
+        "refreshing the ports tab does not rewrite the spec",
+        lambda: _assert(
+            victim_spec.read_text() == before_refresh,
+            "vm.toml changed on a plain refresh",
+        ),
+    )
+
+    # The handler reached with a widget that was never populated, which
+    # is what the sweep does. Must be a no-op on the spec.
+    unsynced = Gtk.CheckButton()
+    stale_pane = VmPane(window, victim)
+    stale_pane._on_internet_toggled(unsynced)
+    pump_until(lambda: False, 0.4)
+    check(
+        "the internet handler ignores an unsynced checkbox",
+        lambda: _assert(
+            victim_spec.read_text() == before_refresh,
+            "an unpopulated checkbox changed the spec",
+        ),
+    )
+
+    # And a real click, after a refresh has populated the widget, must
+    # still reach the spec. Without this the two checks above would also
+    # pass for a checkbox wired to nothing.
+    real_pane = VmPane(window, victim)
+    real_pane._refresh_ports()
+    wanted = not registry.load_spec(victim).network.internet
+    real_pane.internet_check.set_active(wanted)
+    pump_until(
+        lambda: registry.load_spec(victim).network.internet == wanted,
+        4.0,
+    )
+    check(
+        "clicking the internet checkbox saves the new value",
+        lambda: _assert(
+            registry.load_spec(victim).network.internet == wanted,
+            f"spec says internet={registry.load_spec(victim).network.internet}, "
+            f"clicked {wanted}",
+        ),
+    )
+    # Put the victim back so the rest of the run, and the user, see it as
+    # they left it.
+    real_pane.internet_check.set_active(not wanted)
+    pump_until(
+        lambda: registry.load_spec(victim).network.internet == (not wanted),
+        4.0,
+    )
+    fresh_pane.close()
+    stale_pane.close()
+    real_pane.close()
+
     window.select_vm(VM)
     window.panes.pop(victim, None)
     if registry.exists(victim):

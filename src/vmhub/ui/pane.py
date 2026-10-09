@@ -527,8 +527,18 @@ class VmPane(Gtk.Box):
         if signature == self._ports_signature:
             return
         self._ports_signature = signature
+        # Populate the widget from the spec without letting the write
+        # count as a user choice. The guard has to be in a finally:
+        # leaving it set would silently disable every later click.
         if self.internet_check.get_active() != net.internet:
-            self.internet_check.set_active(net.internet)
+            self._internet_syncing = True
+            try:
+                self.internet_check.set_active(net.internet)
+            finally:
+                self._internet_syncing = False
+        # From here on the widget means what the spec says, so a
+        # toggle is a real choice rather than a default leaking out.
+        self._internet_ready = True
         self._clear_box(self.roles_box)
         self._clear_box(self.ports_box)
         for role in spec.PORT_ROLES:
@@ -926,6 +936,18 @@ class VmPane(Gtk.Box):
         widgets.run_task(self.window, work, label="Saving the port")
 
     def _on_internet_toggled(self, button: Gtk.CheckButton) -> None:
+        # A refresh setting the widget emits "toggled"; that is the
+        # pane telling the checkbox what the spec says, not a user
+        # asking for a change.
+        if getattr(self, "_internet_syncing", False):
+            return
+        # Before the first refresh the widget holds a Gtk default,
+        # not this VM's value. Saving it would put an invented
+        # choice into vm.toml. guicheck's handler sweep reaches
+        # here with button=None for the same reason.
+        if button is None or not getattr(self, "_internet_ready", False):
+            return
+
         def work(progress):
             vm_spec = registry.load_spec(self.vm)
             vm_spec.network.internet = button.get_active()
@@ -1119,6 +1141,15 @@ class VmPane(Gtk.Box):
             "On: the guest shares the host network and can reach the internet."
         )
         self.internet_check.connect("toggled", self._on_internet_toggled)
+        # Set while the pane is writing the spec's value into the
+        # widget. set_active() emits "toggled", so without this the
+        # refresh would call the handler that writes the spec, and
+        # merely opening a VM would rewrite its vm.toml.
+        self._internet_syncing = False
+        # Set once a refresh has populated the checkbox. Until then
+        # the widget holds a Gtk default rather than the VM's value,
+        # and a handler that reads it would save that default.
+        self._internet_ready = False
         box.append(self.internet_check)
 
         # Refreshed on every poll now, so remember what is on screen: a pane
