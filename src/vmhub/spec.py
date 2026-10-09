@@ -72,6 +72,24 @@ def effective_bind(port: Port, network_bind: str) -> str:
     return port.bind or network_bind or LOOPBACK_BIND
 
 
+# The one bind value the "Expose on the network" checkbox writes, and
+# the set of spellings that count as it. "*" is podman's own way of
+# writing the same thing, so a spec written by hand with "*" reads as
+# exposed rather than quietly not-exposed.
+EXPOSED_BIND = "0.0.0.0"
+EXPOSED_BINDS = frozenset({"0.0.0.0", "*"})
+
+
+def is_exposed(bind: str) -> bool:
+    """True when anything that can reach this host can reach the port.
+
+    One predicate, because the ports table and `vmctl ports list` both
+    have to answer this and a table that disagrees with the command
+    line is worse than either alone.
+    """
+    return bind in EXPOSED_BINDS
+
+
 _SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGTP]?)(?:i?B)?\s*$", re.IGNORECASE)
 _UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
 

@@ -149,6 +149,15 @@ def cmd_info(args: argparse.Namespace, out: Out) -> int:
     meta = registry.load_meta(args.name)
     vm_spec = registry.load_spec(args.name)
     out.say(out.bold(f"{item.name}"))
+    # Which published ports are reachable from off this machine. A port
+    # with no bind of its own inherits network.bind, so this has to be
+    # worked out per port rather than read off the network default.
+    exposed_hosts = {
+        port.host
+        for port in vm_spec.network.ports
+        if port.host
+        and spec.is_exposed(spec.effective_bind(port, vm_spec.network.bind))
+    }
     rows = [
         ("state", item.summary),
         ("blueprint", item.blueprint or "-"),
@@ -164,14 +173,23 @@ def cmd_info(args: argparse.Namespace, out: Out) -> int:
         ("clone of", item.template_source or "-"),
         ("dependents", ", ".join(item.dependents) or "-"),
         ("console", item.console_url or "-"),
-        ("host ports", ", ".join(f"{h}->{g}" for h, g in sorted(item.ports.items())) or "-"),
+        ("host ports", ", ".join(
+            f"{h}->{g}" + ("  [exposed]" if h in exposed_hosts else "")
+            for h, g in sorted(item.ports.items())
+        ) or "-"),
         ("guest ports", ", ".join(str(p) for p in item.guest_ports) or "-"),
         ("snapshots", ", ".join(item.snapshots) or "-"),
         ("boot media", item.boot_image or "-"),
         ("internet", "allowed" if vm_spec.network.internet else "blocked (--internal)"),
         ("peer dial", ", ".join(item.peer_targets)
             if item.peer_targets
-            else f"loopback only (set network.bind=0.0.0.0 to expose, or a per-port --bind)"),
+            else (
+                f"{len(exposed_hosts)} port(s) reachable from the network; "
+                "the rest are loopback only"
+                if exposed_hosts
+                else "loopback only (set network.bind=0.0.0.0 to expose, "
+                "or a per-port --bind)"
+            )),
         ("shutdown", f"timeout {vm_spec.shutdown.timeout}s"
             + (", no ACPI" if vm_spec.shutdown.skip_acpi else ", ACPI")),
         ("disk has data", "yes" if item.has_disk_data else "no (not installed yet)"),
@@ -823,6 +841,22 @@ def cmd_config_path(args: argparse.Namespace, out: Out) -> int:
     return 0
 
 
+def port_scope(port: spec.Port, network_bind: str) -> str:
+    """How far one port reaches, in the same words the ports table uses.
+
+    This used to print bind= only when the port had a bind of its own,
+    so a port inheriting a network-wide 0.0.0.0 was listed exactly like
+    a loopback one: the one case you most want to notice was the one
+    case the list stayed quiet about.
+    """
+    if not port.host:
+        return ""
+    effective = spec.effective_bind(port, network_bind)
+    if spec.is_exposed(effective):
+        return f"  bind={effective}  exposed to the network"
+    return f"  bind={effective}  localhost only"
+
+
 def cmd_ports(args: argparse.Namespace, out: Out) -> int:
     action = getattr(args, "ports_action", "list")
     vm_spec = registry.load_spec(args.name)
@@ -847,7 +881,12 @@ def cmd_ports(args: argparse.Namespace, out: Out) -> int:
             else:
                 note = out.good("free")
             role = f"  [{port.role}]" if port.role else ""
-            bind = f"  bind={port.bind}" if port.bind else ""
+            scope_text = port_scope(port, net.bind)
+            bind = (
+                out.warn(scope_text)
+                if "exposed to the network" in scope_text
+                else out.dim(scope_text)
+            )
             left = f"{port.host if port.host else '-':>5} -> {port.guest:<6}"
             out.say(f"{left}  {port.label}{role}{bind}  {note}")
         forward = ", ".join(str(p) for p in sorted(net.guest_ports)) or "none"

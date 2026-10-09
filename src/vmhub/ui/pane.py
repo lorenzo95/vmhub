@@ -10,20 +10,13 @@ from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
 from .. import blueprints, disk, export, iso as isomod, lifecycle, paths, podman, rdp, registry, settings, spec  # noqa: E402
 from ..errors import VmhubError  # noqa: E402
+# The exposure vocabulary is spec's, not the UI's: vmctl prints the
+# same words. Re-exported here so the ports tab and its tests can say
+# pane.EXPOSED_BINDS.
+from ..spec import EXPOSED_BIND, EXPOSED_BINDS  # noqa: E402,F401
 from . import style, widgets, workers  # noqa: E402
 
 DISK_TYPES = ["scsi", "blk", "ide", "sata", "nvme"]
-
-# The three ports vmhub drives itself: the title shown for the row, and the
-# guest port behind it. web is the container's own display rather than a
-# guest service, which is why it is never gated on network.guest_ports.
-# The one bind value the "Expose on the network" checkbox means, and
-# the set of spellings that count as it. "*" is podman's own way of
-# writing the same thing, so a spec written by hand with "*" shows the
-# box ticked rather than silently reading as not-exposed.
-EXPOSED_BIND = "0.0.0.0"
-EXPOSED_BINDS = frozenset({"0.0.0.0", "*"})
-
 
 def scope_label(bind: str) -> Gtk.Label:
     """Say how far a published port reaches, without opening a dialog.
@@ -32,7 +25,7 @@ def scope_label(bind: str) -> Gtk.Label:
     so the table could not tell you which of your ports were open
     to the network until you went and looked at every one.
     """
-    exposed = bind in EXPOSED_BINDS
+    exposed = spec.is_exposed(bind)
     label = Gtk.Label(label="Exposed" if exposed else "Localhost only")
     label.set_name("vmhub.port.scope")
     label.add_css_class("warning" if exposed else "hint")
@@ -46,6 +39,10 @@ def scope_label(bind: str) -> Gtk.Label:
         )
     )
     return label
+
+# The three ports vmhub drives itself: the title shown for the row, and the
+# guest port behind it. web is the container's own display rather than a
+# guest service, which is why it is never gated on network.guest_ports.
 
 ROLE_ROWS = {
     "web": ("Web console", 8006),
@@ -747,7 +744,7 @@ class VmPane(Gtk.Box):
         # redundant "127.0.0.1" into every port in vm.toml.
         expose_check = Gtk.CheckButton(label="Expose on the network")
         expose_check.set_name("vmhub.port.expose")
-        expose_check.set_active(bind in EXPOSED_BINDS)
+        expose_check.set_active(spec.is_exposed(bind))
         expose_check.set_tooltip_text(
             "Off: only this machine can reach the port. "
             "On: anything that can reach this host on the network "
