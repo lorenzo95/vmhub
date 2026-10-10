@@ -5,7 +5,7 @@ import shutil
 import socket
 from pathlib import Path
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import quote
 
 from . import registry, settings
@@ -31,13 +31,41 @@ SESSION_WIDTH = 1920
 SESSION_HEIGHT = 1080
 
 
+def shipped_resolution() -> str:
+    """The resolution this release ships with."""
+    return f"{SESSION_WIDTH}x{SESSION_HEIGHT}"
+
+
+def default_resolution() -> str:
+    """What RDP sessions ask for: the user's choice, else the shipped size.
+
+    Read per call, like spec.default_tag() and for the same reason: a module
+    constant would be frozen when the process started, so a preference saved
+    from the running GUI would not apply until the next launch.
+    """
+    return settings.get("rdp_resolution").strip() or shipped_resolution()
+
+
+def resolution_size(resolution: str | None = None) -> tuple[int, int]:
+    """(width, height) for a resolution, falling back if it is unusable.
+
+    The fallback matters because this runs against the Remmina profile too,
+    and a value can reach it from a hand-edited settings.toml that load()
+    would have rejected -- a defensive parse, not a second validation.
+    """
+    width, sep, height = (resolution or default_resolution()).partition("x")
+    if not sep or not width.isdigit() or not height.isdigit():
+        return SESSION_WIDTH, SESSION_HEIGHT
+    return int(width), int(height)
+
+
 @dataclass
 class RdpTarget:
     host: str
     port: int
     user: str
     password: str
-    resolution: str = f"{SESSION_WIDTH}x{SESSION_HEIGHT}"
+    resolution: str = field(default_factory=default_resolution)
 
     def __post_init__(self) -> None:
         # A default password only makes sense next to a known account; with no
@@ -170,16 +198,27 @@ def probe(vm: str, timeout: float = 6.0) -> tuple[bool, str]:
 
 
 PROFILE_GROUP = "vmhub"
-PROFILE_FIELDS = {
-    "resolution_width": SESSION_WIDTH,
-    "resolution_height": SESSION_HEIGHT,
-    "resolution_mode": 0,
-    "colordepth": 63,
-    "viewmode": 1,
-    # The window the session is shown in, sized to the session rather
-    # than to whatever Remmina last remembered.
-    "window_width": SESSION_WIDTH,
-    "window_height": SESSION_HEIGHT,
+
+
+def profile_fields() -> dict[str, object]:
+    """The Remmina profile keys, sized to the resolution in effect now.
+
+    A function rather than a dict built at import, for the reason
+    default_resolution() gives: a module-level dict is frozen when the process
+    starts, so a preference saved from the running GUI would not reach the
+    profile until the next launch.
+    """
+    width, height = resolution_size()
+    return {
+        "resolution_width": width,
+        "resolution_height": height,
+        "resolution_mode": 0,
+        "colordepth": 63,
+        "viewmode": 1,
+        # The window the session is shown in, sized to the session rather
+        # than to whatever Remmina last remembered.
+        "window_width": width,
+        "window_height": height,
     # Spelled out rather than omitted. Remmina saves its window state
     # back into this same file, so leaving the key out would let a
     # remembered maximize quietly decide the window instead of us.
@@ -237,7 +276,7 @@ def write_profile(vm: str) -> Path:  # noqa: D401
         "password=",
         f"group={PROFILE_GROUP}",
     ]
-    lines += [f"{key}={value}" for key, value in PROFILE_FIELDS.items()]
+    lines += [f"{key}={value}" for key, value in profile_fields().items()]
 
     # Drive mapping. The key is "drive", and it is the only one: this Remmina's
     # RDP plugin registers `drive`, with `sharefolder` kept only as a deprecated

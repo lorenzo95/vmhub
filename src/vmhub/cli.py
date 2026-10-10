@@ -813,8 +813,19 @@ def cmd_config(args: argparse.Namespace, out: Out) -> int:
     values = settings.load()
     out.say(out.bold("KEY"))
     for key, description in sorted(settings.FIELDS.items()):
-        shown = values.get(key) or out.dim("(unset)")
-        out.say(f"{key:<14} {shown}")
+        value = values.get(key, "").strip()
+        if value:
+            out.say(f"{key:<14} {value}")
+        else:
+            # Show what the field resolves to, not "(unset)". Asked what a new
+            # VM will pull, "(unset)" says nothing and the answer -- the
+            # shipped pin -- appears nowhere on the screen. The wording keeps
+            # the difference visible: a dimmed value is one you did not choose.
+            fallback = settings.fallback(key)
+            if fallback:
+                out.say(f"{key:<14} {out.dim(f'{fallback}  (shipped default)')}")
+            else:
+                out.say(f"{key:<14} {out.dim('(unset)')}")
         out.say(out.dim(f"               {description}"))
     out.say()
     out.say(out.dim(f"stored in {settings.config_path()}"))
@@ -828,6 +839,11 @@ def cmd_config_set(args: argparse.Namespace, out: Out) -> int:
         return 2
     try:
         path = settings.set_value(args.key, args.value)
+    except settings.SettingError as exc:
+        # A traceback is the worst possible answer to a typo in a tag. Say
+        # which value and why, the way every other complaint here is said.
+        out.say(out.bad(str(exc)))
+        return 1
     except OSError as exc:
         out.say(out.bad(f"could not write {settings.config_path()}: {exc}"))
         return 1
@@ -1042,16 +1058,18 @@ def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
         # qemu-img aborted the table instead of being reported in it.
         qemu_img, qemu_img_ok = str(exc), False
     has_podman = shutil.which("podman") is not None
-    # Report where the pin points and whether it is here. Deliberately
-    # verdict-free: an unpulled image is pulled on first start, so failing
-    # doctor over it would be wrong.
-    pinned_image = spec.Image().ref
+    # Report the image new VMs will pull and whether it is here. It follows
+    # the image_tag preference, so this is the user's choice and not always
+    # the shipped pin -- the label stays "qemu image" rather than claiming to
+    # name a pin. Deliberately verdict-free: an unpulled image is pulled on
+    # first start, so failing doctor over it would be wrong.
+    default_image = spec.Image().ref
     if not has_podman:
-        pinned_image_state = "unknown"
-    elif podman.image_present(pinned_image):
-        pinned_image_state = "local"
+        default_image_state = "unknown"
+    elif podman.image_present(default_image):
+        default_image_state = "local"
     else:
-        pinned_image_state = "not pulled"
+        default_image_state = "not pulled"
     rootless = podman.is_rootless()
     has_kvm = podman.host_has_kvm()
     checks = [
@@ -1063,7 +1081,7 @@ def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
         ("rootless net", net_helper or "MISSING: passt (or slirp4netns)", bool(net_helper)),
         ("qemu-img", qemu_img, qemu_img_ok),
         ("host /dev/kvm", "readable" if has_kvm else "NOT ACCESSIBLE", has_kvm),
-        ("qemu image", f"{pinned_image}  ({pinned_image_state})", True),
+        ("qemu image", f"{default_image}  ({default_image_state})", True),
         ("python gi/gtk", "importable" if not gui_missing else f"MISSING: {', '.join(gui_missing)}", not gui_missing),
         ("free space", spec.format_size(os.statvfs(root).f_bavail * os.statvfs(root).f_frsize) if root else "", True),
         ("init system", autostart.detect_init(), True),

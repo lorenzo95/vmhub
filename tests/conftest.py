@@ -7,6 +7,11 @@ access path -- so pointing the variable at a temp directory re-points every
 path helper there is. There is no import that could have bypassed the
 substitution and no cache that could have gone stale.
 
+``VMHUB_CONFIG`` is redirected alongside it for the same reason, and now
+matters more than the first one: ``settings.load()`` reads that file on every
+``spec.Image()`` construction, so an unredirected settings.toml would put the
+person's own preferences into every test in the suite.
+
 Two rules for tests in this suite:
 
 1. Never call ``monkeypatch.undo()``. It undoes *every* monkeypatch, including
@@ -35,11 +40,20 @@ from vmhub.errors import ProjectRootError
 @pytest.fixture
 def project_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A project root that satisfies the marker check, isolated from the real one."""
+    from vmhub import settings
+
     root = tmp_path / "vmhub"
     (root / paths.BLUEPRINTS_DIR).mkdir(parents=True)
     (root / "vmctl").write_text("#!/bin/sh\n# test sandbox\n")
     monkeypatch.setenv(paths.ENV_HOME, str(root))
     monkeypatch.chdir(root)
+    # Not optional: spec.Image() resolves its default tag through
+    # settings, which reads the file below on every construction. Without
+    # this, every test that builds an Image inherits whatever tag the person
+    # running the suite has set -- so `vmctl config set image_tag latest`
+    # would fail test_default_image_ref_follows_the_pin on their machine and
+    # pass on CI, which is the worst possible direction for that failure.
+    monkeypatch.setenv(settings.ENV_CONFIG, str(tmp_path / "settings.toml"))
     return root
 
 

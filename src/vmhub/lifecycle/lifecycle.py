@@ -72,9 +72,12 @@ def create(
         vm_spec.boot.iso = boot_iso
     if image is not None:
         repository, tag = spec.split_image_ref(image)
+        # default_tag(), not DEFAULT_TAG: `--image docker.io/qemux/qemu` with
+        # no tag is a request for "the usual one", which is whatever the user
+        # has chosen, not whatever shipped the day the code was written.
         vm_spec.image = spec.Image(
             repository=repository or spec.DEFAULT_REPO,
-            tag=tag or spec.DEFAULT_TAG,
+            tag=tag or spec.default_tag(),
         )
     progress("Allocating host ports...")
     allocated = ports.allocate_all()

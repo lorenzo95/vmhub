@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from . import paths, toml_io
+from . import paths, settings, toml_io
 from .errors import SpecError
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$")
@@ -38,6 +38,22 @@ DEFAULT_REPO = "docker.io/qemux/qemu"
 # pointed at when this was pinned -- byte-identical, so pinning changes
 # nothing that is already running, it only stops it from moving later.
 DEFAULT_TAG = "7.50"
+
+
+def default_tag() -> str:
+    """The tag a VM gets when nothing else says otherwise.
+
+    The user's preference first, then the shipped pin. The pin stays the
+    fallback rather than the winner so that an install with no settings file
+    -- and every existing install -- behaves exactly as it did before this
+    was configurable. Empty means unset in settings, so it falls through here
+    instead of becoming an image ref of "docker.io/qemux/qemu:".
+
+    Read fresh every call on purpose: settings.load() is uncached so that a
+    preference saved in the running GUI applies to the next VM created in that
+    same session. See settings.py.
+    """
+    return settings.get("image_tag").strip() or DEFAULT_TAG
 
 # The lowest host port vmhub will publish. vmhub runs rootless, as a
 # normal user, so binding a host port below this needs
@@ -155,7 +171,11 @@ def validate_name(name: str) -> str:
 @dataclass
 class Image:
     repository: str = DEFAULT_REPO
-    tag: str = DEFAULT_TAG
+    # default_factory, not a plain default, so the tag is resolved when an
+    # Image is built rather than frozen at import time: preferences are
+    # editable from the running GUI, and a module-level default would hand
+    # out the tag that was set when the process started.
+    tag: str = field(default_factory=default_tag)
 
     @property
     def ref(self) -> str:

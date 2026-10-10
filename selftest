@@ -620,9 +620,13 @@ def main() -> int:
           "username=gero" in shared_text,
           [line for line in shared_text.splitlines() if line.startswith("username")])
     window_lines = [ln for ln in shared_text.splitlines() if ln.startswith("window")]
+    # profile_fields(), not a module dict: the size follows the rdp_resolution
+    # preference, and a dict frozen at import would not see a setting changed
+    # earlier in this same run.
+    _fields = rdp.profile_fields()
     check("the window is sized to the session it shows",
-          f"window_width={rdp.PROFILE_FIELDS['resolution_width']}" in shared_text
-          and f"window_height={rdp.PROFILE_FIELDS['resolution_height']}" in shared_text,
+          f"window_width={_fields['resolution_width']}" in shared_text
+          and f"window_height={_fields['resolution_height']}" in shared_text,
           window_lines)
     check("and is not maximized behind Remmina's back",
           "window_maximize=0" in shared_text, window_lines)

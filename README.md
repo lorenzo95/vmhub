@@ -653,6 +653,35 @@ starts with no VMs listed. You should not have to add it by hand; if a menu
 entry ever shows an empty window, `./vmctl desktop status` will tell you which
 file it is reading.
 
+## Defaults
+
+`vmctl config` holds the choices you make once for the whole install, stored
+outside the checkout in `~/.config/vmhub/settings.toml` so they survive a
+re-clone. The same fields are in **Preferences** in the GUI.
+
+```bash
+vmctl config show                  what is set, and where it lives
+vmctl config set image_tag 8.1.2   the QEMU version new VMs get
+vmctl config set image_tag latest  ...or follow the newest build
+vmctl config path                  the file itself
+```
+
+The QEMU image tag ships pinned to a tested version (`7.50`) rather than
+`latest`, because `latest` moves — a rebuild can change the QEMU under VMs
+that are already running. Set `image_tag` to move your own default; leave it
+empty and every new VM gets the shipped pin. It only ever changes what *new*
+VMs start on: a VM whose `vm.toml` already names a tag keeps it, and
+`vmctl new --image`, or `vmctl set <vm> image.tag=…`, still overrides both.
+
+RDP sessions open at `1920x1080`, and the window is sized to match rather
+than to whatever Remmina last remembered:
+
+```bash
+vmctl config set rdp_resolution 2560x1440
+```
+
+Changing it takes effect on the next connection — no restart needed.
+
 ## CLI reference
 
 ```

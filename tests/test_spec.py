@@ -379,3 +379,86 @@ def test_is_bind_address_distinguishes_ipv4_from_garbage() -> None:
     assert spec_mod._is_bind_address("::1") is False
     assert spec_mod._is_bind_address("256.0.0.1") is False
     assert spec_mod._is_bind_address("1.2.3") is False
+
+
+def _prefer(tag: str) -> None:
+    """Set the image_tag preference the way the preferences dialog does."""
+    from vmhub import settings
+
+    settings.set_value("image_tag", tag)
+
+
+def test_a_chosen_tag_becomes_the_default_for_new_vms() -> None:
+    """The feature: what the user picks here is what a new VM boots."""
+    _prefer("8.1.2")
+    assert spec.Image().ref == "docker.io/qemux/qemu:8.1.2"
+
+
+def test_latest_can_be_chosen_on_purpose() -> None:
+    """The shipped pin exists because "latest" moves under running VMs. That
+    argues for pinning the default, not for refusing the word: someone who
+    wants the newest build is answering a different question than the one the
+    default answers."""
+    _prefer("latest")
+    assert spec.Image().ref == "docker.io/qemux/qemu:latest"
+
+
+def test_clearing_the_preference_goes_back_to_the_shipped_pin() -> None:
+    """Empty means unset, not "an empty tag"."""
+    _prefer("8.1.2")
+    _prefer("")
+    assert spec.Image().tag == spec.DEFAULT_TAG
+
+
+def test_an_unset_preference_never_yields_a_half_written_image_ref() -> None:
+    """`repository or DEFAULT` and `tag or default` is how the empty string
+    was reaching the ref at all; this is the shape of the bug it would
+    produce."""
+    _prefer("")
+    assert not spec.Image().ref.endswith(":")
+    assert spec.Image().ref == f"{spec.DEFAULT_REPO}:{spec.DEFAULT_TAG}"
+
+
+def test_the_shipped_pin_does_not_move_when_a_preference_is_set() -> None:
+    """DEFAULT_TAG is what a fresh install with no settings file gets, and
+    the pin is the tested one. Setting a preference must not quietly retag
+    the version this release was verified against."""
+    _prefer("8.1.2")
+    assert spec.DEFAULT_TAG == "7.50"
+    assert spec.DEFAULT_TAG != "latest"
+
+
+def test_the_tag_is_resolved_when_an_image_is_built_not_at_import() -> None:
+    """A dataclass default is evaluated once, at class creation. That is
+    fine for a constant and wrong here: preferences are editable from the
+    running GUI, and an import-time default would keep handing out the tag
+    that was set when the process started."""
+    first = spec.Image().tag
+    _prefer("8.1.2")
+    assert first == spec.DEFAULT_TAG
+    assert spec.Image().tag == "8.1.2"
+
+
+def test_a_blueprint_that_names_no_image_inherits_the_preference() -> None:
+    """alpine/debian13/win11/winserver2022 all omit [image] entirely, so this
+    is the path a new VM from any stock blueprint actually takes."""
+    _prefer("8.1.2")
+    assert spec.spec_from_dict({"name": "demo"}).image.tag == "8.1.2"
+
+
+def test_a_vm_that_names_its_own_tag_is_not_rewritten() -> None:
+    """The preference is a default for new machines, not an upgrade. A VM
+    already on 7.40 has to stay there: moving it is not what changing a
+    default means, and the user did not ask for their running VMs to change."""
+    _prefer("8.1.2")
+    vm_spec = spec.spec_from_dict({"name": "demo", "image": {"tag": "7.40"}})
+    assert vm_spec.image.ref == "docker.io/qemux/qemu:7.40"
+
+
+def test_an_explicit_repository_still_pairs_with_the_chosen_tag() -> None:
+    """Splitting a reference the other way round must not break the default:
+    the tag is a default whichever half of the ref was given."""
+    _prefer("8.1.2")
+    repository, tag = spec.split_image_ref("registry.example:5000/qemu")
+    assert repository == "registry.example:5000/qemu"
+    assert (tag or spec.default_tag()) == "8.1.2"
