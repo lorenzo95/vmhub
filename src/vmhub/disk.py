@@ -192,6 +192,35 @@ def convert(src: Path, dst: Path, fmt: str, *, compress: bool = True) -> None:
     run(args, timeout=6 * 3600)
 
 
+def copy_sparse(src: Path, dst: Path) -> None:
+    """Byte-for-byte copy that keeps both the holes and the snapshots.
+
+    Two things go wrong if this is done naively. A plain read/write copy is
+    not sparse-aware, so a 64 GiB image holding 200 MiB becomes a 64 GiB
+    file. And qemu-img convert, which does handle sparseness, writes the
+    image's *current* state as a new image -- internal snapshots are points
+    in the old one and do not come across. Proven on a real disk: copy
+    kept 1 snapshot, convert kept 0.
+
+    So a disk with no backing file is copied and nothing is lost. A disk
+    with one still has to go through convert, because a copy would carry a
+    backing reference to a path that is not in the bundle.
+    """
+    if Path(dst).exists():
+        raise DiskError(f"destination already exists: {dst}")
+    if not Path(src).is_file():
+        raise NotFound(f"no such disk: {src}")
+    proc = subprocess.run(
+        ["cp", "--sparse=always", "--", str(src), str(dst)],
+        capture_output=True,
+        text=True,
+        timeout=6 * 3600,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise DiskError(f"copying {src} failed: {detail}")
+
+
 def rebase(path: Path, backing: Path | None, *, backing_fmt: str = "qcow2") -> None:
     if backing is None:
         run(["rebase", "-f", "qcow2", "-u", "-b", "", "--", str(path)])

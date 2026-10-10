@@ -71,6 +71,7 @@ def export_vm(
         (staging / "disk").mkdir(parents=True)
 
         chain = disk.backing_chain(disk_file)
+        exported = staging / "disk" / paths.DISK_NAME
         if len(chain) > 1:
             # qemu-img convert resolves the chain as it writes, so the exported
             # disk is standalone. Copying the overlay file instead would carry a
@@ -81,16 +82,23 @@ def export_vm(
                 f"The chain holds {spec.format_size(disk.chain_used(disk_file))} of real "
                 f"data, so this copies far more than the clone alone:"
             )
+            disk.convert(disk_file, exported, "qcow2")
         else:
+            # Standalone disk: copy it. Convert was used here too, and it
+            # dropped the disk's internal snapshots -- the bundle came back
+            # with nothing to revert to. This used to say "Copying disk
+            # (sparse-aware)" while converting anyway.
             progress("Copying disk (sparse-aware)...")
-        disk.convert(disk_file, staging / "disk" / paths.DISK_NAME, "qcow2")
-        exported = staging / "disk" / paths.DISK_NAME
+            disk.copy_sparse(disk_file, exported)
         disk_entry = {
             "file": paths.DISK_NAME,
             "sha256": _sha256(exported),
             "virtual_size": disk.virtual_size(disk_file),
             "actual_size": disk.actual_size(exported),
             "format": disk.format_of(exported),
+            # Read off the exported disk, which is now the source itself for a
+            # standalone VM -- so this lists what the bundle actually carries
+            # rather than what a convert happened to drop.
             "snapshots": disk.snapshot_names(exported),
             "backing": None,
         }
