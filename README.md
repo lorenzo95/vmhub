@@ -7,10 +7,11 @@ One container per VM. No root, no systemd, no libvirt. Snapshots, instant
 clones, portable export/import — all working on a stock Debian 13 host.
 
 ```
-~/vms/vmhub     # the GUI
-~/vms/vmctl     # the CLI
-~/vms/selftest  # 164-check end-to-end test of the backend
-~/vms/guicheck  # 50-check headless test of every GUI handler
+~/vms/vmhub       # the GUI
+~/vms/vmctl       # the CLI
+~/vms/selftest    # 345-check end-to-end test of the backend
+~/vms/guicheck    # 127-check headless test of every GUI handler
+python3 -m pytest # 237-test suite for the pure logic, no display needed
 ```
 
 ## What it does
@@ -28,6 +29,8 @@ clones, portable export/import — all working on a stock Debian 13 host.
 | **Backup / restore** | `export` and `import`, so a backup is just a bundle. |
 | **Resize** | Grow a disk in place; never shrinks. |
 | **Console** | The container's own web viewer, plus one-click SSH and RDP. |
+| **Ports** | Publish any guest port, bind each one, and see how far it actually reaches. |
+| **Start menu** | `vmctl desktop install` puts vmhub in the application menu, with its own icon. |
 | **Install media** | Attach a real ISO from your disk: read-only, boots first, and available as a CD-ROM. |
 
 ## Requirements
@@ -71,6 +74,8 @@ The GUI needs all four Python/GTK packages. The CLI works without them.
 | `vmctl rdp` | `remmina` (preferred) or `freerdp2-x11` |
 | `vmctl libvirt` | `libvirt-clients` for `virsh`, and read access to `qemu:///system` |
 | `guicheck` headless | `xvfb` (run it as `xvfb-run -a ./guicheck`) |
+| `pytest` suite | `pytest` |
+| `vmctl desktop install` | `desktop-file-utils` for `desktop-file-validate`, and `gtk-update-icon-cache` so the icon is indexed. Both are used only if present, and the entry still works without them |
 | `--mode guest` | `qemu-guest-agent` **inside the guest**, not on the host |
 
 ### Also required
@@ -89,13 +94,18 @@ firmware, SeaBIOS and noVNC.
 
 ```bash
 ./vmctl doctor                 # environment: podman, rootless, crun, kvm, init
-./selftest                     # 164-check backend lifecycle (creates throwaway VMs)
-xvfb-run -a ./guicheck         # 50-check GUI sweep, touches no existing VMs
+python3 -m pytest              # 237 unit tests, sub-second, no display needed
+./selftest                     # 345-check backend lifecycle (creates throwaway VMs)
+xvfb-run -a ./guicheck         # 127-check GUI sweep, touches no existing VMs
 ```
 
 `doctor` is the one to run first; it checks every item above and names anything
 missing. Note `guicheck` and `selftest` create and delete their own throwaway
 VMs — they never touch VMs you have created.
+
+`pytest` is deliberately GTK-free: widget creation segfaults without a display,
+so anything pure lives in `spec.py` and gets tested here, and UI behaviour is
+covered by `guicheck` instead. Run it first — it is the fast feedback loop.
 
 
 ## Quick start
@@ -229,6 +239,11 @@ password. Override them per VM if you set a real one during installation:
 Snapshots are genuine qcow2 internal snapshots taken over QMP, so you can take
 one while the VM is running. They live **inside the disk file**, not in a
 database — `qemu-img snapshot -l` reads them even if you delete the metadata.
+
+A stopped VM can be snapshotted too, which is worth knowing before you have a
+guest installed to boot. Each snapshot also records the VM's power state at the
+time, so reverting to one restores whether the machine was running rather than
+leaving it stopped and making you guess.
 
 Reverting is necessarily an **offline** operation: QEMU has no
 "load internal snapshot" command. vmhub stops the VM, applies the snapshot with
@@ -417,6 +432,46 @@ For a VM to be reachable this way it must publish to more than loopback:
 that VM's services to your entire LAN, not just to other VMs. Only widen it when
 you specifically want that.
 
+### Publishing ports
+
+A VM publishes as many guest ports as it needs, each named, and each with its
+own bind:
+
+```bash
+./vmctl ports web-01 list
+./vmctl ports web-01 add 22 --name ssh
+./vmctl ports web-01 add 8080 --bind 0.0.0.0
+./vmctl ports web-01 set 18080 --guest 8080
+./vmctl ports web-01 rm 18080        # a role (web, ssh, rdp) or a host port
+```
+
+`network.bind` is the VM-wide default and a port may override it. What matters
+is the bind **actually in force** once both are applied, and that is what gets
+reported — in the Ports tab and in `vmctl ports list`, which says *exposed to
+the network* or *localhost only* per port.
+
+That distinction is worth being pedantic about. A port with no bind of its own
+inherits `network.bind`, so a VM whose `network.bind` is `0.0.0.0` publishes
+every unconfigured port to the LAN. Reading `port.bind` alone calls those
+private, and the first thing anyone discovers is that a web server meant to be
+local was reachable from the coffee-shop wifi. Both the GUI and the CLI call
+one function to work this out, so they cannot drift apart.
+
+Host ports below 1024 are refused: binding those needs privileges the container
+does not have, so the VM would start and the port would silently not work.
+
+### Turning the internet off per VM
+
+A VM can be given no route out at all:
+
+```bash
+./vmctl set myvm network.internet=false
+```
+
+The host-to-guest published ports keep working — this only removes the guest's
+route to the outside world. Useful for a VM you are about to point untrusted
+code at.
+
 Guests are never visible on your LAN. Rootless podman cannot create the bridge
 or the `/dev/tapN` node that would be required, and those failures are
 deliberately silenced by upstream, so you get no warning — only the published
@@ -485,6 +540,19 @@ need — which makes it a natural pre-command for the backup tool you already ru
 ~/vms/vmctl export-all --include-running --mode guest
 ```
 
+What happens to the disk depends on what it is:
+
+- A **standalone** disk is copied, sparse-aware, so the export keeps the VM's
+  internal snapshots.
+- A disk with a **backing chain** (a linked clone) is converted, because a copy
+  would reference a backing file the bundle does not contain. A convert flattens
+  the chain, and snapshots inside the images being resolved do not survive it —
+  the bundle's manifest says so rather than quietly listing none.
+
+That split is why export time scales with the chain, not just the disk: the
+first case is a file copy, the second is a read and rewrite of everything the
+chain actually holds.
+
 Exit status is non-zero if any VM failed, so a backup job can detect it.
 
 ## Autostart
@@ -524,27 +592,58 @@ your desktop session:
 To be explicit, pass `--target systemd|sysvinit|session`. Uninstall with
 `./vmctl autostart uninstall`.
 
+Autostart is about *when* vmhub starts. Putting it in the menu is a different
+job with its own command — see `vmctl desktop install` under [The GUI](#the-gui).
+
 ## The GUI
 
 ```bash
 ~/vms/vmhub
 ```
 
-Left: every VM with a live state dot, resources and badges. Right: five tabs.
+Left: every VM with a live state dot, resources and badges. Right: six tabs.
 
 - **Console** — the container's web viewer, copyable `ssh` and `xfreerdp`
   commands, a **Connect with Remmina** button, and install-media attach/detach.
+  The RDP account and shared folder are edited here and written by one **Save**
+  button, which also brings the `.remmina` profile back in step. Leaving a VM
+  with an unsaved edit says so rather than dropping it.
 - Right-click a VM in the sidebar for console, start/stop, clone, export and
   delete. `Ctrl+N` creates a new VM.
 - **Hardware** — edit vCPUs, RAM, disk size and disk bus; see UUID, MAC,
-  backing file and port mapping.
+  backing file, and a per-VM internet toggle.
+- **Ports** — publish a guest port, change its host or guest number, and set
+  each port's bind. Every published row is labelled **Exposed** or **Localhost
+  only** according to the bind actually in force, so an inherited
+  `network.bind = 0.0.0.0` is never mistaken for a private port. The GUI and
+  `vmctl ports list` compute that from the same function, so they cannot
+  disagree.
+- **Details** — the rest of what used to be on the Info tab: templates, clones,
+  snapshots summary, and the copyable paths.
 - **Snapshots** — take, revert, delete.
-- **Actions** — mark template, clone, rebase, export, flatten, import, delete.
 - **Logs** — streaming container output.
+
+There is no Actions tab. Marking a template, cloning, rebasing, exporting and
+flattening are all buttons or sidebar actions, and deleting sits next to the VM
+it deletes rather than in a list somewhere else.
 
 Long operations run on worker threads and report progress in the status bar, so
 the UI never blocks. The bar shows the newest message with the last few kept in
 its tooltip.
+
+Put vmhub in the application menu with:
+
+```bash
+./vmctl desktop install     # writes ~/.local/share/applications/vmhub.desktop
+./vmctl desktop status      # what is installed, and which helper tools exist
+./vmctl desktop uninstall   # takes the entry and its icon away again
+```
+
+The entry is namespaced to the VM owner rather than whoever ran the command, so
+`sudo vmctl desktop install` does not put it in root's menu. It names the
+checkout by absolute path, so moving or deleting the checkout is what makes the
+entry stop working, rather than leaving a launcher behind that fails when
+picked.
 
 ## CLI reference
 
@@ -565,7 +664,8 @@ vmctl revert <vm> <name> [-y]     revert, discarding later snapshots
 vmctl snapshot-rm <vm> <name>     delete a snapshot
 
 vmctl template ls|mark|unmark     manage templates
-vmctl clone <new> <source>        linked (template) or full (any stopped VM)
+vmctl clone <new> <source>        --mode linked|full (linked needs a template source;
+                                  full copies any stopped VM)
 vmctl flatten <vm>                resolve the backing chain
 vmctl rebase <template>           repoint all clones
 
@@ -589,8 +689,16 @@ vmctl finish-install <vm>         clear the boot ISO after installing
 
 vmctl blueprints                  list blueprints
 vmctl doctor                      check the environment
+vmctl prune [--dry-run]           remove containers whose VM directory is gone
+vmctl repair-ports [--dry-run]    reassign conflicting host ports
+vmctl ports <vm> list             published ports and how far each one reaches
+vmctl ports <vm> add GUEST        publish a guest port (--name N --as ROLE
+                                  --host H --bind B)
+vmctl ports <vm> rm ROLE|HOST     stop publishing a port
+vmctl ports <vm> set ROLE|HOST    change it (--host H --guest G --bind B)
+vmctl config show|set|path        app-wide defaults, without hand-editing TOML
 vmctl autostart status|install|uninstall
-vmctl registry                    rebuild registry.json
+vmctl desktop status|install|uninstall
 ```
 
 ## How it finds your VMs
@@ -649,14 +757,17 @@ only source of truth, so it is detected explicitly:
 
 ```
 ~/vms/
-├── vmctl, vmhub, selftest        entry points
-├── blueprints/*.toml             declarative VM templates
-├── backups/                      exported bundles
-├── systemd/user/                 unit template
-├── sysvinit/                     LSB script template
+├── vmctl, vmhub, selftest, guicheck   entry points
+├── src/vmhub/                         the implementation
+│   ├── icons/vmhub.svg                the start-menu icon
+│   ├── lifecycle/                     start, stop, clone, snapshot, export
+│   └── ui/                            the GTK4 app
+├── tests/                             the pytest suite
+├── pytest.ini, blueprints/*.toml
+├── backups/                           exported bundles
 └── <vm>/
     ├── vm.toml                   declarative spec, relative paths only
-    ├── meta.json                 uuid, mac, template flags (rebuildable)
+    ├── meta.json                 uuid, mac, template flags
     ├── disk/data.qcow2           the disk, owned by vmhub
     └── storage/                  bind-mounted to /storage
         ├── qmp.sock, monitor.sock
@@ -664,12 +775,17 @@ only source of truth, so it is detected explicitly:
         └── <os>/                 NVRAM, written by the container
 ```
 
+There are no template directories for the boot hook. The systemd unit and the
+SysVinit script are generated by `autostart.py`, so there is no file in the
+checkout to drift out of step with the code that writes them.
+
 `disk/data.qcow2` is bind-mounted into the container at `/data.qcow2`, which
 means vmhub owns the disk outright and its location never depends on the boot
 image. The same file is also mounted at `/storage/data.qcow2` so the container
 recognises it as an existing disk and stops defaulting to its own Alpine image
 once the guest has been installed. Snapshots live inside that file, so they
-survive losing `meta.json` — `vmctl registry` rebuilds the index.
+survive losing `meta.json`: vmhub rebuilds the identity from the directory
+itself rather than from an index, so there is nothing to regenerate.
 
 ## Known constraints
 

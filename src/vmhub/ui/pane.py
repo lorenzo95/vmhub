@@ -476,6 +476,12 @@ class VmPane(Gtk.Box):
             return True
 
         def done(_result):
+            # A keystroke can land while this save is in flight. Standing down
+            # anyway reports that newer edit as saved: the flag is cleared, the
+            # button disarms, nothing warns, and leaving the pane drops it.
+            # Only stand down if the fields still hold what was just written.
+            if self._rdp_values() != (user, share):
+                return
             self._rdp_dirty = False
             self._rdp_save.set_sensitive(False)
             self._rdp_status.set_text(

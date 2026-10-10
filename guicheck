@@ -1866,9 +1866,17 @@ def _probe(app) -> None:
     )
     save_pane.rdp_user_entry.set_text("second-account")
     save_pane._on_save_rdp()
-    pump_until(
+    save_landed = pump_until(
         lambda: save_button is not None and not save_button.get_sensitive(),
         4.0,
+    )
+    check(
+        "and that save lands before the next edit begins",
+        lambda: _assert(
+            save_landed,
+            "the previous save never finished, so the edit below would race "
+            "its completion callback instead of testing the deselect path",
+        ),
     )
     check(
         "Save brings an existing profile back in step",
@@ -1876,6 +1884,44 @@ def _probe(app) -> None:
             "username=second-account" in profile_file.read_text()
             and "drive=/tmp/shared-typed" in profile_file.read_text(),
             profile_file.read_text(),
+        ),
+    )
+
+    # Typing while a save is in flight used to lose the keystroke. The save
+    # runs on a worker thread and its completion callback cleared the dirty
+    # flag unconditionally, so a value typed after Save was clicked was marked
+    # saved, warned about by nobody, and dropped when the pane was left.
+    # set_text arms the flag and the worker cannot call back until the main
+    # loop runs, so this ordering is not a race to hope for.
+    save_pane.rdp_user_entry.set_text("typed-during-save")
+    save_pane._on_save_rdp()
+    save_pane.rdp_user_entry.set_text("typed-after-save-started")
+    pump_until(lambda: _saved().media.rdp_user == "typed-during-save", 4.0)
+    for _ in range(20):
+        GLib.MainContext.default().iteration(True)
+    check(
+        "a value typed while a save is in flight is not reported as saved",
+        lambda: _assert(
+            save_pane.rdp_user_entry.get_text() == "typed-after-save-started"
+            and save_pane._rdp_dirty is True
+            and save_button is not None
+            and save_button.get_sensitive(),
+            f"the field says {save_pane.rdp_user_entry.get_text()!r} with "
+            f"dirty={save_pane._rdp_dirty} and Save armed="
+            f"{save_button.get_sensitive() if save_button else None}; the "
+            "edit was reported as saved",
+        ),
+    )
+    save_pane.rdp_user_entry.set_text("second-account")
+    save_pane._on_save_rdp()
+    resaved = pump_until(
+        lambda: save_button is not None and not save_button.get_sensitive(), 4.0
+    )
+    check(
+        "and saving it afterwards still works",
+        lambda: _assert(
+            resaved and _saved().media.rdp_user == "second-account",
+            f"resave did not take: {save_landed=}, {_saved().media.rdp_user=}",
         ),
     )
 
@@ -1892,6 +1938,11 @@ def _probe(app) -> None:
     window.select_vm(save_vm)
     pump_until(
         lambda: save_pane.rdp_user_entry.get_text() == "second-account", 4.0
+    )
+    # The field and the button move in the same callback, but the pump above
+    # returns on the field, so settle the button before asserting on it.
+    pump_until(
+        lambda: save_button is not None and not save_button.get_sensitive(), 4.0
     )
     check(
         "leaving a VM releases an unsaved RDP edit",
