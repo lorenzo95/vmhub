@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <!--
+    vmhub. A monitor with two VM rows in it: the app is a list of machines
+    and the thing you end up doing with them is looking at one.
+
+    This comment sits after the root tag on purpose. An earlier draft put it
+    in front, and gdk-pixbuf then refused the whole file with "unrecognized
+    image file format": the menu draws a broken placeholder for it while
+    `vmctl desktop install` reports a successful install, and nothing in the
+    chain names a cause. Open the file with <svg and the prose below can be
+    as long as it likes.
+
+    Colours are the ones already in ui/style.py: #2b6cb0 for the badge blue,
+    #38a169 for "running", #a0aec0 for a stopped row. So the icon and the
+    window agree without either of them being restyled.
+
+    Filled shapes only, no strokes. At 16px in a menu a hairline is a smear,
+    but a filled rounded rectangle is still a rounded rectangle.
+  -->
+  <rect x="4" y="4" width="56" height="56" rx="13" fill="#2b6cb0"/>
+
+  <rect x="14" y="17" width="36" height="25" rx="3" fill="#ffffff"/>
+
+  <rect x="19" y="22" width="26" height="5" rx="2.5" fill="#38a169"/>
+  <rect x="19" y="31" width="26" height="5" rx="2.5" fill="#a0aec0"/>
+
+  <rect x="28.5" y="43" width="7" height="4" fill="#ffffff"/>
+  <rect x="21" y="46.5" width="22" height="4" rx="2" fill="#ffffff"/>
+</svg>

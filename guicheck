@@ -1940,6 +1940,21 @@ def _probe(app) -> None:
     lifecycle.stop(VM, force=True)
     lifecycle.remove(VM)
 
+    # ---- the start-menu icon has to decode, not merely exist -----------
+    # gdk-pixbuf worked out what the first draft of vmhub.svg was from the
+    # head of the file, refused it as an unknown format, and the menu showed a
+    # broken placeholder while `vmctl desktop install` reported success. The
+    # file was well-formed XML, so nothing in the chain explained it and
+    # rsvg-convert, which does load it, is no use as an oracle. This decodes
+    # the icon through the same decoder GTK uses.
+    check(
+        "the start-menu icon decodes to a picture",
+        lambda: _assert(
+            _icon_decodes() == (48, 48),
+            f"gdk-pixbuf refused the icon: {_icon_decodes()}",
+        ),
+    )
+
     # The sweep must not have taken a user's VM with it.
     vanished = sorted(preexisting - set(registry.all_names()))
     if vanished:
@@ -1986,6 +2001,27 @@ def _widgets_source() -> str:
 def _assert(condition: bool, value: object) -> None:
     if not condition:
         raise AssertionError(f"got {value!r}")
+
+
+def _icon_decodes() -> tuple[int, int] | None:
+    """Decode the shipped icon with the decoder the desktop menu uses.
+
+    Returns its pixel size, or None if GdkPixbuf would not take the file.
+    """
+    import gi
+
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf
+
+    from vmhub import desktop
+
+    try:
+        pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(
+            str(desktop.icon_source()), 48, 48
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    return pixbuf.get_width(), pixbuf.get_height()
 
 
 if __name__ == "__main__":
