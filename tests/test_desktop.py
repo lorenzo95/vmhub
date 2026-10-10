@@ -99,6 +99,157 @@ def test_tryexec_guards_a_moved_checkout(fake_home: Path) -> None:
     assert "TryExec=" in text
 
 
+def test_the_entry_runs_in_the_checkout(fake_home: Path) -> None:
+    """Path=, not decoration -- see the comment in desktop.entry_text().
+
+    An absolute Exec line still gets run in whatever directory the desktop
+    picks, which for a menu entry is the user's home. This is the key that
+    stops the GUI coming up finding no VMs.
+    """
+    from vmhub import paths
+
+    text = desktop.entry_text()
+    path_line = next(l for l in text.splitlines() if l.startswith("Path="))
+    assert path_line == f"Path={paths.project_root()}", path_line
+    assert Path(path_line[len("Path=") :]).is_dir(), path_line
+
+
+def test_the_directory_it_pins_is_one_the_project_actually_lives_in(
+    fake_home: Path,
+) -> None:
+    """Path= has to agree with Exec=, or the entry runs the right program in
+    the wrong checkout -- which on a machine with two clones shows the VMs of
+    one while the launcher belongs to the other."""
+    from vmhub import paths
+
+    lines = desktop.entry_text().splitlines()
+    exec_target = Path(
+        next(l for l in lines if l.startswith("Exec="))[len("Exec=") :]
+    )
+    path_target = Path(
+        next(l for l in lines if l.startswith("Path="))[len("Path=") :]
+    )
+    assert exec_target.parent == path_target, (exec_target, path_target)
+    assert exec_target.parent == paths.project_root()
+
+
+def test_the_installed_entry_still_carries_the_working_directory(
+    fake_home: Path,
+) -> None:
+    """Same reason the icon has a test that reads the file rather than
+    entry_text(): what the menu gets is the text on disk."""
+    desktop.install()
+    text = desktop.desktop_path().read_text()
+    assert "\nPath=" in text, text
+
+
+def test_the_working_directory_is_load_bearing(
+    project_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reason Path= exists at all: from anywhere else, discovery fails.
+
+    Pinned so the key cannot be dropped as cruft -- it looks redundant next
+    to an absolute Exec, and the only symptom of removing it is a GUI that
+    lists no VMs.
+    """
+    from vmhub import paths
+    from vmhub.errors import ProjectRootError
+
+    # The entry names the directory that does work...
+    assert f"Path={project_home}" in desktop.entry_text()
+
+    # ...and from anywhere else, discovery fails. monkeypatch.context, not
+    # undo(): undo would also drop the sandbox's VMHUB_HOME and leave the
+    # rest of the test running against the real checkout.
+    elsewhere = tmp_path / "not-the-checkout"
+    elsewhere.mkdir()
+    with monkeypatch.context() as patch:
+        patch.delenv(paths.ENV_HOME, raising=False)
+        patch.chdir(elsewhere)
+        with pytest.raises(ProjectRootError):
+            paths.project_root()
+
+
+def test_the_entry_names_the_window_it_is_meant_to_bind_to(
+    fake_home: Path,
+) -> None:
+    """StartupWMClass is how a running window is matched to this entry.
+
+    Without it the match has to happen by luck, on WM_CLASS and the entry's
+    filename agreeing, and nothing in either file says that they are supposed
+    to.
+    """
+    desktop.install()
+    text = desktop.desktop_path().read_text()
+    line = next(l for l in text.splitlines() if l.startswith("StartupWMClass="))
+    assert line == f"StartupWMClass={desktop.WM_CLASS}", line
+
+
+def test_the_entry_it_writes_is_valid_with_the_window_binding_in_it(
+    fake_home: Path,
+) -> None:
+    """Adding a key to a generated file is exactly how an entry starts being
+    silently ignored by the menu."""
+    if not shutil.which("desktop-file-validate"):
+        pytest.skip("desktop-file-validate not installed")
+    desktop.install()
+    assert desktop._validate(desktop.desktop_path().read_text()) is None
+
+
+def test_the_window_class_agrees_with_the_name_the_gui_claims() -> None:
+    """The binding is only real if both halves hold the same string.
+
+    Skipped rather than failed when GTK is absent: vmctl has to stay usable,
+    and testable, on a machine with only the CLI packages installed.
+    """
+    pytest.importorskip("gi", reason="PyGObject/GTK not installed")
+    from vmhub.ui.app import PRGNAME
+
+    assert PRGNAME == desktop.WM_CLASS, (
+        "the window calls itself one thing and the entry names another, so "
+        "the dock has no .desktop to match the window against"
+    )
+
+
+def test_building_the_app_claims_that_name_for_real() -> None:
+    """The behaviour itself, not a string in the source.
+
+    Constructing a Gtk.Application is safe without a display -- it does not
+    register or open anything -- so this runs in the plain test suite rather
+    than only under the xvfb run of ./guicheck.
+    """
+    pytest.importorskip("gi", reason="PyGObject/GTK not installed")
+    from gi.repository import GLib
+
+    from vmhub.ui.app import VmhubApp
+
+    GLib.set_prgname("not-vmhub")
+    VmhubApp()
+    assert GLib.get_prgname() == desktop.WM_CLASS, (
+        "the window keeps the module filename as its WM_CLASS, so no dock can "
+        "find vmhub.desktop for it"
+    )
+
+
+def test_the_launchers_name_the_checkout_rather_than_leaving_it_to_the_cwd(
+) -> None:
+    """Defense in depth behind Path=, and the fix for every other launcher.
+
+    A desktop that ignores Path= -- or a user who runs the GUI from a file
+    manager, or a session autostart -- gets the same project root anyway,
+    because the launcher exports it from the directory it lives in. Same
+    reasoning as the systemd unit's Environment= and the sysvinit hook's cd.
+    """
+    root = Path(desktop.__file__).resolve().parent.parent.parent
+    for script in ("vmhub", "vmctl"):
+        text = (root / script).read_text(encoding="utf-8")
+        assert 'export VMHUB_HOME="$HERE"' in text, (
+            f"{script} leaves the project root to be discovered from the "
+            "working directory, so it only works when started from the "
+            "checkout"
+        )
+
+
 def test_the_entry_names_the_icon_rather_than_pathing_to_it() -> None:
     """A theme name is what lets the desktop substitute and, failing that,
     fall back. A path to the installed copy is correct for exactly one

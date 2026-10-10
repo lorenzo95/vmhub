@@ -73,6 +73,22 @@ def test_systemd_unit_also_knows_the_project() -> None:
     assert "VMHUB_HOME=" in text, text
 
 
+def test_the_session_entry_starts_the_gui_where_it_can_find_the_project() -> None:
+    """A login session runs this in the user's home, and project_root() only
+    walks upward from the cwd -- so from /home/you it cannot reach
+    /home/you/vmhub. Same reason the menu entry carries Path=."""
+    text = autostart.desktop_entry_text()
+    assert "Path=" in text, text
+    assert "@PROJECTDIR@" not in text, "placeholder left unsubstituted"
+
+
+def test_the_session_entry_binds_itself_to_the_window_it_starts() -> None:
+    """Without StartupWMClass the session window has no entry to match, so
+    it gets a generic icon and nothing stable to pin."""
+    text = autostart.desktop_entry_text()
+    assert f"StartupWMClass={autostart.WM_CLASS}" in text, text
+
+
 def test_both_templates_name_a_real_project() -> None:
     """@PROJECTDIR@ must render, or the hook points at the literal placeholder."""
     import os

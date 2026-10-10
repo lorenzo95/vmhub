@@ -2,4 +2,8 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="$HERE/src${PYTHONPATH:+:$PYTHONPATH}"
+# See the comment in ./vmhub: the project root is this script's own
+# directory, and it is named here so it does not have to be discovered by
+# walking up from whatever directory we happened to be started in.
+export VMHUB_HOME="$HERE"
 exec python3 -m vmhub.cli "$@"

@@ -2,4 +2,11 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="$HERE/src${PYTHONPATH:+:$PYTHONPATH}"
+# The checkout this script lives in *is* the project root, so name it
+# outright rather than leaving it to be discovered from the working
+# directory: a desktop entry runs us in the user's home, and discovery only
+# walks upward from there. Unconditional on purpose -- it matches the
+# systemd unit's Environment= and the sysvinit hook's cd, so the working
+# directory cannot matter however we were started.
+export VMHUB_HOME="$HERE"
 exec python3 -m vmhub.ui.app "$@"

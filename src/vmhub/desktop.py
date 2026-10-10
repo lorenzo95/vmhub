@@ -9,6 +9,11 @@ The entry names the checkout by absolute path, so moving or deleting the
 checkout is what makes the entry stop working, rather than leaving a
 launcher behind that fails when it is picked.
 
+It also carries Path=, because an absolute Exec line is not enough on its
+own: what a desktop actually runs is "this program, in some working
+directory", and the one it picks is the user's home. Naming the directory
+here is what makes the entry show the same VMs the terminal does.
+
 The icon is a file in the checkout that gets copied into the VM owner's
 ~/.local/share/icons, beside the entry. Both go to the owner and not the
 caller, for the same reason as the entry itself.
@@ -22,7 +27,7 @@ import tempfile
 from pathlib import Path
 
 from . import paths
-from .autostart import _owner_home, gui_path, vmctl_path
+from .autostart import WM_CLASS, _owner_home, gui_path, vmctl_path
 from .errors import LifecycleError
 
 DESKTOP_FILE_NAME = "vmhub.desktop"
@@ -87,7 +92,23 @@ def entry_text() -> str:
             # vmctl rather than the GUI script: it is the one that has to
             # exist for the checkout to be usable at all.
             f"TryExec={vmctl_path()}",
+            # Load-bearing, not decoration. The desktop launches an entry with
+            # the user's home as the working directory, and project_root()
+            # only ever walks *upward* from the cwd -- so from /home/admin it
+            # can never reach /home/admin/vmhub, which is below it, and its
+            # one fallback is hardcoded to ~/vms. The GUI then came up with no
+            # VMs and no explanation: every path helper raises through
+            # ProjectRootError, and nothing anywhere names the working
+            # directory as the cause. Same reason the systemd unit carries
+            # WorkingDirectory= and the sysvinit hook both cds and exports
+            # VMHUB_HOME: see autostart.py.
+            f"Path={paths.project_root()}",
             f"Icon={ICON_NAME}",
+            # Binds the running window to this entry. A dock looks for
+            # <WM_CLASS>.desktop; ui.app claims WM_CLASS=vmhub, so without
+            # this key it can be right by luck, and there is nothing here to
+            # say so if it ever stops being.
+            f"StartupWMClass={WM_CLASS}",
             "Terminal=false",
             "StartupNotify=true",
             "Categories=System;Emulator;",

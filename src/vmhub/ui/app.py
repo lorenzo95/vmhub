@@ -8,6 +8,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
+from ..autostart import WM_CLASS  # noqa: E402
 from ..errors import VmhubError  # noqa: E402
 from . import style  # noqa: E402
 from .window import VmhubWindow  # noqa: E402
@@ -15,9 +16,19 @@ from .window import VmhubWindow  # noqa: E402
 
 APP_ID = "dev.vmhub.GUI"
 
+# GTK takes WM_CLASS from GLib's program name, and `python3 -m vmhub.ui.app`
+# leaves that as the basename of the module file -- the window was calling
+# itself "app.py", after app.py. A dock resolves a window to an application by
+# looking for <WM_CLASS>.desktop, and there is no app.py.desktop anywhere, so
+# the window had no icon to group under and "Pin to Dock" had nothing stable to
+# hold. WM_CLASS is what both entry templates write into StartupWMClass, so
+# claiming it is what makes vmhub.desktop find the window.
+PRGNAME = WM_CLASS
+
 
 class VmhubApp(Gtk.Application):
     def __init__(self, application_id: str | None = None) -> None:
+        GLib.set_prgname(PRGNAME)
         super().__init__(
             application_id=application_id or os.environ.get("VMHUB_APP_ID") or APP_ID,
             flags=Gio.ApplicationFlags.FLAGS_NONE,

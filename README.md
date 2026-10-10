@@ -645,6 +645,14 @@ checkout by absolute path, so moving or deleting the checkout is what makes the
 entry stop working, rather than leaving a launcher behind that fails when
 picked.
 
+It also carries `Path=`, pointing at the checkout. A desktop launches an entry
+in *its own* working directory — usually your home — and vmhub finds its
+project by walking upward from where it was started, so from `/home/you` it
+cannot reach `/home/you/vmhub`, which is below it. Without `Path=` the GUI
+starts with no VMs listed. You should not have to add it by hand; if a menu
+entry ever shows an empty window, `./vmctl desktop status` will tell you which
+file it is reading.
+
 ## CLI reference
 
 ```

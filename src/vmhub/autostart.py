@@ -11,6 +11,15 @@ from .errors import LifecycleError
 
 SYSTEMD_UNIT_NAME = "vmhub.service"
 SYSVINIT_SCRIPT = "/etc/init.d/vmhub"
+
+# The name the GUI window calls itself, and so the name of a menu entry with
+# the suffix removed. A desktop binds the two together through this string:
+# it looks for <WM_CLASS>.desktop for the window's icon, grouping and pinning,
+# so ui.app has to claim exactly this name and both entry templates have to
+# name it back. Defined here because all three need it and this module is the
+# one they can all import -- desktop.py already imports from here, so the
+# reverse would be circular.
+WM_CLASS = "vmhub"
 LINGER_HINT = (
     "systemd user services stop when you log out unless lingering is enabled.\n"
     "  sudo loginctl enable-linger $USER"
@@ -81,6 +90,7 @@ def _render(template: str) -> str:
         .replace("@README@", str(paths.project_root() / "README.md"))
         .replace("@OWNER@", _vm_owner())
         .replace("@PROJECTDIR@", str(paths.project_root()))
+        .replace("@WMCLASS@", WM_CLASS)
     )
 
 
@@ -267,12 +277,19 @@ exit $?
 
 
 def desktop_entry_text() -> str:
+    # Path= for the same reason the systemd unit carries WorkingDirectory= and
+    # the start-menu entry carries one: a session starts this in the user's
+    # home, and project_root() only walks upward from the cwd, so without it
+    # the GUI comes up on the login screen finding no VMs and saying nothing
+    # about why. See desktop.entry_text() and paths.project_root().
     return _render(
         """[Desktop Entry]
 Type=Application
 Name=vmhub
 Comment=Manage podman-hosted QEMU VMs
 Exec=@GUI@
+Path=@PROJECTDIR@
+StartupWMClass=@WMCLASS@
 Terminal=false
 Categories=System;Emulator;
 X-GNOME-Autostart-enabled=true
