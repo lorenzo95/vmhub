@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import autostart, blueprints, disk, export, iso as isomod, lifecycle, paths, podman, ports, rdp, registry, settings, spec
+from . import autostart, blueprints, desktop, disk, export, iso as isomod, lifecycle, paths, podman, ports, rdp, registry, settings, spec
 from .errors import ProjectRootError, VmhubError
 
 DIM = "\033[2m"
@@ -1135,6 +1135,20 @@ def cmd_autostart(args: argparse.Namespace, out: Out) -> int:
     return 2
 
 
+def cmd_desktop(args: argparse.Namespace, out: Out) -> int:
+    if args.action == "status":
+        for key, value in desktop.status().items():
+            out.say(f"  {key:16s} {value}")
+        return 0
+    if args.action == "install":
+        for line in desktop.install():
+            out.say(f"  {out.good('+')} {line}")
+        return 0
+    for line in desktop.uninstall():
+        out.say(f"  {out.good('-')} {line}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vmctl", description="Manage QEMU VMs running in rootless podman containers."
@@ -1438,6 +1452,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("repair-ports", help="reassign conflicting host ports")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_repair_ports)
+
+    p = sub.add_parser("desktop", help="install or remove the start-menu entry")
+    p.add_argument("action", choices=["status", "install", "uninstall"])
+    p.set_defaults(func=cmd_desktop)
 
     p = sub.add_parser("autostart", help="install boot/login restore hooks")
     p.add_argument("action", choices=["status", "install", "uninstall"])
