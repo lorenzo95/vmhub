@@ -6,12 +6,14 @@ A local VM manager for [qemus/qemu](https://github.com/qemus/qemu) running in
 One container per VM. No root, no systemd, no libvirt. Snapshots, instant
 clones, portable export/import — all working on a stock Debian 13 host.
 
+![The vmhub desktop app: the VM list on the left, and one VM's console, ports and RDP options on the right](docs/screenshot.png)
+
 ```
 ~/vms/vmhub       # the GUI
 ~/vms/vmctl       # the CLI
 ~/vms/selftest    # 345-check end-to-end test of the backend
-~/vms/guicheck    # 127-check headless test of every GUI handler
-python3 -m pytest # 237-test suite for the pure logic, no display needed
+~/vms/guicheck    # 136-check headless test of every GUI handler
+python3 -m pytest # 317-test suite for the pure logic, no display needed
 ```
 
 ## What it does
@@ -96,7 +98,7 @@ firmware, SeaBIOS and noVNC.
 ./vmctl doctor                 # environment: podman, rootless, crun, kvm, init
 python3 -m pytest              # 237 unit tests, sub-second, no display needed
 ./selftest                     # 345-check backend lifecycle (creates throwaway VMs)
-xvfb-run -a ./guicheck         # 127-check GUI sweep, touches no existing VMs
+xvfb-run -a ./guicheck         # 136-check GUI sweep, touches no existing VMs
 ```
 
 `doctor` is the one to run first; it checks every item above and names anything

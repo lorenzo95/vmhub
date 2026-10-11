@@ -243,10 +243,22 @@ def test_the_launchers_name_the_checkout_rather_than_leaving_it_to_the_cwd(
     root = Path(desktop.__file__).resolve().parent.parent.parent
     for script in ("vmhub", "vmctl"):
         text = (root / script).read_text(encoding="utf-8")
-        assert 'export VMHUB_HOME="$HERE"' in text, (
-            f"{script} leaves the project root to be discovered from the "
-            "working directory, so it only works when started from the "
-            "checkout"
+        # The ${VMHUB_HOME:-...} form, not VMHUB_HOME="$HERE". A desktop
+        # session has no VMHUB_HOME and must land on this checkout, which is
+        # what fixes the menu entry; an explicit one must still win, because
+        # the README documents it as the way to point vmhub at another
+        # checkout. Hardcoding it made that documented override a no-op.
+        assert (
+            'export VMHUB_HOME="${VMHUB_HOME:-$HERE}"' in text
+        ), (
+            f"{script} must default the project root to its own directory "
+            "while still honouring an explicit VMHUB_HOME"
+        )
+        assert (
+            'export VMHUB_HOME="$HERE"' not in text
+        ), (
+            f"{script} overrides VMHUB_HOME unconditionally, so pointing "
+            "vmhub at another checkout silently does nothing"
         )
 
 
