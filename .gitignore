@@ -22,6 +22,10 @@
 # The unit suite and its config are project files, not VM data.
 !/tests/
 !/pytest.ini
+# The README's screenshot. It needs un-ignoring like everything else: /* above
+# ignores the whole root, so a new top-level file is invisible to `git add -A`
+# and the README link 404s on GitHub while the local tree looks perfectly fine.
+!/screenshot.png
 
 # ...and drop the noise inside the directories we keep.
 __pycache__/

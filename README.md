@@ -6,7 +6,7 @@ A local VM manager for [qemus/qemu](https://github.com/qemus/qemu) running in
 One container per VM. No root, no systemd, no libvirt. Snapshots, instant
 clones, portable export/import — all working on a stock Debian 13 host.
 
-![The vmhub desktop app: the VM list on the left, and one VM's console, ports and RDP options on the right](docs/screenshot.png)
+![The vmhub desktop app: the VM list on the left, and one VM's console, ports and RDP options on the right](screenshot.png)
 
 ```
 ~/vms/vmhub       # the GUI
