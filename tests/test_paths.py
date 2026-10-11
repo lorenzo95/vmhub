@@ -117,3 +117,77 @@ def test_qmp_socket_lives_in_storage(project_home: Path) -> None:
     assert paths.qmp_path("demo").resolve() == (
         paths.storage_dir("demo").resolve() / "qmp.sock"
     ).resolve()
+
+
+def test_the_fallback_prefers_the_directory_a_clone_creates() -> None:
+    """`git clone` names the directory after the repository, so the documented
+    fallback has to be ~/vmhub. The README said ~/vms throughout while the
+    code and every clone said otherwise."""
+    assert paths.DEFAULT_HOME == "~/vmhub", paths.DEFAULT_HOME
+
+
+def _make_convention_root(base: Path) -> Path:
+    """A checkout at an exact name, unlike _make_root which always appends
+    "vmhub" -- here the directory name is the thing under test."""
+    base.mkdir(parents=True, exist_ok=True)
+    (base / paths.BLUEPRINTS_DIR).mkdir(exist_ok=True)
+    (base / "vmctl").write_text("#!/bin/sh\n")
+    return base
+
+
+def _root_found_from_nowhere(monkeypatch, tmp_path, *conventions: str) -> Path:
+    """Run discovery from a directory with no checkout above it, with the
+    home-directory conventions pointing into a temp tree.
+
+    monkeypatch.context(), not plain monkeypatch: the sandbox guard re-resolves
+    the project root at teardown, and a patch still in place would make it
+    resolve to the temp tree and fail an unrelated assertion.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    for name in conventions:
+        _make_convention_root(home / name)
+
+    with monkeypatch.context() as patch:
+        patch.delenv(paths.ENV_HOME, raising=False)
+        patch.setattr(paths, "_expand_home", lambda c: home / Path(c).name)
+        patch.chdir(tmp_path)      # somewhere with no project root above it
+        return paths.project_root().resolve()
+
+
+def test_a_checkout_at_the_documented_location_is_found_when_nothing_else_says_where(
+    monkeypatch, tmp_path
+) -> None:
+    """The point of the fallback: run vmctl from an unrelated directory and
+    still land on the checkout."""
+    assert _root_found_from_nowhere(monkeypatch, tmp_path, "vmhub") == (
+        tmp_path / "home" / "vmhub"
+    )
+
+
+def test_a_checkout_at_the_old_location_is_still_found(monkeypatch, tmp_path) -> None:
+    """Someone who set their install up against the old README is not left
+    broken: the fallback tries the legacy name too, so ~/vms still resolves
+    when nothing else identifies a checkout."""
+    assert _root_found_from_nowhere(monkeypatch, tmp_path, "vms") == (
+        tmp_path / "home" / "vms"
+    )
+
+
+def test_vmhub_is_tried_before_the_legacy_name(monkeypatch, tmp_path) -> None:
+    """With both present the current convention wins -- otherwise an old ~/vms
+    would quietly shadow the checkout someone just cloned."""
+    assert _root_found_from_nowhere(monkeypatch, tmp_path, "vmhub", "vms") == (
+        tmp_path / "home" / "vmhub"
+    )
+
+
+def test_the_fallback_resolves_to_nothing_without_a_checkout(
+    monkeypatch, tmp_path
+) -> None:
+    """And it is still only a fallback: with no checkout at either
+    convention, the answer is where the user actually was."""
+    from vmhub.errors import ProjectRootError
+
+    with pytest.raises(ProjectRootError):
+        _root_found_from_nowhere(monkeypatch, tmp_path)

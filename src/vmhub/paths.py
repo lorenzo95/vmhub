@@ -6,7 +6,8 @@ from pathlib import Path
 from .errors import ProjectRootError
 
 ENV_HOME = "VMHUB_HOME"
-DEFAULT_HOME = "~/vms"
+DEFAULT_HOME = "~/vmhub"
+LEGACY_HOME = "~/vms"
 
 BLUEPRINTS_DIR = "blueprints"
 DISK_SUBDIR = "disk"
@@ -50,15 +51,28 @@ def project_root() -> Path:
     return root
 
 
+def _expand_home(fallback: str) -> Path:
+    """Where a convention says the checkout might be.
+
+    Its own function so a test can point the convention at a temp tree without
+    monkeypatching HOME, which expanduser() only consults on some paths.
+    """
+    return Path(fallback).expanduser()
+
+
 def _discover(start: Path) -> Path:
     for candidate in (start, *start.parents):
         if _is_project_root(candidate):
             return candidate
-    # ~/vms is the documented convention, not a requirement, but honour it so a
-    # user running vmctl from an unrelated directory still finds the checkout.
-    fallback = Path(DEFAULT_HOME).expanduser()
-    if _is_project_root(fallback):
-        return fallback
+    # The documented convention, not a requirement: honour it so a user
+    # running vmctl from an unrelated directory still finds the checkout.
+    # ~/vmhub is what `git clone` actually produces, and it is the README's
+    # convention throughout; ~/vms is what the README used to say, and an
+    # install set up against that is still somebody's working setup.
+    for convention in (DEFAULT_HOME, LEGACY_HOME):
+        fallback = _expand_home(convention)
+        if _is_project_root(fallback):
+            return fallback
     # Return where the user actually was: the filesystem root is a far more
     # confusing thing to report back than the directory they ran the command in.
     return start

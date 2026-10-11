@@ -9,10 +9,10 @@ clones, portable export/import — all working on a stock Debian 13 host.
 ![The vmhub desktop app: the VM list on the left, and one VM's console, ports and RDP options on the right](screenshot.png)
 
 ```
-~/vms/vmhub       # the GUI
-~/vms/vmctl       # the CLI
-~/vms/selftest    # 345-check end-to-end test of the backend
-~/vms/guicheck    # 136-check headless test of every GUI handler
+~/vmhub/vmhub       # the GUI
+~/vmhub/vmctl       # the CLI
+~/vmhub/selftest    # 345-check end-to-end test of the backend
+~/vmhub/guicheck    # 136-check headless test of every GUI handler
 python3 -m pytest # 317-test suite for the pure logic, no display needed
 ```
 
@@ -112,11 +112,17 @@ covered by `guicheck` instead. Run it first — it is the fast feedback loop.
 
 ## Quick start
 
-The checkout can live anywhere and its name does not matter: vmhub locates itself by walking up from the current directory until it finds `blueprints/` and `vmctl`, or from `$VMHUB_HOME` if you set it.
+```bash
+git clone git@github.com:lorenzo95/vmhub.git     # or https://…; lands in ~/vmhub
+cd ~/vmhub
+```
+
+The checkout can live anywhere and its name does not matter: vmhub locates
+itself by walking up from the current directory until it finds `blueprints/`
+and `vmctl`, or from `$VMHUB_HOME` if you set it. `~/vmhub` is just what
+`git clone` names it.
 
 ```bash
-cd ~/vms
-
 ./vmhub                              # launch the GUI
 
 ./vmctl new debian-a -b debian13      # or from the CLI
@@ -140,7 +146,7 @@ read-only until you flatten or delete them. See *Templates and clones* below.
 
 ## Blueprints
 
-A blueprint is a declarative starting point in `~/vms/blueprints/*.toml`.
+A blueprint is a declarative starting point in `~/vmhub/blueprints/*.toml`.
 
 | Blueprint | Notes |
 |---|---|
@@ -196,7 +202,7 @@ is the **Install media** section of the Console tab, and **vmctl iso probe
 ### Windows
 
 `qemus/qemu` has no unattended install, so you supply the ISO and click
-through setup. Put it at `~/vms/<vm>/storage/boot.iso` and point the spec at
+through setup. Put it at `~/vmhub/<vm>/storage/boot.iso` and point the spec at
 it:
 
 ```bash
@@ -206,7 +212,7 @@ it:
 The `win11` blueprint boots on **IDE** so Windows Setup sees the disk without
 any drivers. Afterwards:
 
-1. Drop `virtio-win.iso` into `~/vms/<vm>/storage/drivers.iso`. The container
+1. Drop `virtio-win.iso` into `~/vmhub/<vm>/storage/drivers.iso`. The container
    auto-attaches it as a second CD-ROM.
 2. Run `virtio-win-guest-install.bat` in the guest, reboot.
 3. `./vmctl set myvm resources.disk_type=scsi` for the finished template.
@@ -362,10 +368,10 @@ Every VM's disk can be made self-contained and moved to another machine.
 
 ```bash
 ./vmctl export debian-a                     # -> backups/debian-a-<date>.vmhub.tar.gz
-scp backups/debian-a-*.tar.gz otherhost:~/vms/backups/
+scp backups/debian-a-*.tar.gz otherhost:~/vmhub/backups/
 
 # on the other host
-./vmctl import ~/vms/backups/debian-a-*.tar.gz
+./vmctl import ~/vmhub/backups/debian-a-*.tar.gz
 ./vmctl start debian-a
 ```
 
@@ -394,7 +400,7 @@ clone's own few hundred MB, and vmhub says so before it starts.
 
 Staging happens beside the destination rather than in `/tmp`, because a bundle
 can be tens of gigabytes and `/tmp` is often a small tmpfs. Copying the whole
-`~/vms` tree also works, since paths are stored relative to the project root.
+`~/vmhub` tree also works, since paths are stored relative to the project root.
 
 Windows will very likely need reactivation on a different machine, since
 OEM/DSP licensing is hardware-bound.
@@ -539,7 +545,7 @@ how to stop). Each bundle is self-contained, so `backups/` is everything you
 need — which makes it a natural pre-command for the backup tool you already run:
 
 ```bash
-~/vms/vmctl export-all --include-running --mode guest
+~/vmhub/vmctl export-all --include-running --mode guest
 ```
 
 What happens to the disk depends on what it is:
@@ -576,7 +582,7 @@ sudo loginctl enable-linger $USER   # so it also runs before you log in
 **SysVinit host** (like this machine, PID 1 is `init`):
 
 ```bash
-sudo ~/vms/vmctl autostart install   # writes /etc/init.d/vmhub
+sudo ~/vmhub/vmctl autostart install   # writes /etc/init.d/vmhub
 ```
 
 The generated script runs the restore as **your** user, not root, and with
@@ -600,7 +606,7 @@ job with its own command — see `vmctl desktop install` under [The GUI](#the-gu
 ## The GUI
 
 ```bash
-~/vms/vmhub
+~/vmhub/vmhub
 ```
 
 Left: every VM with a live state dot, resources and badges. Right: six tabs.
@@ -746,10 +752,10 @@ vmctl desktop status|install|uninstall
 central state — a VM exists if and only if its directory has a `meta.json`:
 
 ```
-~/vms/<name>/          a directory containing meta.json  →  a VM
-~/vms/<name>/meta.json uuid, mac, template flag, created time
-~/vms/<name>/vm.toml   resources, ports, network, media
-~/vms/<name>/disk/     the disk, owned by vmhub
+~/vmhub/<name>/          a directory containing meta.json  →  a VM
+~/vmhub/<name>/meta.json uuid, mac, template flag, created time
+~/vmhub/<name>/vm.toml   resources, ports, network, media
+~/vmhub/<name>/disk/     the disk, owned by vmhub
 ```
 
 **The directory name is the VM's name.** Neither `meta.json` nor `vm.toml`
@@ -795,7 +801,7 @@ only source of truth, so it is detected explicitly:
 ## Layout
 
 ```
-~/vms/
+~/vmhub/
 ├── vmctl, vmhub, selftest, guicheck   entry points
 ├── src/vmhub/                         the implementation
 │   ├── icons/vmhub.svg                the start-menu icon

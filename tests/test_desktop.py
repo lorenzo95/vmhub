@@ -158,13 +158,18 @@ def test_the_working_directory_is_load_bearing(
     # The entry names the directory that does work...
     assert f"Path={project_home}" in desktop.entry_text()
 
-    # ...and from anywhere else, discovery fails. monkeypatch.context, not
-    # undo(): undo would also drop the sandbox's VMHUB_HOME and leave the
-    # rest of the test running against the real checkout.
+    # ...and from anywhere else, discovery fails -- but only where no checkout
+    # sits at either home convention. On a machine whose checkout IS ~/vmhub
+    # the fallback would find it, which is the fallback doing its job, not
+    # Path= being redundant. Pin the conventions somewhere empty so what is
+    # under test is Path= rather than where this checkout happens to live.
+    # monkeypatch.context, not undo(): undo would also drop the sandbox's
+    # VMHUB_HOME and leave the rest of the test running against the real one.
     elsewhere = tmp_path / "not-the-checkout"
     elsewhere.mkdir()
     with monkeypatch.context() as patch:
         patch.delenv(paths.ENV_HOME, raising=False)
+        patch.setattr(paths, "_expand_home", lambda c: elsewhere / c)
         patch.chdir(elsewhere)
         with pytest.raises(ProjectRootError):
             paths.project_root()
