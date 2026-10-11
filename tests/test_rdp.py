@@ -112,3 +112,96 @@ def test_a_mistyped_resolution_is_refused_at_save_time(value: str, why: str) -> 
     """Refused where the person can see it, rather than at the first RDP
     connection minutes later with an xrdp error that names none of this."""
     assert settings.resolution_problem(value) is not None, why
+
+
+def _vm(make_vm, minimal_spec_data, share: str) -> str:
+    """A VM whose spec says `share` about its mapped folder.
+
+    3389 is published because write_profile() refuses a VM with no RDP port,
+    and the profile is where the opt-out has to show up.
+    """
+    from vmhub import registry
+
+    data = dict(minimal_spec_data)
+    make_vm("demo", spec_data=data)
+    vm_spec = registry.load_spec("demo")
+    # host_for("rdp") resolves by role, so the port needs the role as well as
+    # the guest number -- a bare guest_ports entry is not an RDP port.
+    vm_spec.network.set_role("rdp", 3389, 3389)
+    vm_spec.media.share_path = share
+    registry.save_spec(vm_spec)
+    return "demo"
+
+
+def test_a_dot_opts_out_of_the_app_wide_default(make_vm, minimal_spec_data) -> None:
+    """The regression.
+
+    The GUI advertised "put '.' here to map nothing" and the save path
+    rewrote "." to "" before writing it -- so Save reported success, nothing
+    was stored that said opt-out, and the field went back to reading
+    "Inherited from the app-wide default".
+    """
+    from vmhub import registry, settings
+
+    settings.set_value("share_path", "/home/admin/Shared")
+    _vm(make_vm, minimal_spec_data, rdp.NO_SHARE)
+
+    assert registry.load_spec("demo").media.share_path == rdp.NO_SHARE, (
+        "the opt-out was not stored, so there is nothing left to honour"
+    )
+    assert rdp.share_path("demo") == "", rdp.share_path("demo")
+
+
+def test_the_opt_out_beats_the_default_even_though_it_is_not_a_path(
+    make_vm, minimal_spec_data
+) -> None:
+    """"." must not fall through to `own or settings.get(...)` the way an
+    empty value does -- that is the whole difference between the two."""
+    from vmhub import settings
+
+    settings.set_value("share_path", "/home/admin/Shared")
+    _vm(make_vm, minimal_spec_data, rdp.NO_SHARE)
+    assert rdp.share_path("demo") != settings.get("share_path")
+
+
+def test_the_opt_out_writes_no_drive_into_the_profile(
+    make_vm, minimal_spec_data
+) -> None:
+    """What comes back from share_path() goes straight into `drive=`, so a
+    literal "drive=." would hand the client whatever directory Remmina was
+    started in."""
+    from vmhub import settings
+
+    settings.set_value("share_path", "/home/admin/Shared")
+    _vm(make_vm, minimal_spec_data, rdp.NO_SHARE)
+    text = rdp.write_profile("demo").read_text()
+    assert "drive=" not in text, [ln for ln in text.splitlines() if "drive" in ln]
+
+
+def test_an_ordinary_folder_still_wins_over_the_default(
+    make_vm, minimal_spec_data
+) -> None:
+    """The fix must not cost the case that already worked."""
+    from vmhub import settings
+
+    settings.set_value("share_path", "/home/admin/Shared")
+    _vm(make_vm, minimal_spec_data, "/home/admin/Other")
+    assert rdp.share_path("demo") == "/home/admin/Other"
+
+
+def test_an_empty_value_still_inherits(make_vm, minimal_spec_data) -> None:
+    """. and "" are different decisions, and only one of them inherits."""
+    from vmhub import settings
+
+    settings.set_value("share_path", "/home/admin/Shared")
+    _vm(make_vm, minimal_spec_data, "")
+    assert rdp.share_path("demo") == "/home/admin/Shared"
+
+
+def test_the_opt_out_survives_a_spec_round_trip(make_vm, minimal_spec_data) -> None:
+    """It has to be a value vm.toml can hold, not something the GUI makes up
+    on the way to disk."""
+    from vmhub import registry
+
+    _vm(make_vm, minimal_spec_data, rdp.NO_SHARE)
+    assert registry.load_spec("demo").media.share_path == rdp.NO_SHARE

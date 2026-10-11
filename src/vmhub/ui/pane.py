@@ -445,11 +445,17 @@ class VmPane(Gtk.Box):
     def _rdp_values(self) -> tuple[str, str]:
         """The two settings as they should be written.
 
-        "." is how a VM opts out of a shared default. Empty cannot mean "map
-        nothing", because empty means "use the default".
+        "." is written through verbatim. It used to be rewritten to "" here, on
+        the reasoning that empty is how a VM maps nothing -- but empty is how a
+        VM says nothing and inherits the app-wide default, so the rewrite threw
+        the opt-out away: Save reported success and the field went straight back
+        to reading "Inherited from the app-wide default". rdp.share_path() is
+        where "." is resolved to nothing mapped.
         """
-        share = self.share_entry.get_text().strip()
-        return self.rdp_user_entry.get_text().strip(), ("" if share == "." else share)
+        return (
+            self.rdp_user_entry.get_text().strip(),
+            self.share_entry.get_text().strip(),
+        )
 
     def _on_save_rdp(self, _button: object = None) -> None:
         """Write both fields in one save, then re-derive the profile.
@@ -922,7 +928,11 @@ class VmPane(Gtk.Box):
     def _on_remove_role(self, role: str | None = None) -> None:
         if not role:
             return
-        title, _guest = ROLE_ROWS[role]
+        # `guest`, not `_guest`: work() reads it below to stop forwarding a
+        # guest port nothing is listening on any more. The underscore spelling
+        # raised NameError inside the worker on every click, so the port was
+        # never removed and the error named a variable nobody had heard of.
+        title, guest = ROLE_ROWS[role]
 
         def work(progress):
             from .. import ports as ports_mod
@@ -1602,14 +1612,23 @@ class VmPane(Gtk.Box):
         try:
             fresh = registry.load_spec(status.name)
             self._sync_entry(self.rdp_user_entry, target.user)
-            # Blank means "inherit the default", which is what the label below
-            # says. "." is only ever what the user types to opt out.
-            self._sync_entry(self.share_entry, "")
+            # This VM's own folder, which is blank when it inherits the
+            # app-wide default and holds the literal "." when it has opted
+            # out. Syncing to "" unconditionally showed a blank field for a
+            # VM that had made a decision -- and then, because Save writes
+            # both fields together, editing the account afterwards saved that
+            # blank straight back over the opt-out.
+            self._sync_entry(self.share_entry, fresh.media.share_path)
         finally:
             self._rdp_loading = False
         own_share = fresh.media.share_path
         inherited = settings.get("share_path")
-        if own_share:
+        if own_share == rdp.NO_SHARE:
+            self.share_source.set_text(
+                "This VM maps no folder: '.' overrides the app-wide default. "
+                "Clear the field to go back to inheriting it."
+            )
+        elif own_share:
             self.share_source.set_text(f"This VM maps {own_share}.")
         elif inherited:
             self.share_source.set_text(

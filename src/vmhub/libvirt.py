@@ -179,8 +179,18 @@ def materialize(
     # Firmware is detected from the imported disk by the container.
     vm_spec.boot.mode = "auto"
     vm_spec.network.guest_ports = [22]
-    vm_spec.network.set_role("web", 8006, ports.allocate("web"))
-    vm_spec.network.set_role("ssh", 22, ports.allocate("ssh"))
+    # Reserve against every host port another VM already publishes, and fold in
+    # each pick as it is made. allocate() consults only the OS, and a stopped
+    # VM's published port is not listening, so without this the import can be
+    # handed a port that is already spoken for -- and then fail to bind the
+    # next time both are started. allocate_all() gets this right for the
+    # blueprint path; this is the same reservation, written out.
+    reserved = set(ports.used_by_vms())
+    web_host = ports.allocate("web", also_wanted=reserved)
+    reserved.add(web_host)
+    ssh_host = ports.allocate("ssh", also_wanted=reserved)
+    vm_spec.network.set_role("web", 8006, web_host)
+    vm_spec.network.set_role("ssh", 22, ssh_host)
     vm_spec.validate()
 
     registry.save_spec(vm_spec)

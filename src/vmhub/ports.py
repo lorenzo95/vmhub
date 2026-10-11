@@ -35,7 +35,16 @@ def used_by_vms(exclude: str | None = None) -> dict[str, str]:
     return used
 
 
-def allocate(kind: str, *, exclude: str | None = None, also_wanted: Iterable[int] = ()) -> int:
+def allocate(kind: str, *, also_wanted: Iterable[int] = ()) -> int:
+    """A free host port from this kind's base range.
+
+    Also_wanted is the whole of the reservation mechanism: callers pass every
+    port already in use by another VM, and the OS probe covers the rest. This
+    used to take an `exclude` that it never read -- allocate_all() honours its
+    own exclude by leaving those ports out of `used`, so nothing depended on
+    it, but a parameter that looks like it does something is worse than no
+    parameter at all.
+    """
     base = BASES[kind]
     claimed = set(int(p) for p in also_wanted)
     for offset in range(0, MAX_OFFSET):
@@ -50,10 +59,16 @@ def allocate(kind: str, *, exclude: str | None = None, also_wanted: Iterable[int
 
 
 def allocate_all(*, exclude: str | None = None) -> dict[str, int]:
+    """A host port for each of the three roles vmhub drives itself.
+
+    The exclusion happens here, in what `used` contains: a VM being
+    re-allocated does not need to avoid its own current ports, and does need
+    to avoid everyone else's.
+    """
     used = set(int(p) for p in used_by_vms(exclude).keys())
     assigned: dict[str, int] = {}
     for kind in ("web", "ssh", "rdp"):
-        port = allocate(kind, exclude=exclude, also_wanted=used | set(assigned.values()))
+        port = allocate(kind, also_wanted=used | set(assigned.values()))
         assigned[kind] = port
         used.add(port)
     return assigned

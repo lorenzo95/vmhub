@@ -1473,6 +1473,58 @@ def _probe(app) -> None:
                     "the Remove button on a custom port changed nothing",
                 ))
                 print("  \033[31mFAIL\033[0m  removing a custom port changed nothing")
+
+            # ...and the Remove button on a role row (Web console / SSH / RDP),
+            # which is a different handler and had no coverage at all. It read
+            # a `guest` that the enclosing scope bound as `_guest`, so every
+            # click raised NameError inside the worker and the port stayed
+            # put. Nothing here could have caught that: the custom-port check
+            # above exercises a sibling handler and passes.
+            role = "ssh"
+            # Start from a known state. This VM can already publish `role`
+            # from an earlier run of this harness, and then "wait until it is
+            # published" returns instantly -- before the Publish worker has
+            # done anything -- so the Remove below races it and the port comes
+            # back. Take the old one away first and wait for that to land.
+            if registry.load_spec(VM).network.by_role(role) is not None:
+                pane._on_remove_role(role)
+                pump_until(
+                    lambda: registry.load_spec(VM).network.by_role(role) is None,
+                    4.0,
+                )
+            pane._on_add_role(role)
+            pump_until(
+                lambda: registry.load_spec(VM).network.by_role(role) is not None,
+                4.0,
+            )
+            added = registry.load_spec(VM).network.by_role(role)
+            check(
+                "a role port can be published",
+                lambda: _assert(
+                    added is not None and added.host,
+                    f"Publish on the {role} row did nothing",
+                ),
+            )
+            pane._on_remove_role(role)
+            pump_until(
+                lambda: registry.load_spec(VM).network.by_role(role) is None,
+                4.0,
+            )
+            check(
+                "and the Remove button on a role row takes it away again",
+                lambda: _assert(
+                    registry.load_spec(VM).network.by_role(role) is None,
+                    "the Remove button on a role row left the port published",
+                ),
+            )
+            check(
+                "and the guest port stops being forwarded with it",
+                lambda: _assert(
+                    role not in registry.load_spec(VM).network.guest_ports
+                    or not registry.load_spec(VM).network.published(),
+                    f"guest_ports still forwards {registry.load_spec(VM).network.guest_ports}",
+                ),
+            )
     finally:
         widgets.TextPrompt.present = saved_present
         for leaked in add_dialogs:
@@ -1952,6 +2004,66 @@ def _probe(app) -> None:
             and "drive=/tmp/shared-typed" in profile_file.read_text(),
             profile_file.read_text(),
         ),
+    )
+
+    # And the opt-out, which the GUI advertises and used to throw away.
+    # "." is how a VM says "map nothing here" while empty means "inherit the
+    # app-wide default". The save path rewrote "." to "" before writing it, so
+    # Save reported success, nothing that said opt-out reached disk, and the
+    # label went back to reading "Inherited from the app-wide default" -- which
+    # is the one outcome the field is there to make impossible.
+    save_pane.share_entry.set_text(rdp_mod.NO_SHARE)
+    save_pane._on_save_rdp()
+    pump_until(lambda: _saved().media.share_path == rdp_mod.NO_SHARE, 4.0)
+    check(
+        "the opt-out is stored rather than rewritten to empty",
+        lambda: _assert(
+            _saved().media.share_path == rdp_mod.NO_SHARE,
+            f"share_path={_saved().media.share_path!r}; the opt-out was "
+            "written as empty, which means inherit",
+        ),
+    )
+    _drive_gone = pump_until(
+        lambda: "drive=" not in profile_file.read_text(), 4.0
+    )
+    check(
+        "and it leaves the drive out of the profile",
+        lambda: _assert(
+            _drive_gone and "drive=" not in profile_file.read_text(),
+            [ln for ln in profile_file.read_text().splitlines() if "drive" in ln],
+        ),
+    )
+    window.select_vm(save_vm)
+    window.select_vm(VM)
+    window.select_vm(save_vm)
+    pump_until(
+        lambda: save_pane.share_entry.get_text() == rdp_mod.NO_SHARE, 4.0
+    )
+    check(
+        "a refresh still shows the opt-out in the field",
+        lambda: _assert(
+            save_pane.share_entry.get_text() == rdp_mod.NO_SHARE,
+            f"the field came back as {save_pane.share_entry.get_text()!r}",
+        ),
+    )
+    check(
+        "and the label says no folder rather than a folder called dot",
+        lambda: _assert(
+            "maps no folder" in save_pane.share_source.get_text(),
+            save_pane.share_source.get_text(),
+        ),
+    )
+    # Back to an ordinary folder so the checks below start from a normal state.
+    save_pane.share_entry.set_text("/tmp/shared-typed")
+    save_pane._on_save_rdp()
+    pump_until(
+        lambda: _saved().media.share_path == "/tmp/shared-typed", 4.0
+    )
+    pump_until(
+        lambda: "drive=/tmp/shared-typed" in profile_file.read_text(), 4.0
+    )
+    pump_until(
+        lambda: save_button is not None and not save_button.get_sensitive(), 4.0
     )
 
     # Typing while a save is in flight used to lose the keystroke. The save

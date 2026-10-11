@@ -280,3 +280,39 @@ def test_conflicts_for_excludes_the_vm_being_checked(
     _vm_claiming(make_vm, minimal_spec_data, "solo", 8006)
     monkeypatch.setattr(ports, "port_is_free", lambda *_a, **_k: True)
     assert ports.conflicts_for("solo") == []
+
+
+def test_every_allocation_in_production_reserves_what_is_already_taken() -> None:
+    """allocate() probes the OS, and a stopped VM's published port is not
+    listening -- so a call site that forgets `also_wanted` silently hands out
+    a port another VM already owns. Nothing complains until both are started,
+    and then the error names the port rather than the collision.
+
+    Scanned rather than mocked because the mistake is in the call itself: no
+    amount of exercising allocate() can tell a caller that forgot to ask.
+    """
+    import ast
+    from pathlib import Path
+
+    import vmhub.ports
+
+    src_root = Path(vmhub.ports.__file__).parent
+    offenders: list[str] = []
+    for path in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(
+                func, "id", ""
+            )
+            if name not in {"allocate", "allocate_any"}:
+                continue
+            if any(kw.arg == "also_wanted" for kw in node.keywords):
+                continue
+            offenders.append(f"{path.name}:{node.lineno} {name}()")
+    assert not offenders, (
+        "these allocation calls can hand out a host port another VM already "
+        f"publishes: {offenders}"
+    )

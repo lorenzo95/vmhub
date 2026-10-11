@@ -14,6 +14,12 @@ from .errors import VmhubError
 REMMINA = "remmina"
 FREERDP = "xfreerdp"
 
+# A VM's way of saying "map nothing here", as opposed to saying nothing at all
+# and inheriting the app-wide default. Empty cannot mean this, because empty
+# already means the other thing. Named rather than written inline so the GUI,
+# the CLI and the profile cannot drift onto two different spellings.
+NO_SHARE = "."
+
 RDP_NEGOTIATE = bytes.fromhex("030000130ee000000000000100080003000000")
 RDP_PROTOCOLS = {
     0: "0x0 - legacy, TLS must be negotiated first",
@@ -141,11 +147,20 @@ def share_path(vm: str) -> str:
     This VM's own setting wins over the app-wide default, so one machine can
     map something different from every other one without changing the default
     for the rest. Empty at both levels means nothing is mapped.
+
+    "." is how a VM opts out of the app-wide default while still having an
+    opinion, so it is not empty and must not fall through to the default
+    below. It resolves to nothing mapped, rather than to itself: the caller
+    writes whatever comes back straight into the profile as `drive=`, and a
+    literal `drive=.` would hand the client whatever directory Remmina
+    happened to be started in.
     """
     try:
         own = registry.load_spec(vm).media.share_path
     except VmhubError:
         own = ""
+    if own == NO_SHARE:
+        return ""
     return own or settings.get("share_path")
 
 
