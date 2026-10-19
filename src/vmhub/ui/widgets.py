@@ -406,3 +406,103 @@ def run_task(
         on_done=handle_done,
         on_error=handle_error if on_error is None else on_error,
     )
+
+
+class NamePromptDialog(Gtk.Window):
+    """Modal single-field dialog: ask the user for a VM name.
+
+    Used to resolve import name collisions. The dialog fires ``on_response`` with
+    the entered name (or ``None`` if cancelled) and closes; it does not block.
+    """
+
+    def __init__(
+        self,
+        parent: Gtk.Window,
+        *,
+        title: str,
+        message: str,
+        default: str = "",
+        confirm_label: str = "Use this name",
+    ) -> None:
+        super().__init__(modal=True, transient_for=parent, title=title)
+        self._response: Callable[[str | None], None] | None = None
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        root.set_margin_top(16)
+        root.set_margin_bottom(16)
+        root.set_margin_start(16)
+        root.set_margin_end(16)
+
+        heading = Gtk.Label(label=message)
+        heading.set_xalign(0.0)
+        heading.set_wrap(True)
+        root.append(heading)
+
+        self._entry = Gtk.Entry(text=default)
+        if default:
+            # Highlight the suggestion so a tap on Enter keeps it
+            self._entry.select_region(0, len(default))
+        self._entry.connect("activate", lambda *_a: self._emit_ok())
+        root.append(self._entry)
+
+        # spec.validate_name runs on every keystroke so the OK button tracks the
+        # same rule the real importer does -- "starts with a letter, then letters,
+        # digits, dash or underscore". Without this the dialog can hand a bad
+        # name back to the import, which then raises a different exception.
+        self._error_label = Gtk.Label()
+        self._error_label.add_css_class("errrow")
+        self._error_label.set_xalign(0.0)
+        self._error_label.set_wrap(True)
+        root.append(self._error_label)
+
+        self._ok_button = Gtk.Button(label=confirm_label)
+        self._ok_button.add_css_class("suggested-action")
+        self._ok_button.connect("clicked", lambda *_a: self._emit_ok())
+
+        cancel_button = Gtk.Button(label="Cancel")
+        cancel_button.connect("clicked", lambda *_a: self._emit_cancel())
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        buttons.set_halign(Gtk.Align.END)
+        buttons.append(cancel_button)
+        buttons.append(self._ok_button)
+        root.append(buttons)
+
+        self.set_child(root)
+        self.set_default_size(420, -1)
+        self._entry.connect("changed", lambda *_a: self._refresh())
+        self._refresh()
+
+    def open(self, on_response: Callable[[str | None], None]) -> None:
+        self._response = on_response
+        self.present()
+        self._entry.grab_focus()
+
+    def _refresh(self) -> None:
+        name = self._entry.get_text().strip()
+        if not name:
+            self._error_label.set_text("Name cannot be empty.")
+            self._ok_button.set_sensitive(False)
+            return
+        try:
+            spec.validate_name(name)
+        except VmhubError as exc:
+            self._error_label.set_text(str(exc))
+            self._ok_button.set_sensitive(False)
+            return
+        self._error_label.set_text("")
+        self._ok_button.set_sensitive(True)
+
+    def _emit_ok(self) -> None:
+        if not self._ok_button.get_sensitive():
+            return
+        cb, self._response = self._response, None
+        if cb is not None:
+            cb(self._entry.get_text().strip())
+        self.destroy()
+
+    def _emit_cancel(self) -> None:
+        cb, self._response = self._response, None
+        if cb is not None:
+            cb(None)
+        self.destroy()

@@ -6,6 +6,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, Gtk, Pango  # noqa: E402
 
 from .. import export, lifecycle  # noqa: E402
+from ..errors import AlreadyExists  # noqa: E402
 from . import widgets, workers  # noqa: E402
 from .pane import VmPane  # noqa: E402
 
@@ -542,14 +543,53 @@ class VmhubWindow(Gtk.ApplicationWindow):
                 file = chooser.open_finish(result)
             except Exception:
                 return
-            widgets.run_task(
-                self,
-                lambda progress: export.import_bundle(file.get_path(), progress=progress),
-                label="Importing bundle",
-                on_done=lambda vm: self.select_vm(vm),
-            )
+            self._attempt_import(file.get_path(), name=None)
 
         chooser.open(self, None, on_open)
+
+    def _attempt_import(self, archive_path: str, name: str | None) -> None:
+        """Run import_bundle, and if the chosen name is taken, prompt for a new
+        one and retry. The retry path is the same call -- a manual loop keeps
+        the staging-on-disk flow simple and avoids re-scanning the archive
+        until the user actually picks a usable name."""
+
+        def on_error(exc: BaseException) -> bool:
+            if isinstance(exc, AlreadyExists) and exc.name:
+                self._prompt_for_new_name(
+                    existing=exc.name,
+                    on_response=lambda new_name: (
+                        self._attempt_import(archive_path, name=new_name)
+                        if new_name
+                        else widgets.report_error(self, exc)
+                    ),
+                )
+                return False
+            widgets.report_error(self, exc)
+            return False
+
+        widgets.run_task(
+            self,
+            lambda progress: export.import_bundle(
+                archive_path, name=name, progress=progress
+            ),
+            label="Importing bundle",
+            on_done=lambda vm: self.select_vm(vm),
+            on_error=on_error,
+        )
+
+    def _prompt_for_new_name(
+        self,
+        existing: str,
+        on_response,
+    ) -> None:
+        dialog = widgets.NamePromptDialog(
+            self,
+            title="Name in use",
+            message=f"A VM called \u201c{existing}\u201d already exists. Pick a different name.",
+            default=f"{existing}-2",
+            confirm_label="Import with this name",
+        )
+        dialog.open(on_response)
 
     def _on_start_all(self, _button) -> None:
         pending = [s.name for s in sorted(

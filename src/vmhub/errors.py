@@ -47,7 +47,11 @@ class PortConflict(LifecycleError):
 
 
 class AlreadyExists(VmhubError):
-    pass
+    def __init__(self, message: str, *, name: str = "") -> None:
+        super().__init__(message)
+        # The name that collided -- empty when the caller did not have a single
+        # well-formed name to point at, so callers that don't care can ignore it.
+        self.name = name
 
 
 class NotFound(VmhubError):

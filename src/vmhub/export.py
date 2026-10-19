@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import shutil
 import socket
@@ -204,10 +205,17 @@ def import_bundle(
 
     target_name = spec.validate_name(name or manifest.get("name", "imported"))
     if registry.exists(target_name):
-        raise AlreadyExists(f"VM already exists: {target_name} (choose another name)")
+        raise AlreadyExists(
+            f"VM already exists: {target_name} (choose another name)",
+            name=target_name,
+        )
 
     progress(f"Importing {target_name} from {Path(archive).name}...")
-    with tempfile.TemporaryDirectory(prefix=f"vmhub-import-{target_name}-") as tmpname:
+    # Stage beside the backups directory, not in /tmp: a bundle can be tens of
+    # GB and /tmp is frequently a small tmpfs (and a 4 GB compressed qcow2
+    # routinely decompresses past it). Mirrors export_vm's policy above.
+    tmpname = tempfile.mkdtemp(prefix=f"vmhub-import-{target_name}-", dir=paths.backup_dir())
+    try:
         tmp = Path(tmpname)
         with tarfile.open(archive, "r:*") as tar:
             for member in tar.getmembers():
@@ -239,7 +247,17 @@ def import_bundle(
 
         paths.disk_dir(target_name).mkdir(parents=True, exist_ok=True)
         paths.storage_dir(target_name).mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src_disk, paths.disk_path(target_name))
+        # Move the staged disk into place rather than copying it: the bundle
+        # already lives in backups/ under the project root, which is the same
+        # filesystem as the VM directory, so rename is atomic and avoids a
+        # full second write of a multi-GB image. Unlink first because rename
+        # silently overwrites on POSIX but only when the source and
+        # destination are the same file -- a stale qcow2 left behind by a
+        # previous failed attempt would be replaced otherwise, which is
+        # exactly the failure mode this path exists to avoid.
+        disk_dest = paths.disk_path(target_name)
+        disk_dest.unlink(missing_ok=True)
+        os.rename(src_disk, disk_dest)
         for entry in (bundle_root / "storage").iterdir():
             if entry.is_file():
                 shutil.copy2(entry, paths.storage_dir(target_name) / entry.name)
@@ -264,6 +282,8 @@ def import_bundle(
             **({"uuid": old_meta.get("uuid", spec.new_uuid()),
                 "mac": old_meta.get("mac", spec.new_mac())} if keep_identity else {}),
         )
+    finally:
+        shutil.rmtree(tmpname, ignore_errors=True)
 
     if keep_identity:
         progress(f"Imported {target_name} keeping original UUID/MAC")
