@@ -38,7 +38,22 @@ def _archive_name(vm: str) -> str:
 
 def _build_tar(staging: Path, dest: Path) -> Path:
     with tarfile.open(dest, "w:gz") as tar:
-        tar.add(staging, arcname=".")
+        # Add the manifest first, with a bare arcname. read_manifest() on the
+        # import side streams the gzip members and short-circuits on the first
+        # manifest.json it sees -- so a name-collision check on import can run
+        # before the multi-GB disk block has even been decompressed. Without
+        # this, every import pays the full cost of decoding past the disk
+        # just to find the manifest near the end of the archive.
+        manifest = staging / "manifest.json"
+        if manifest.is_file():
+            tar.add(manifest, arcname="manifest.json")
+        tar.add(
+            staging, arcname=".",
+            # The recursive add below would re-add manifest.json as
+            # "./manifest.json"; skip it so it stays a single, bare-named
+            # member at the start of the archive.
+            filter=lambda ti: None if ti.name == "./manifest.json" else ti,
+        )
     return dest
 
 
@@ -180,8 +195,19 @@ def export_vm(
 
 
 def read_manifest(archive: Path) -> dict[str, Any]:
+    # Stream the gzip archive header-by-header via tar.next() instead of
+    # getmembers(), which decodes the entire archive up front. Bundles built
+    # after _build_tar's manifest-first ordering lands put manifest.json in the
+    # first member; tar.next() returns it before the disk member is reached,
+    # so an import that hits AlreadyExists never has to decompress the disk.
+    # Older bundles (manifest near the end) still work -- the loop walks the
+    # whole archive, but the import flow only pays that cost when the name is
+    # actually free.
     with tarfile.open(archive, "r:*") as tar:
-        for member in tar.getmembers():
+        while True:
+            member = tar.next()
+            if member is None:
+                break
             if member.name.endswith("manifest.json"):
                 handle = tar.extractfile(member)
                 if handle is None:
