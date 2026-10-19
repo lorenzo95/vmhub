@@ -557,10 +557,13 @@ class VmhubWindow(Gtk.ApplicationWindow):
             if isinstance(exc, AlreadyExists) and exc.name:
                 self._prompt_for_new_name(
                     existing=exc.name,
+                    # Cancel means "I don't want to import this"; the user has
+                    # already seen why the dialog opened, so don't re-surface
+                    # the same AlreadyExists when they back out.
                     on_response=lambda new_name: (
                         self._attempt_import(archive_path, name=new_name)
                         if new_name
-                        else widgets.report_error(self, exc)
+                        else None
                     ),
                 )
                 return False
