@@ -236,13 +236,18 @@ def _probe(app) -> None:
     sweep(pane, "pane")
     sweep(newvm.NewVmDialog(window), "newvm")
 
-    for name in ("refresh", "doctor", "restore"):
+    for name in ("refresh", "doctor", "restore", "checkfix"):
         action = window.lookup_action(name)
         if action is None:
             failures.append((f"action:{name}", "not registered"))
             print(f"  \033[31mFAIL\033[0m  action:{name} is not registered")
             continue
         check(f"action:{name}", lambda a=action: a.activate(None))
+
+    check(
+        "a failure the app can fix offers a button",
+        lambda: widgets.report_error(window, RuntimeError("boom"), fix=lambda: None),
+    )
 
     status = window.statuses[VM]
     check("filter_store", lambda: widgets.filter_store("x", ["*.iso"]))
@@ -1339,6 +1344,18 @@ def _probe(app) -> None:
             f"resolves={win_resolves}",
         ))
         print("  \033[31mFAIL\033[0m  the header overflow menu's actions do not resolve")
+
+    # The entry has to be in the menu, not only registered as an action: a
+    # check-and-fix nobody can find is the same as no check-and-fix.
+    menu_labels = [
+        label for label, _action in getattr(window, "overflow_entries", [])
+    ]
+    if any("Check and fix" in label for label in menu_labels):
+        exercised.append("the overflow menu offers check and fix")
+        print("  \033[32mPASS\033[0m  the overflow menu offers check and fix")
+    else:
+        failures.append(("check and fix in the menu", str(menu_labels)))
+        print("  \033[31mFAIL\033[0m  the overflow menu has no check-and-fix entry")
 
     # ---- the tab you are on carries over to a VM you have not opened ----
     # Every new pane used to open on the Console, so comparing two machines

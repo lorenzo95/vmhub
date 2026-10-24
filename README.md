@@ -618,6 +618,13 @@ Left: every VM with a live state dot, resources and badges. Right: six tabs.
   with an unsaved edit says so rather than dropping it.
 - Right-click a VM in the sidebar for console, start/stop, clone, export and
   delete. `Ctrl+N` creates a new VM.
+- **Check and fix…** in the overflow menu looks for the two things the app can
+  put right by itself — a VM whose container podman lost, and a host port two
+  VMs both claim — and offers to put them right. A start that fails because of
+  a port clash says so with a **Fix** button next to **Close**, rather than
+  asking the user to run a command. The Fix moves the port to one that is
+  free and starts the VM; the number in `vm.toml` changes, and the change is
+  said out loud afterwards.
 - **Hardware** — edit vCPUs, RAM, disk size and disk bus; see UUID, MAC,
   backing file, and a per-VM internet toggle.
 - **Ports** — publish a guest port, change its host or guest number, and set
@@ -814,7 +821,9 @@ reports them:
 
 Stopping it asks the guest to shut down first, the same way a normal stop
 does, so its files get closed. Starting the VM clears the leftovers and then
-starts it properly. 
+starts it properly. The GUI has the same repair under **Check and fix…**, and
+offers a **Fix** button next to **Close** when a start fails over a port.
+
 ## Layout
 
 ```

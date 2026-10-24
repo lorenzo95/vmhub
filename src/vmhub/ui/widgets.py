@@ -361,15 +361,48 @@ def prompt_text(
     )
 
 
-def report_error(parent: Gtk.Window, exc: BaseException) -> None:
+def report_error(
+    parent: Gtk.Window,
+    exc: BaseException,
+    *,
+    fix: Callable[[], None] | None = None,
+    fix_label: str = "Fix",
+) -> None:
+    """Show a failure, with a way out of it when the app has one.
+
+    A button that does the fixing beats a line telling the user which
+    command to type: the command is the same every time, and the user
+    should not have to know it. The command stays in the error itself,
+    for the CLI, which has no buttons.
+    """
+    if fix is None:
+        dialog = Gtk.AlertDialog(
+            message="Operation failed",
+            detail=workers.describe(exc),
+            buttons=["Close"],
+            default_button=0,
+            cancel_button=0,
+        )
+        dialog.show(parent)
+        return
+
     dialog = Gtk.AlertDialog(
         message="Operation failed",
         detail=workers.describe(exc),
-        buttons=["Close"],
+        buttons=[fix_label, "Close"],
         default_button=0,
-        cancel_button=0,
+        cancel_button=1,
     )
-    dialog.show(parent)
+
+    def on_choice(source, result):
+        try:
+            chosen = source.choose_finish(result)
+        except Exception:
+            return
+        if chosen == 0:
+            fix()
+
+    dialog.choose(parent, None, on_choice)
 
 
 def run_task(

@@ -8,8 +8,8 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
-from .. import blueprints, disk, export, iso as isomod, lifecycle, paths, podman, rdp, registry, settings, spec  # noqa: E402
-from ..errors import VmhubError  # noqa: E402
+from .. import blueprints, disk, export, iso as isomod, lifecycle, paths, podman, ports, rdp, registry, settings, spec  # noqa: E402
+from ..errors import PortConflict, VmhubError  # noqa: E402
 # The exposure vocabulary is spec's, not the UI's: vmctl prints the
 # same words. Re-exported here so the ports tab and its tests can say
 # pane.EXPOSED_BINDS.
@@ -1788,7 +1788,53 @@ class VmPane(Gtk.Box):
                 self.window,
                 lambda progress: lifecycle.start(self.vm, progress=progress),
                 label=f"Starting {self.vm}",
+                on_error=self._on_start_failed,
             )
+
+    def _on_start_failed(self, exc: BaseException) -> None:
+        """Offer to fix a start that failed for a reason the app can fix.
+
+        A port clash is the app's own bookkeeping: it can be put right
+        by moving the port, and a button that does that is a better
+        answer than a line telling the user which command to type.
+        """
+        status = getattr(self.window, "_vmhub_status", None)
+        if status is not None:
+            status.pop()
+        if not isinstance(exc, PortConflict):
+            widgets.report_error(self.window, exc)
+            return
+        widgets.report_error(
+            self.window,
+            exc,
+            fix=lambda: self._move_the_port_and_start(),
+        )
+
+    def _move_the_port_and_start(self) -> None:
+        """Give the VM a port it can use, then start it.
+
+        The port moves in vm.toml, so the number the user chose is not
+        the number the VM runs on afterwards -- which is why the change
+        is said out loud afterwards.
+        """
+
+        def work(progress):
+            changes = ports.ensure_for(self.vm)
+            for change in changes:
+                progress(f"port repaired: {change}")
+            lifecycle.start(self.vm, progress=progress)
+            return changes
+
+        def done(changes):
+            if changes:
+                self.window.report(f"{self.vm}: " + "; ".join(changes))
+
+        widgets.run_task(
+            self.window,
+            work,
+            label=f"Fixing {self.vm}",
+            on_done=done,
+        )
 
     def _on_force_stop(self, _button: object = None) -> None:
         dialog = Gtk.AlertDialog(

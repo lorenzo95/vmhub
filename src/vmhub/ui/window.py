@@ -5,7 +5,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, Gtk, Pango  # noqa: E402
 
-from .. import export, lifecycle, registry  # noqa: E402
+from .. import export, lifecycle, ports, registry  # noqa: E402
 from ..errors import AlreadyExists  # noqa: E402
 from . import widgets, workers  # noqa: E402
 from .pane import VmPane  # noqa: E402
@@ -115,10 +115,18 @@ class VmhubWindow(Gtk.ApplicationWindow):
 
         menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic")
         menu = Gio.Menu()
+        # One list, so the menu and the test cannot disagree: the menu
+        # model itself cannot be read back from Python.
+        entries = [
+            ("Refresh", "win.refresh"),
+            ("Check and fix…", "win.checkfix"),
+            ("Doctor", "win.doctor"),
+            ("Restore running VMs", "win.restore"),
+        ]
+        self.overflow_entries = entries + [("Preferences…", "win.prefs")]
         section = Gio.Menu()
-        section.append("Refresh", "win.refresh")
-        section.append("Doctor", "win.doctor")
-        section.append("Restore running VMs", "win.restore")
+        for label, action in entries:
+            section.append(label, action)
         menu.append_section(None, section)
         menu.append("Preferences…", "win.prefs")
         menu_button.set_menu_model(menu)
@@ -246,6 +254,9 @@ class VmhubWindow(Gtk.ApplicationWindow):
         doctor = Gio.SimpleAction.new("doctor", None)
         doctor.connect("activate", lambda *a: self._on_doctor())
         self.add_action(doctor)
+        checkfix = Gio.SimpleAction.new("checkfix", None)
+        checkfix.connect("activate", lambda *a: self._on_check_and_fix())
+        self.add_action(checkfix)
         restore = Gio.SimpleAction.new("restore", None)
         restore.connect("activate", lambda *a: self._on_restore())
         self.add_action(restore)
@@ -628,6 +639,77 @@ class VmhubWindow(Gtk.ApplicationWindow):
         widgets.run_task(
             self, work, label=f"Starting {len(pending)} VM(s)",
             on_done=lambda done: self.report(f"Started {len(done)} VM(s)"),
+        )
+
+    def _on_check_and_fix(self, _button: object = None) -> None:
+        """Look for what the app can put right, and offer to put it right.
+
+        Two things qualify. A VM whose container podman lost still has
+        its processes running, holding its ports, and nothing can manage
+        it. And a host port two VMs both claim stops one of them from
+        starting. Both are the app's own bookkeeping, and both have one
+        obvious repair, so the user should not have to know the commands.
+        """
+        leftovers = [s for s in lifecycle.list_vms() if s.leftover]
+        clashes = ports.collisions()
+
+        lines: list[str] = []
+        for item in leftovers:
+            lines.append(
+                f"{item.name}: podman lost its container; "
+                f"{', '.join(str(pid) for pid in item.leftover_pids)} still running"
+            )
+        for port, names in sorted(clashes.items()):
+            lines.append(f"host port {port} is claimed by {', '.join(names)}")
+
+        if not lines:
+            dialog = Gtk.AlertDialog(
+                message="Nothing to fix",
+                detail="No lost containers, and no host port two VMs both claim.",
+                buttons=["Close"],
+                default_button=0,
+                cancel_button=0,
+            )
+            dialog.show(self)
+            return
+
+        dialog = Gtk.AlertDialog(
+            message=f"{len(lines)} problem(s) found",
+            detail="\n".join(lines),
+            buttons=["Fix", "Close"],
+            default_button=0,
+            cancel_button=1,
+        )
+
+        def on_choice(source, result):
+            try:
+                chosen = source.choose_finish(result)
+            except Exception:
+                return
+            if chosen == 0:
+                self._fix_problems([item.name for item in leftovers])
+
+        dialog.choose(self, None, on_choice)
+
+    def _fix_problems(self, leftovers: list[str]) -> None:
+        """Clear the leftovers and give every VM a port it can use."""
+
+        def work(progress):
+            notes: list[str] = []
+            for name in leftovers:
+                notes += lifecycle.stop_leftovers(name, progress=progress)
+            for vm, changes in ports.repair_all().items():
+                notes += [f"{vm}: {change}" for change in changes]
+            return notes
+
+        def done(notes: list[str]) -> None:
+            if notes:
+                self.report("Fixed: " + "; ".join(notes))
+            else:
+                self.report("Nothing needed fixing")
+
+        widgets.run_task(
+            self, work, label="Fixing", on_done=done,
         )
 
     def _on_stop_all(self, _button) -> None:
