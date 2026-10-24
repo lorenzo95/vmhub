@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from vmhub import paths, ports, spec
+from vmhub import paths, ports, registry, spec
 
 
 @pytest.fixture
@@ -316,3 +316,30 @@ def test_every_allocation_in_production_reserves_what_is_already_taken() -> None
         "these allocation calls can hand out a host port another VM already "
         f"publishes: {offenders}"
     )
+
+
+def test_repairing_leaves_a_running_vms_port_where_it_is(
+    make_vm, minimal_spec_data, monkeypatch
+) -> None:
+    """A running VM's ports are held by its own container.
+
+    That is what "in use" looks like from the outside, and moving the
+    number in vm.toml would leave the container publishing the old one.
+    """
+    _vm_claiming(make_vm, minimal_spec_data, "live", 8006)
+    monkeypatch.setattr(ports, "port_is_free", lambda *_a, **_k: False)
+    monkeypatch.setattr(ports.podman, "is_running", lambda vm: True)
+    assert ports.ensure_for("live") == []
+    assert registry.load_spec("live").network.published() == {8006: 22}
+
+
+def test_repairing_moves_a_stopped_vms_port_out_of_the_way(
+    make_vm, minimal_spec_data, monkeypatch
+) -> None:
+    """The other half: a port that is busy does get a new number."""
+    _vm_claiming(make_vm, minimal_spec_data, "cold", 8006)
+    monkeypatch.setattr(ports, "port_is_free", lambda port, *_a, **_k: port != 8006)
+    monkeypatch.setattr(ports.podman, "is_running", lambda vm: False)
+    changes = ports.ensure_for("cold")
+    assert changes, "a busy port was left alone"
+    assert registry.load_spec("cold").network.published() != {8006: 22}

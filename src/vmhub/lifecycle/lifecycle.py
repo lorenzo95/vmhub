@@ -7,11 +7,11 @@ grouping and the import list are new.
 
 from __future__ import annotations
 
-import getpass, os, shutil, time
+import getpass, os, shutil, signal, time
 
 from pathlib import Path
 
-from .. import blueprints, disk, paths, podman, ports, qga, qmp, registry, spec
+from .. import blueprints, disk, paths, podman, ports, procs, qga, qmp, registry, spec
 
 from ..errors import (
     AlreadyExists,
@@ -238,6 +238,12 @@ def start(vm: str, *, progress: Progress = _noop, repair: bool = False) -> str:
     vm_spec = registry.load_spec(vm)
 
     if not podman.is_running(vm):
+        # A VM whose container podman lost is still running: its QEMU
+        # holds the disk open and its forwarder holds the host ports.
+        # Starting it on top of that would fail on a locked disk and on
+        # a conflict with its own ports, so the leftovers go first.
+        if stop_leftovers(vm, progress=progress):
+            vm_spec = registry.load_spec(vm)
         # Used to call ensure_for() here, which rewrote vm.toml and picked a
         # different port than the one on file. The user was told in a progress
         # line that scrolls away, and only saw the new number once they
@@ -245,14 +251,22 @@ def start(vm: str, *, progress: Progress = _noop, repair: bool = False) -> str:
         # their back. Refuse instead, and leave the number alone.
         blocked = ports.conflicts_for(vm)
         if blocked and not repair:
+            hint = (
+                f"  fix: vmctl repair-ports {vm}   "
+                f"(reassigns them and rewrites vm.toml)\n"
+                f"       or vmctl start {vm} --repair-ports   "
+                f"(reassigns them just for this start)\n"
+                f"       or pick a different port in the GUI's Ports tab"
+            )
+            if any("leftover" in problem for problem in blocked):
+                hint += (
+                    f"\n       or vmctl stop {vm}   "
+                    f"(clears the leftover instance holding the port)"
+                )
             raise PortConflict(
-                f"{vm} cannot start:\n"
-                + "\n".join(f"  {b}" for b in blocked)
-                + f"\n  fix: vmctl repair-ports {vm}   "
-                f"(reassigns them and rewrites vm.toml)"
-                + f"\n       or vmctl start {vm} --repair-ports   "
-                f"(reassigns them just for this start)"
-                + f"\n       or pick a different port in the GUI's Ports tab"
+                f"{vm} cannot start:\n" + "\n".join(f"  {b}" for b in blocked),
+                vm=vm,
+                hint=hint,
             )
         for change in ports.ensure_for(vm):
             progress(f"port repaired: {change}")
@@ -350,6 +364,160 @@ def _startup_failure(vm: str) -> str:
 
 STOP_MODES = ("guest", "graceful", "power", "force")
 
+# How long a leftover QEMU is given to go away on its own after the guest
+# has been asked to power down. The container's own shutdown waits 13
+# seconds for the guest and then gives up on it; this waits a little
+# longer, because here there is no container to wait for the guest with.
+LEFTOVER_STOP_TIMEOUT = 30
+
+
+def _leftovers(vm: str) -> procs.Leftovers:
+    """What is still running for a VM that podman has no container for."""
+    if podman.is_running(vm):
+        # The container is alive, so whatever is running belongs to it.
+        return procs.Leftovers()
+    try:
+        meta = registry.load_meta(vm)
+    except Exception:
+        return procs.Leftovers()
+    try:
+        vm_spec = registry.load_spec(vm)
+    except Exception:
+        vm_spec = None
+    published = vm_spec.network.published() if vm_spec else ()
+    return procs.leftovers(
+        procs.scan(),
+        uuid=meta.uuid,
+        container=podman.container_name(vm),
+        host_ports=published,
+    )
+
+
+def _stop_leftover_container(found: procs.Leftovers) -> None:
+    """Ask a lost container's processes to shut down, the way podman would.
+
+    podman stop sends SIGTERM to the container's init, and the image's
+    own shutdown logic does the rest: an ACPI powerdown to the guest,
+    then a wait for QEMU to go. The init is still there -- it is the one
+    process podman did not take with it -- so the same signal does the
+    same work, and the guest is given the chance to close its files.
+    """
+    conmon = found.conmon
+    if not conmon:
+        return
+    if not procs.still_matches(conmon.pid, flag="-n", value=conmon.container):
+        return
+    for pid in procs.children_of(conmon.pid):
+        procs.signal_pid(pid, signal.SIGTERM)
+
+
+def _powerdown_leftover(vm: str) -> None:
+    """Ask the guest to power down over QMP.
+
+    Used when the container's own init is gone: there is no image
+    shutdown logic left to ask, but QEMU can still ask the guest to
+    power itself off, which is the clean version of stopping.
+    """
+    try:
+        with qmp.Qmp(paths.qmp_path(vm), timeout=5) as client:
+            client.execute("system_powerdown")
+    except (QmpError, OSError, NotFound):
+        pass
+
+
+def _cut_leftover_power(vm: str, qemu: procs.Qemu) -> None:
+    """Cut the power to a leftover QEMU that would not shut down.
+
+    The guest is asked over QMP first, which is the same cut the
+    "power" stop mode uses, and the process is killed only if QEMU is
+    still there afterwards.
+    """
+    if not procs.still_matches(qemu.pid, flag="-uuid", value=qemu.uuid):
+        return
+    try:
+        with qmp.Qmp(paths.qmp_path(vm), timeout=5) as client:
+            client.quit()
+    except (QmpError, OSError, NotFound):
+        pass
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not procs.alive(qemu.pid):
+            return
+        time.sleep(0.2)
+    procs.terminate(qemu.pid)
+
+
+def stop_leftovers(
+    vm: str, *, mode: str | None = None, progress: Progress = _noop
+) -> list[str]:
+    """Clear away the processes a lost container left behind.
+
+    A VM whose container podman has lost is still running: its QEMU
+    holds the disk open and its port forwarder holds the host ports.
+    Nothing in vmhub can stop it, because podman has no container to
+    stop -- so the processes are found and stopped here.
+
+    The guest is asked to shut down first and is only cut off if it
+    does not, so it gets the chance to close its files. The forwarder
+    is then terminated, which is what releases the host ports, and
+    whatever is left of the container's process tree goes with it.
+    """
+    progress = progress or _noop
+    found = _leftovers(vm)
+    if not found.running:
+        return []
+
+    actions: list[str] = []
+    progress(f"{vm}: podman lost this VM's container; clearing its leftovers")
+    if found.qemu:
+        if mode == "force":
+            progress(f"  killing the leftover QEMU (pid {found.qemu.pid})")
+            procs.kill_now(found.qemu.pid)
+        elif mode == "power":
+            progress(f"  cutting power to the leftover QEMU (pid {found.qemu.pid})")
+            _cut_leftover_power(vm, found.qemu)
+        else:
+            if mode == "guest":
+                progress("  asking the guest agent in the VM to shut down")
+                try:
+                    qga.shutdown(vm)
+                except (QgaError, NotFound, OSError):
+                    pass
+            else:
+                progress(
+                    f"  asking the guest in {vm} to shut down (QEMU pid {found.qemu.pid})"
+                )
+                if found.conmon:
+                    _stop_leftover_container(found)
+                else:
+                    _powerdown_leftover(vm)
+            deadline = time.monotonic() + LEFTOVER_STOP_TIMEOUT
+            while time.monotonic() < deadline:
+                if not procs.alive(found.qemu.pid):
+                    break
+                time.sleep(0.5)
+            if procs.alive(found.qemu.pid):
+                progress("  the guest did not shut down; cutting power")
+                _cut_leftover_power(vm, found.qemu)
+        actions.append(f"stopped the leftover QEMU (pid {found.qemu.pid})")
+
+    if found.forwarder:
+        held = ", ".join(str(port) for port in found.forwarder.host_ports)
+        progress(f"  releasing the host ports it was holding ({held})")
+        procs.terminate(found.forwarder.pid)
+        actions.append(
+            f"released host port {held}"
+            if held
+            else f"stopped the leftover port forwarder (pid {found.forwarder.pid})"
+        )
+
+    if found.conmon:
+        for pid in procs.process_tree(found.conmon.pid):
+            procs.terminate(pid, timeout=2)
+        procs.terminate(found.conmon.pid, timeout=2)
+        actions.append(f"stopped the leftover container (conmon pid {found.conmon.pid})")
+    return actions
+
 
 def _mark_stopped(vm: str, *, preserve_run_state: bool = False) -> None:
     if preserve_run_state:
@@ -400,9 +568,19 @@ def stop(
 
     _mark_stopped(vm, preserve_run_state=preserve_run_state)
     if not podman.exists(vm):
+        # podman has no container for this VM, but the VM may still be
+        # running: a container podman lost leaves its QEMU and its port
+        # forwarder behind, and "stop" has to mean those too.
+        if stop_leftovers(vm, mode=mode, progress=progress):
+            return mode
         progress(f"{vm} has no container")
         return mode
     if not podman.is_running(vm):
+        # A container that exists but is stopped can still have a leftover
+        # behind it: the VM was started, podman lost the container, and a
+        # new one was created afterwards. Those processes hold the ports.
+        if stop_leftovers(vm, mode=mode, progress=progress):
+            return mode
         progress(f"{vm} is already stopped")
         return mode
 

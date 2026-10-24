@@ -43,7 +43,17 @@ class NoFreePort(LifecycleError):
 
 
 class PortConflict(LifecycleError):
-    pass
+    """A host port the VM needs cannot be used.
+
+    The advice is kept apart from the message on purpose. The CLI shows
+    it as a command to run, the GUI offers a button that does the same
+    thing, and neither has to parse the other's wording.
+    """
+
+    def __init__(self, message: str, *, vm: str = "", hint: str = "") -> None:
+        super().__init__(message)
+        self.vm = vm
+        self.hint = hint
 
 
 class AlreadyExists(VmhubError):

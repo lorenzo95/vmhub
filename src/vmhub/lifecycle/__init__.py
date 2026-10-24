@@ -29,6 +29,7 @@ from .lifecycle import (
     start,
     stop,
     stop_all,
+    stop_leftovers,
     wait_until_podman_can_run,
 )
 

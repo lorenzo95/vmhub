@@ -15,7 +15,7 @@ from pathlib import Path
 
 from typing import Any
 
-from .. import blueprints, disk, paths, podman, ports, qga, qmp, registry, spec
+from .. import blueprints, disk, paths, podman, ports, procs, qga, qmp, registry, spec
 
 from ..errors import (
     DiskError,
@@ -77,6 +77,10 @@ class VmStatus:
     finish_install_needed: bool = False
     notices: list[Notice] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # What is still running for a VM whose container podman has lost.
+    leftover: bool = False
+    leftover_pids: list[int] = field(default_factory=list)
+    leftover_ports: list[int] = field(default_factory=list)
 
     @property
     def summary(self) -> str:
@@ -108,6 +112,7 @@ class Ctx:
     addresses: list[tuple[str, str]] = field(default_factory=list)
     shadowed: str = ""
     _peer: str | None = None
+    _procs: procs.Snapshot | None = None
 
     def container(self, vm: str) -> podman.Container | None:
         return self.containers.get(vm)
@@ -116,9 +121,42 @@ class Ctx:
         container = self.containers.get(vm)
         return container.state if container else "absent"
 
-    def powered(self, vm: str) -> bool:
+    def container_powered(self, vm: str) -> bool:
+        """Whether podman still has a running container for this VM."""
         container = self.containers.get(vm)
         return bool(container and container.powered)
+
+    def powered(self, vm: str) -> bool:
+        """Whether the VM is running, container or not.
+
+        A VM whose container podman has lost is still running: its QEMU
+        is alive and holding the disk open. Reporting it as stopped is
+        what lets the leftovers sit there for ever.
+        """
+        if self.container_powered(vm):
+            return True
+        return self.leftovers(vm).qemu is not None
+
+    def proc_snapshot(self) -> procs.Snapshot:
+        """The host's QEMU, forwarder and conmon processes, read once."""
+        if self._procs is None:
+            self._procs = procs.scan()
+        return self._procs
+
+    def leftovers(self, vm: str) -> procs.Leftovers:
+        """What is still running for a VM that podman has no container for."""
+        meta = self.meta(vm)
+        try:
+            vm_spec = self.vm_spec(vm)
+        except Exception:
+            vm_spec = None
+        published = vm_spec.network.published() if vm_spec else ()
+        return procs.leftovers(
+            self.proc_snapshot(),
+            uuid=meta.uuid,
+            container=podman.container_name(vm),
+            host_ports=published,
+        )
 
     def vm_spec(self, vm: str) -> spec.VmSpec:
         if vm not in self.specs:
@@ -179,6 +217,10 @@ def status(vm: str, *, ctx: Ctx | None = None) -> VmStatus:
     has_disk = bool(info)
     snap_list = disk.snapshot_names(disk_file, data=info) if has_disk else []
     targets = peer_dial_targets(vm, ctx=ctx)
+    # Only worth looking for when podman has no running container: a VM
+    # with a container is managed by podman, and anything else it left
+    # behind is a stale process from an earlier life, not a live VM.
+    leftover = procs.Leftovers() if ctx.container_powered(vm) else ctx.leftovers(vm)
 
     result = VmStatus(
         name=vm,
@@ -208,7 +250,18 @@ def status(vm: str, *, ctx: Ctx | None = None) -> VmStatus:
         peer_targets=targets,
         live_media=[label for _, label in ctx.media(vm)],
         drifted=drifted(vm, ctx=ctx),
+        leftover=leftover.running,
+        leftover_pids=leftover.pids,
+        leftover_ports=leftover.held_ports,
     )
+    if leftover.running:
+        held = ", ".join(str(port) for port in sorted(leftover.held_ports))
+        result.notices.append(
+            f"podman lost the container for {vm}, but {leftover.describe()} is still "
+            f"running -- the VM is up"
+            + (f" and still holding host port {held}" if held else "")
+            + f", but vmhub cannot manage it. Clear it with: vmctl stop {vm}"
+        )
     if has_disk:
         try:
             result.disk_actual = spec.format_size(disk.actual_size(disk_file))

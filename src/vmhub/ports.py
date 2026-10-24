@@ -3,7 +3,7 @@ from __future__ import annotations
 import socket
 from typing import Iterable
 
-from . import registry, spec
+from . import podman, procs, registry, spec
 from .errors import NoFreePort
 
 BASES = {"web": 8006, "ssh": 2222, "rdp": 3389}
@@ -217,6 +217,43 @@ def _claimed_by_others(exclude: str) -> dict[int, str]:
     return claimed
 
 
+def own_forwarder_ports(vm: str, vm_spec: "spec.VmSpec") -> set[int]:
+    """The host ports this VM's own port forwarder holds.
+
+    The forwarder is found by the network namespace it shares with this
+    VM's QEMU, which is an exact link: the QEMU carries the VM's UUID on
+    its command line, and the forwarder and the QEMU are in one namespace.
+    """
+    try:
+        meta = registry.load_meta(vm)
+    except Exception:
+        return set()
+    found = procs.leftovers(
+        procs.scan(),
+        uuid=meta.uuid,
+        container=podman.container_name(vm),
+        host_ports=vm_spec.network.published(),
+    )
+    return set(found.held_ports)
+
+
+def leftover_ports(vm: str, vm_spec: "spec.VmSpec") -> set[int]:
+    """The host ports a leftover instance of this VM is still holding.
+
+    A VM whose container podman lost keeps its port forwarder alive, and
+    that forwarder keeps the host ports bound. The ports are not in use
+    by anything foreign -- they are held by this VM's own previous
+    instance -- and saying otherwise sends the user off to look for a
+    process they do not have.
+
+    A running VM is not a leftover: the forwarder belongs to its
+    container, and the ports it holds are the VM's own.
+    """
+    if podman.is_running(vm):
+        return set()
+    return own_forwarder_ports(vm, vm_spec)
+
+
 def conflicts_for(vm: str) -> list[str]:
     """Which of this VM's host ports cannot be used, and why. Never writes.
 
@@ -227,6 +264,7 @@ def conflicts_for(vm: str) -> list[str]:
     """
     vm_spec = registry.load_spec(vm)
     claimed = _claimed_by_others(vm)
+    mine = leftover_ports(vm, vm_spec)
     problems: list[str] = []
     for port in vm_spec.network.ports:
         current = port.host
@@ -238,20 +276,37 @@ def conflicts_for(vm: str) -> list[str]:
                 f"{port.label} host port {current} is claimed by VM {holder!r}"
             )
         elif not port_is_free(current):
-            problems.append(
-                f"{port.label} host port {current} is bound by another process"
-            )
+            if current in mine:
+                problems.append(
+                    f"{port.label} host port {current} is still held by a leftover "
+                    f"instance of {vm} (podman lost its container)"
+                )
+            else:
+                problems.append(
+                    f"{port.label} host port {current} is bound by another process"
+                )
     return problems
-
 
 def ensure_for(vm: str) -> list[str]:
     """Make this VM's host ports usable, reassigning the ones that are not.
 
-    A port is unusable if another VM claims it, or if some other process holds
-    it. Ports whose guest service is not forwarded at all are dropped rather
-    than reassigned, since nothing would answer them either way.
+    A port is unusable if another VM claims it, or if some other process
+    holds it. Ports whose guest service is not forwarded at all are
+    dropped rather than reassigned, since nothing would answer them
+    either way.
+
+    A running VM's ports are left alone. They are held by its own
+    container, which is what "in use" looks like from here, and moving
+    the number in vm.toml would leave the container publishing the old
+    one.
     """
     vm_spec = registry.load_spec(vm)
+    try:
+        if podman.is_running(vm):
+            return []
+    except Exception:
+        # Without podman there is no container, so there is no running VM.
+        pass
     claimed = _claimed_by_others(vm)
     forwarded = {int(p) for p in vm_spec.network.guest_ports}
     changes: list[str] = []

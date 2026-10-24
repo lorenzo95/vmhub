@@ -1379,12 +1379,16 @@ def main() -> int:
     # numbers. It refuses now, so the user finds out instead of getting a
     # different port than the one they set.
     refused = ""
+    advice = ""
     try:
         lifecycle.start(rival, progress=None)
     except VmhubError as exc:
         refused = str(exc)
+        advice = getattr(exc, "hint", "")
     check("starting a clashing VM refuses instead of reassigning",
-          "repair-ports" in refused, refused[:200])
+          "cannot start" in refused, refused[:200])
+    check("and the advice for it is kept apart from the message",
+          "repair-ports" in advice, advice[:200])
     check("the refusal names the port it would not use",
           str(mine.network.host_for("web")) in refused, refused[:200])
     check("and rewrote nothing, so the clash is still on disk",
@@ -1793,14 +1797,18 @@ def main() -> int:
         registry.save_spec(bspec)
         before = paths.spec_path(blocked).read_text()
         refused = ""
+        advice = ""
         try:
             lifecycle.start(blocked, progress=None)
         except VmhubError as exc:
             refused = str(exc)
+            advice = getattr(exc, "hint", "")
         check("start refuses a host port that is taken",
-              str(_hogged) in refused and "repair-ports" in refused, refused[:200])
+              str(_hogged) in refused, refused[:200])
         check("and says which port and why",
               "bound by another process" in refused, refused[:200])
+        check("and how the CLI fixes it",
+              "repair-ports" in advice, advice[:200])
         check("and leaves the port in vm.toml exactly as the user set it",
               paths.spec_path(blocked).read_text() == before,
               registry.load_spec(blocked).network.by_role("web").host)

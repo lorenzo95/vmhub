@@ -98,6 +98,7 @@ def cmd_ls(args: argparse.Namespace, out: Out) -> int:
                         "state": s.summary,
                         "template": s.is_template,
                         "template_source": s.template_source,
+                        "leftover": s.leftover,
                         "ports": s.ports,
                         "cpus": s.cpus,
                         "ram": s.ram,
@@ -124,6 +125,8 @@ def cmd_ls(args: argparse.Namespace, out: Out) -> int:
         tags = []
         if item.is_template:
             tags.append(out.info("template"))
+        if item.leftover:
+            tags.append(out.warn("leftover"))
         if item.template_source:
             tags.append(out.dim(f"clone of {item.template_source}"))
         if item.peer_targets:
@@ -233,6 +236,17 @@ def cmd_new(args: argparse.Namespace, out: Out) -> int:
     return 0
 
 
+def error_text(exc: BaseException) -> str:
+    """An error, with the advice the CLI gives for it.
+
+    An error that knows how it can be fixed carries that advice apart
+    from its message, so the GUI can offer a button instead of a
+    command and this can print the command.
+    """
+    hint = getattr(exc, "hint", "")
+    return f"{exc}\n{hint}" if hint else str(exc)
+
+
 def cmd_start(args: argparse.Namespace, out: Out) -> int:
     failed = 0
     for name in args.names:
@@ -246,7 +260,7 @@ def cmd_start(args: argparse.Namespace, out: Out) -> int:
                 out.say(out.good(f"{name} started"))
         except VmhubError as exc:
             failed += 1
-            out.say(out.bad(f"{name}: {exc}"))
+            out.say(out.bad(f"{name}: {error_text(exc)}"))
     if args.console and not failed:
         open_url(lifecycle.console_url(args.names[0]))
     return 1 if failed else 0
@@ -887,13 +901,20 @@ def cmd_ports(args: argparse.Namespace, out: Out) -> int:
             out.say(out.dim(f"{args.name} publishes no ports"))
             return 0
         claimed = ports.used_by_vms(args.name)
+        mine = ports.leftover_ports(args.name, vm_spec)
+        own = ports.own_forwarder_ports(args.name, vm_spec)
         for port in net.ports:
             if not port.host:
                 note = out.dim("not published")
             elif port.host in claimed:
                 note = out.bad(f"claimed by {claimed[port.host]}")
             elif not ports.port_is_free(port.host):
-                note = out.bad("bound by another process")
+                if port.host in mine:
+                    note = out.bad("held by a leftover instance of this VM")
+                elif port.host in own:
+                    note = out.dim("held by this VM")
+                else:
+                    note = out.bad("bound by another process")
             else:
                 note = out.good("free")
             role = f"  [{port.role}]" if port.role else ""
@@ -1106,6 +1127,22 @@ def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
             f"  {out.warn('orphan')}        container {entry['container']} is "
             f"{entry['state']} but VM {entry['vm']!r} no longer exists — "
             f"it will never be stopped again. Clean up: vmctl prune"
+        )
+
+    for item in lifecycle.list_vms():
+        if not item.leftover:
+            continue
+        problems += 1
+        held = (
+            f" and holding host port {', '.join(str(p) for p in sorted(item.leftover_ports))}"
+            if item.leftover_ports
+            else ""
+        )
+        out.say(
+            f"  {out.warn('leftover')}      {item.name}: podman lost this VM's container, "
+            f"but {', '.join(str(pid) for pid in item.leftover_pids)} is still running"
+            f"{held} — the VM is up and vmhub cannot manage it. "
+            f"Clear it: vmctl stop {item.name}"
         )
 
     for name, reason in registry.broken_metas():

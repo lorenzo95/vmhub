@@ -798,6 +798,23 @@ only source of truth, so it is detected explicitly:
 
 `vmctl doctor` reports both.
 
+**Lost containers.** The other way round: podman forgets a container while the
+processes inside it keep running. The QEMU goes on holding the disk open, and
+the port forwarder podman ran for it goes on holding the host ports, so the VM
+looks stopped and cannot be started. vmhub finds those processes by what they
+are rather than by what podman thinks — the QEMU by the UUID on its command
+line, the forwarder by the network namespace it shares with that QEMU — and
+reports them:
+
+```bash
+./vmctl doctor                   # reports it as a leftover
+./vmctl ls                       # shows the VM as running, with a note
+./vmctl stop <vm>                # stops what podman left behind
+```
+
+Stopping it asks the guest to shut down first, the same way a normal stop
+does, so its files get closed. Starting the VM clears the leftovers and then
+starts it properly. 
 ## Layout
 
 ```
@@ -862,6 +879,16 @@ The usual cause is a template being started while a clone holds its disk.
 
 **A port is already in use** — `vmctl ls` shows which VM owns it. Move it with
 `vmctl set <vm> network.host_ssh=2222`.
+
+**"host port 8006 is bound by another process"** — and `vmctl ls` says the VM
+is stopped. The VM is not stopped: podman has lost its container (a storage
+reset, a wiped database, a container removed while its processes were still
+running), and the QEMU inside it is still running, still holding the disk open
+and still holding the host ports it was published on. `vmctl doctor` reports it
+as a *leftover*, and `vmctl ls` shows the VM as running with a note. Clear it
+with `vmctl stop <vm>`, which stops what podman left behind — the guest is
+asked to shut down first, so it gets the chance to close its files. Starting
+the VM clears the leftovers too and then starts it properly.
 
 **The disk seems to have vanished** — check `vmctl info <vm>` for the `backing
 file`. vmhub fails loudly rather than silently creating a blank disk.
