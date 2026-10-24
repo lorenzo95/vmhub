@@ -280,6 +280,30 @@ def _probe(app) -> None:
         exercised.append("panes are pruned when a VM disappears")
         print("  \033[32mPASS\033[0m  pane pruned when the VM disappeared")
 
+    # ---- a VM newer than the snapshot keeps its pane ----
+    # The refresh collects the list of VMs in a worker thread, so a VM
+    # created a moment ago is not in the snapshot yet. Treating that as
+    # "the VM is gone" closed the pane of a VM the user had just selected
+    # and typed into, and the edit went with it.
+    fresh = "vmhub-guicheck-fresh"
+    lifecycle.create(fresh, blueprint="alpine")
+    window.select_vm(fresh)
+    window._apply_statuses([])  # a snapshot taken before the VM existed
+    settle()
+    if fresh in window.panes and window.current == fresh:
+        exercised.append("a VM newer than the snapshot keeps its pane")
+        print("  \033[32mPASS\033[0m  a VM newer than the snapshot keeps its pane")
+    else:
+        failures.append(
+            ("stale snapshot closed a live VM's pane", f"panes={sorted(window.panes)}")
+        )
+        print(
+            "  \033[31mFAIL\033[0m  a VM newer than the snapshot lost its pane"
+        )
+    window.select_vm(VM)
+    lifecycle.remove(fresh)
+    settle()
+
     # ---- a registered action must actually CALL its handler ----
     # Every win.* item was registered and resolvable and raised
     # "TypeError: 'NoneType' object is not callable" on click, because the

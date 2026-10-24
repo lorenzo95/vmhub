@@ -5,7 +5,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, Gtk, Pango  # noqa: E402
 
-from .. import export, lifecycle  # noqa: E402
+from .. import export, lifecycle, registry  # noqa: E402
 from ..errors import AlreadyExists  # noqa: E402
 from . import widgets, workers  # noqa: E402
 from .pane import VmPane  # noqa: E402
@@ -294,6 +294,14 @@ class VmhubWindow(Gtk.ApplicationWindow):
     def _prune_panes(self) -> None:
         """Drop panes whose VM is gone; they were never released before."""
         for name in [n for n in self.panes if n not in self.statuses]:
+            # The snapshot is collected in a worker thread, so a VM created
+            # a moment ago is not in it yet. The filesystem is the truth
+            # about whether a VM is gone, and the snapshot is only a
+            # moment old: closing the pane of a VM that is merely newer
+            # than the snapshot throws away the edit the user has just
+            # typed into it.
+            if registry.exists(name):
+                continue
             pane = self.panes.pop(name)
             pane.close()
             child = self.content.get_child_by_name(name)
@@ -307,7 +315,11 @@ class VmhubWindow(Gtk.ApplicationWindow):
         self._render_list()
         self.sidebar_empty.set_visible(not self.order)
         if self.current and self.current not in self.statuses:
-            self.select_vm(None)
+            # The same story as the panes above: the snapshot may be older
+            # than the VM, and switching away from it because of that
+            # loses whatever the user has typed into it.
+            if not registry.exists(self.current):
+                self.select_vm(None)
         else:
             # Every open pane, not just the current one. Refreshing only
             # self.current meant a VM that was changed while you were looking
