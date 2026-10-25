@@ -831,6 +831,14 @@ offers a **Fix** button next to **Close** when a start fails over a port.
 ├── vmctl, vmhub, selftest, guicheck   entry points
 ├── src/vmhub/                         the implementation
 │   ├── icons/vmhub.svg                the start-menu icon
+│   ├── cli/                           the vmctl commands
+│   │   ├── output.py                  the Out class and its colours
+│   │   ├── vms.py                     the VMs: list, create, start, stop
+│   │   ├── media.py                   install media, export, import, libvirt
+│   │   ├── network.py                 the published host ports
+│   │   ├── env.py                     doctor, config, blueprints, prune
+│   │   ├── parser.py                  the argument parser
+│   │   └── main.py                    the entry point
 │   ├── lifecycle/                     start, stop, clone, snapshot, export
 │   └── ui/                            the GTK4 app
 ├── tests/                             the pytest suite

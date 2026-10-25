@@ -328,7 +328,7 @@ def test_restore_reports_failure_so_the_hook_can_retry(monkeypatch) -> None:
     indistinguishable from a working one."""
     from types import SimpleNamespace
 
-    from vmhub import cli
+    from vmhub import cli, lifecycle
 
     seen: list[list[str]] = []
 
@@ -338,7 +338,7 @@ def test_restore_reports_failure_so_the_hook_can_retry(monkeypatch) -> None:
         failures.append("winni")
         return []
 
-    monkeypatch.setattr(cli.lifecycle, "restore_run_state", fake_restore)
+    monkeypatch.setattr(lifecycle, "restore_run_state", fake_restore)
     out = SimpleNamespace(step=lambda *_a, **_k: None, say=lambda *_a, **_k: None)
     args = SimpleNamespace(quiet=True)
 
@@ -346,6 +346,6 @@ def test_restore_reports_failure_so_the_hook_can_retry(monkeypatch) -> None:
     assert seen == [["winni"]]
 
     monkeypatch.setattr(
-        cli.lifecycle, "restore_run_state", lambda progress=None, failures=None: []
+        lifecycle, "restore_run_state", lambda progress=None, failures=None: []
     )
     assert cli.cmd_restore(args, out) == 0
