@@ -1862,12 +1862,10 @@ def _probe(app) -> None:
             expose_box.set_active(False)
             settle_dialog()
             dialog.accept_button.emit("clicked")
-            pump_until(
-                lambda: registry.load_spec(scope_vm)
-                .network.ports[1]
-                .bind
-                == ""
-            )
+            # Wait for the row, not for the write. The write lands in a
+            # worker thread and the row is rebuilt from the spec, so the
+            # row is the thing being checked and the thing to wait for.
+            pump_until(lambda: _row_scopes()[1] == ["Localhost only"], 8.0)
             roles, extras = _row_scopes()
             check(
                 "ticking the expose box updates the row without reopening it",
@@ -2086,6 +2084,12 @@ def _probe(app) -> None:
             save_pane.share_entry.get_text() == rdp_mod.NO_SHARE,
             f"the field came back as {save_pane.share_entry.get_text()!r}",
         ),
+    )
+    # The label is written by the refresh, and the entry was set by the
+    # test itself, so waiting for the entry proves nothing about the
+    # label. Wait for the label.
+    pump_until(
+        lambda: "maps no folder" in save_pane.share_source.get_text(), 8.0
     )
     check(
         "and the label says no folder rather than a folder called dot",
