@@ -4,13 +4,26 @@ import os
 import pwd
 import shutil
 import subprocess
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterator
 
 from . import paths
 from .errors import LifecycleError
 
 SYSTEMD_UNIT_NAME = "vmhub.service"
 SYSVINIT_SCRIPT = "/etc/init.d/vmhub"
+
+# The user whose VMs these are, when it cannot be worked out from the
+# environment. Set by `vmctl autostart install --owner`, and by the install
+# itself for the duration of the call.
+#
+# It has to be settable from the environment rather than only as an argument,
+# because every path in this module resolves the owner through _vm_owner() and
+# those helpers are called from all over the place. A cron job has neither
+# SUDO_USER nor USER, so without this the install lands on root.
+OWNER_ENV = "VMHUB_OWNER"
 
 # The name the GUI window calls itself, and so the name of a menu entry with
 # the suffix removed. A desktop binds the two together through this string:
@@ -71,7 +84,65 @@ def _vm_owner() -> str:
     Installing with sudo must not bake in "root": rootless podman keeps its
     store under the user's home, so running as root at boot would start nothing.
     """
+    override = os.environ.get(OWNER_ENV)
+    if override:
+        return override
     return os.environ.get("SUDO_USER") or os.environ.get("USER") or _login_user()
+
+
+@contextmanager
+def _owner_override(owner: str | None) -> Iterator[None]:
+    """Run a block with a known VM owner."""
+    if not owner:
+        yield
+        return
+    previous = os.environ.get(OWNER_ENV)
+    os.environ[OWNER_ENV] = owner
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(OWNER_ENV, None)
+        else:
+            os.environ[OWNER_ENV] = previous
+
+
+def resolve_owner(explicit: str | None = None) -> str:
+    """The owner to install for, and a loud refusal when there isn't one.
+
+    A root owner is always wrong. vmhub runs rootless podman, and rootless
+    podman's store lives under the owner's home -- so a unit installed for
+    root starts nothing at boot, and every message says it worked.
+
+    An environment that cannot name an owner is the same failure waiting to
+    happen: a cron job has neither SUDO_USER nor USER, and getpass falls back
+    to whoever the job runs as, which for a system cron is root. So the
+    owner has to be stated when the environment cannot state it.
+    """
+    owner = (explicit or _vm_owner() or "").strip()
+    if not owner:
+        raise LifecycleError(
+            "could not work out which user owns the VMs. Pass --owner <user>.\n"
+            "  A cron job has neither SUDO_USER nor USER, so the install would "
+            "otherwise be made for the wrong account -- and for root it starts "
+            "nothing at all, because rootless podman keeps its store under the "
+            "owner's home."
+        )
+    if owner == "root":
+        raise LifecycleError(
+            "the VM owner resolved to root, which cannot work.\n"
+            "  vmhub runs rootless podman, whose store lives under the owner's "
+            "home, so a unit installed for root starts nothing at boot.\n"
+            "  Pass --owner <user> to say who the VMs belong to."
+        )
+    try:
+        pwd.getpwnam(owner)
+    except KeyError:
+        raise LifecycleError(
+            f"no such user: {owner!r}. The VM owner has to be a real account on "
+            "this host."
+        ) from None
+    return owner
 
 
 def _login_user() -> str:
@@ -104,6 +175,15 @@ After=default.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# No timeout. systemd's default TimeoutStartSec is 90 seconds, and a
+# restore of several VMs takes longer than that: the VMs are started one at
+# a time and each one waits up to 90 seconds for QEMU to answer. With the
+# default in place systemd killed the unit part-way through the fleet and
+# left the rest of it down -- which reads as "the VMs did not come back".
+# The same goes for the stop side, where each VM can take its own shutdown
+# timeout to wind down.
+TimeoutStartSec=0
+TimeoutStopSec=0
 # systemd's default working directory is "/", and project_root() only walks
 # upward from the cwd -- so without this the unit failed with "not a vmhub
 # project root: /" on exactly the machines where it is installed.
@@ -325,8 +405,8 @@ def _linger_state() -> str:
     return result.stdout.strip().split("=", 1)[-1] or "unknown"
 
 
-def _enable_linger() -> str:
-    """Make the user unit able to run at boot, not only at login.
+def _enable_linger_result() -> tuple[str, bool]:
+    """Make a user unit able to run at boot, not only at login.
 
     systemd starts a user's manager on login and tears it down at logout. With
     lingering off there is no user manager at boot at all, so the unit cannot
@@ -334,25 +414,36 @@ def _enable_linger() -> str:
     enables and starts fine and looks healthy right up until the next reboot,
     which is why this used to be a hint in the output rather than a step: the
     symptom shows up days later and nowhere near here.
+
+    Returns the message and whether it worked. The message alone is not
+    enough: an install that says "the unit will not run at boot" and then
+    exits 0 is the failure this function exists to prevent.
     """
     user = _vm_owner()
     if shutil.which("loginctl") is None:
         return (
             "loginctl not found, so lingering cannot be enabled: the unit will "
             "only run while you are logged in. Boot restore needs "
-            "`loginctl enable-linger`."
+            "`loginctl enable-linger`.",
+            False,
         )
     result = subprocess.run(
         ["loginctl", "enable-linger", user], capture_output=True, text=True
     )
     if result.returncode == 0:
-        return f"enabled lingering for {user}, so the unit also runs at boot"
+        return f"enabled lingering for {user}, so the unit also runs at boot", True
     detail = (result.stderr or result.stdout or "").strip() or f"exit {result.returncode}"
     return (
         f"could not enable lingering for {user} ({detail}). Until that is done "
         f"the unit only runs while you are logged in, so VMs will NOT come back "
-        f"at boot. Run: sudo loginctl enable-linger {user}"
+        f"at boot. Run: sudo loginctl enable-linger {user}",
+        False,
     )
+
+
+def _enable_linger() -> str:
+    """The lingering message on its own."""
+    return _enable_linger_result()[0]
 
 
 def _user_systemctl(args: list[str]) -> subprocess.CompletedProcess:
@@ -383,61 +474,114 @@ def _user_systemctl(args: list[str]) -> subprocess.CompletedProcess:
     )
 
 
-def install(*, target: str | None = None, gui: bool = False) -> list[str]:
+@dataclass
+class InstallResult:
+    """What an install did, and whether it will actually work at boot.
+
+    The verdict is the point. An install that cannot run at boot -- the unit
+    was not enabled, or lingering is off -- used to print a sentence about it
+    and then exit 0, so a provisioning script read "success" and shipped a box
+    whose VMs never came back.
+    """
+
+    messages: list[str] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.problems
+
+    def __iter__(self) -> Iterator[str]:
+        """Iterating gives the messages, so a caller that only wants those
+        keeps working."""
+        return iter(self.messages)
+
+
+def install(
+    *, target: str | None = None, gui: bool = False, owner: str | None = None
+) -> InstallResult:
     chosen = target or detect_init()
-    done: list[str] = []
+    result = InstallResult()
 
-    if chosen == "systemd":
-        unit = _systemd_unit_path()
-        unit.parent.mkdir(parents=True, exist_ok=True)
-        unit.write_text(systemd_unit_text())
-        done.append(f"wrote {unit}")
-        if shutil.which("systemctl"):
-            _user_systemctl(["daemon-reload"])
-            result = _user_systemctl(["enable", "--now", SYSTEMD_UNIT_NAME])
-            if result.returncode == 0:
-                done.append("enabled and started vmhub.service")
+    with _owner_override(owner):
+        # Raises when the owner cannot be worked out, is root, or is not a
+        # real account. Better a refusal at install time than a unit that
+        # starts nothing and reports success.
+        resolve_owner(owner)
+
+        if chosen == "systemd":
+            unit = _systemd_unit_path()
+            unit.parent.mkdir(parents=True, exist_ok=True)
+            unit.write_text(systemd_unit_text())
+            result.messages.append(f"wrote {unit}")
+            if shutil.which("systemctl"):
+                _user_systemctl(["daemon-reload"])
+                outcome = _user_systemctl(["enable", "--now", SYSTEMD_UNIT_NAME])
+                if outcome.returncode == 0:
+                    result.messages.append("enabled and started vmhub.service")
+                else:
+                    result.problems.append(_enable_failure(outcome))
+                    result.problems.append(
+                        f"run manually: systemctl --user enable --now {SYSTEMD_UNIT_NAME}"
+                    )
             else:
-                done.append(_enable_failure(result))
-                done.append(
-                    f"run manually: systemctl --user enable --now {SYSTEMD_UNIT_NAME}"
+                result.problems.append(
+                    "systemctl not found; unit written but not enabled, so the "
+                    "VMs will NOT come back at boot"
                 )
-        else:
-            done.append("systemctl not found; unit written but not enabled")
-        done.append(_enable_linger())
+            message, ok = _enable_linger_result()
+            result.messages.append(message)
+            if not ok:
+                result.problems.append(message)
 
-    elif chosen == "sysvinit":
-        script = Path(SYSVINIT_SCRIPT)
-        if os.geteuid() == 0:
-            script.write_text(sysvinit_script_text())
-            script.chmod(0o755)
-            done.append(f"wrote {script}")
-            if shutil.which("update-rc.d"):
-                subprocess.run(["update-rc.d", "vmhub", "defaults"], check=False)
-                done.append("registered with update-rc.d")
-            if shutil.which("service"):
-                subprocess.run(["service", "vmhub", "start"], check=False)
-                done.append("started via service vmhub start")
+        elif chosen == "sysvinit":
+            script = Path(SYSVINIT_SCRIPT)
+            if os.geteuid() == 0:
+                script.write_text(sysvinit_script_text())
+                script.chmod(0o755)
+                result.messages.append(f"wrote {script}")
+                if shutil.which("update-rc.d"):
+                    subprocess.run(["update-rc.d", "vmhub", "defaults"], check=False)
+                    result.messages.append("registered with update-rc.d")
+                else:
+                    result.problems.append(
+                        "update-rc.d not found; the script was written but not "
+                        "registered, so it will not run at boot"
+                    )
+                if shutil.which("service"):
+                    started = subprocess.run(
+                        ["service", "vmhub", "start"], check=False
+                    )
+                    if started.returncode == 0:
+                        result.messages.append("started via service vmhub start")
+                    else:
+                        result.problems.append(
+                            f"service vmhub start failed (exit {started.returncode})"
+                        )
+                else:
+                    result.problems.append(
+                        "service not found; the script was written but not started"
+                    )
+            else:
+                raise LifecycleError(
+                    f"writing {script} needs root. Re-run with sudo, or install a\n"
+                    f"session autostart entry instead:\n"
+                    f"    {vmctl_path()} autostart install --target session"
+                )
+
+        elif chosen == "session":
+            result.messages.extend(_install_session())
+            return result
+
         else:
             raise LifecycleError(
-                f"writing {script} needs root. Re-run with sudo, or install a\n"
-                f"session autostart entry instead:\n"
-                f"    {vmctl_path()} autostart install --target session"
+                "could not detect an init system. Install explicitly with "
+                "--target systemd|sysvinit|session"
             )
 
-    elif chosen == "session":
-        done.extend(_install_session())
-        return done
-
-    else:
-        raise LifecycleError(
-            "could not detect an init system. Install explicitly with "
-            "--target systemd|sysvinit|session"
-        )
-
-    if gui:
-        done.extend(_install_session())
-    return done
+        if gui:
+            result.messages.extend(_install_session())
+    return result
 
 
 def _install_session() -> list[str]:
@@ -447,63 +591,70 @@ def _install_session() -> list[str]:
     return [f"wrote {desktop} (GUI starts with your desktop session)"]
 
 
-def uninstall(*, target: str | None = None) -> list[str]:
+def uninstall(*, target: str | None = None, owner: str | None = None) -> list[str]:
     chosen = target or detect_init()
     done: list[str] = []
 
-    if chosen == "systemd":
-        unit = _systemd_unit_path()
-        if unit.is_file():
-            if shutil.which("systemctl"):
-                subprocess.run(
-                    ["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT_NAME],
-                    capture_output=True,
-                    check=False,
-                )
-            unit.unlink()
-            if shutil.which("systemctl"):
-                subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-            done.append(f"removed {unit}")
+    with _owner_override(owner):
+        if chosen == "systemd":
+            unit = _systemd_unit_path()
+            if unit.is_file():
+                if shutil.which("systemctl"):
+                    subprocess.run(
+                        ["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT_NAME],
+                        capture_output=True,
+                        check=False,
+                    )
+                unit.unlink()
+                if shutil.which("systemctl"):
+                    subprocess.run(
+                        ["systemctl", "--user", "daemon-reload"], check=False
+                    )
+                done.append(f"removed {unit}")
+            else:
+                done.append(f"nothing to remove at {unit}")
+        elif chosen == "sysvinit":
+            script = Path(SYSVINIT_SCRIPT)
+            if script.is_file():
+                if shutil.which("update-rc.d"):
+                    subprocess.run(
+                        ["update-rc.d", "-f", "vmhub", "remove"], check=False
+                    )
+                script.unlink()
+                done.append(f"removed {script}")
+            else:
+                done.append(f"nothing to remove at {script}")
         else:
-            done.append(f"nothing to remove at {unit}")
-    elif chosen == "sysvinit":
-        script = Path(SYSVINIT_SCRIPT)
-        if script.is_file():
-            if shutil.which("update-rc.d"):
-                subprocess.run(["update-rc.d", "-f", "vmhub", "remove"], check=False)
-            script.unlink()
-            done.append(f"removed {script}")
-        else:
-            done.append(f"nothing to remove at {script}")
-    else:
-        done.append(f"nothing to remove for target {chosen}")
+            done.append(f"nothing to remove for target {chosen}")
 
-    desktop = _session_autostart_path()
-    if desktop.is_file():
-        desktop.unlink()
-        done.append(f"removed {desktop}")
+        desktop = _session_autostart_path()
+        if desktop.is_file():
+            desktop.unlink()
+            done.append(f"removed {desktop}")
     return done
 
 
-def status() -> dict[str, object]:
+def status(*, owner: str | None = None) -> dict[str, object]:
     chosen = detect_init()
-    result: dict[str, object] = {
-        "init": chosen,
-        "systemd_unit": _systemd_unit_path().is_file(),
-        "sysvinit_script": Path(SYSVINIT_SCRIPT).is_file(),
-        "session_autostart": _session_autostart_path().is_file(),
-        "vmctl": vmctl_path().is_file(),
-        "gui": gui_path().is_file(),
-    }
-    if chosen == "systemd" and shutil.which("systemctl"):
-        proc = subprocess.run(
-            ["systemctl", "--user", "is-enabled", SYSTEMD_UNIT_NAME],
-            capture_output=True,
-            text=True,
-        )
-        result["systemd_enabled"] = (proc.stdout or proc.stderr).strip()
-    if chosen == "systemd":
-        # Without this the unit is enabled and healthy and still does nothing at
-        # boot, which is the single most confusing way this can fail.
-        result["linger"] = _linger_state()
+    with _owner_override(owner):
+        result: dict[str, object] = {
+            "init": chosen,
+            "owner": _vm_owner(),
+            "systemd_unit": _systemd_unit_path().is_file(),
+            "sysvinit_script": Path(SYSVINIT_SCRIPT).is_file(),
+            "session_autostart": _session_autostart_path().is_file(),
+            "vmctl": vmctl_path().is_file(),
+            "gui": gui_path().is_file(),
+        }
+        if chosen == "systemd" and shutil.which("systemctl"):
+            proc = subprocess.run(
+                ["systemctl", "--user", "is-enabled", SYSTEMD_UNIT_NAME],
+                capture_output=True,
+                text=True,
+            )
+            result["systemd_enabled"] = (proc.stdout or proc.stderr).strip()
+        if chosen == "systemd":
+            # Without this the unit is enabled and healthy and still does nothing at
+            # boot, which is the single most confusing way this can fail.
+            result["linger"] = _linger_state()
     return result

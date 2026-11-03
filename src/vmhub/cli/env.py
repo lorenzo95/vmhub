@@ -241,15 +241,27 @@ def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
 
 def cmd_autostart(args: argparse.Namespace, out: Out) -> int:
     if args.action == "status":
-        for key, value in autostart.status().items():
+        for key, value in autostart.status(owner=getattr(args, "owner", None)).items():
             out.say(f"  {key:20s} {value}")
         return 0
     if args.action == "install":
-        for line in autostart.install(target=args.target, gui=args.gui):
+        result = autostart.install(
+            target=args.target,
+            gui=args.gui,
+            owner=getattr(args, "owner", None),
+        )
+        for line in result.messages:
             out.say(f"  {out.good('+')} {line}")
-        return 0
+        # A problem is not a note. It means the VMs will not come back at
+        # boot, and the install has to say so with the exit code -- a
+        # provisioning script reads that and nothing else.
+        for problem in result.problems:
+            out.say(f"  {out.bad('!')} {problem}")
+        return 0 if result.ok else 1
     if args.action == "uninstall":
-        for line in autostart.uninstall(target=args.target):
+        for line in autostart.uninstall(
+            target=args.target, owner=getattr(args, "owner", None)
+        ):
             out.say(f"  {out.good('-')} {line}")
         return 0
     return 2

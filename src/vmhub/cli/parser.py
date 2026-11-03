@@ -453,6 +453,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("action", choices=["status", "install", "uninstall"])
     p.add_argument("--target", choices=["systemd", "sysvinit", "session"])
     p.add_argument("--gui", action="store_true", help="also start the GUI with the session")
+    p.add_argument(
+        "--owner",
+        help="the user whose VMs these are. Required when the environment "
+             "does not say: a cron job has neither SUDO_USER nor USER, and "
+             "the install would otherwise land on root, whose rootless podman "
+             "store holds no containers at all",
+    )
+
     p.set_defaults(func=cmd_autostart)
 
 
