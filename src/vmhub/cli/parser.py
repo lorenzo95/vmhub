@@ -117,6 +117,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--force", action="store_true", help="alias for --mode force")
+    p.add_argument(
+        "--preserve-run-state",
+        action="store_true",
+        help="stop the VMs but leave meta.last_run_state as it was, so they are "
+             "still in the set `vmctl restore` brings back at boot. Use this "
+             "for a scripted stop -- a maintenance job that stops a VM to "
+             "patch it would otherwise cancel its own boot restore",
+    )
+
     p.set_defaults(func=cmd_stop)
 
     p = sub.add_parser("stop-all", help="stop every running VM")

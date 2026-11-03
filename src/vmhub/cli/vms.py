@@ -210,6 +210,17 @@ def cmd_start(args: argparse.Namespace, out: Out) -> int:
     return 1 if failed else 0
 
 
+def _was_restored_at_boot(vm: str) -> bool:
+    """Whether this VM is in the set `vmctl restore` brings back at boot.
+
+    Read before the stop, because the stop is what clears it.
+    """
+    try:
+        return registry.load_meta(vm).last_run_state == "running"
+    except VmhubError:
+        return False
+
+
 def cmd_stop(args: argparse.Namespace, out: Out) -> int:
     mode = args.mode or ("force" if args.force else None)
     names = args.names or [s.name for s in lifecycle.list_vms() if s.powered]
@@ -219,11 +230,28 @@ def cmd_stop(args: argparse.Namespace, out: Out) -> int:
     failed = 0
     for name in names:
         try:
+            was_restored = _was_restored_at_boot(name)
             used = lifecycle.stop(
-                name, mode=mode, progress=None if args.quiet else out.step
+                name,
+                mode=mode,
+                # getattr, not args.: this is a public entry point and
+                # callers build the namespace by hand.
+                preserve_run_state=getattr(args, "preserve_run_state", False),
+                progress=None if args.quiet else out.step,
             )
             if not args.quiet:
                 out.say(out.good(f"{name} stopped ({used})"))
+                # A stop clears the boot restore registration. That is what
+                # the user asked for when they typed it, but a script that
+                # stops a VM to patch it does not want its own boot restore
+                # cancelled -- and it cannot see that from the exit code.
+                if was_restored and not getattr(args, "preserve_run_state", False):
+                    out.say(
+                        out.warn(
+                            f"  {name} will NOT be restored at the next boot; "
+                            "use --preserve-run-state to keep it in the set"
+                        )
+                    )
         except VmhubError as exc:
             failed += 1
             out.say(out.bad(f"{name}: {exc}"))
@@ -235,20 +263,32 @@ def cmd_stop(args: argparse.Namespace, out: Out) -> int:
 
 def cmd_stop_all(args: argparse.Namespace, out: Out) -> int:
     failed = 0
+    cancelled: list[str] = []
     for item in lifecycle.list_vms():
         if item.powered:
             if not args.quiet:
                 out.step(f"stopping {item.name}")
+            was_restored = _was_restored_at_boot(item.name)
             try:
                 lifecycle.stop(
                     item.name,
                     mode=args.mode or ("force" if args.force else None),
-                    preserve_run_state=args.preserve_run_state,
+                    preserve_run_state=getattr(args, "preserve_run_state", False),
                 )
+                if was_restored and not getattr(args, "preserve_run_state", False):
+                    cancelled.append(item.name)
             except VmhubError as exc:
                 failed += 1
                 if not args.quiet:
                     out.say(out.warn(f"  {exc}"))
+    if cancelled and not args.quiet:
+        out.say(
+            out.warn(
+                "  these will NOT be restored at the next boot: "
+                + ", ".join(cancelled)
+                + " (use --preserve-run-state to keep them in the set)"
+            )
+        )
     return 1 if failed else 0
 
 
