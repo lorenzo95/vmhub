@@ -514,7 +514,13 @@ def ssh_target(vm: str) -> str:
 
 def spec_user_hint(vm: str) -> str:
     try:
-        blueprint = blueprints.load(registry.load_spec(vm).blueprint)
+        vm_spec = registry.load_spec(vm)
+    except Exception:
+        return "user"
+    if vm_spec.ssh_user:
+        return vm_spec.ssh_user
+    try:
+        blueprint = blueprints.load(vm_spec.blueprint)
     except Exception:
         return "user"
     return getattr(blueprint, "ssh_user", "user") or "user"

@@ -13,10 +13,11 @@ version: 1
 Local VM manager. QEMU runs inside **rootless podman** containers — one
 container per VM. No root, no libvirt, no systemd on this host.
 
-Project root: `/home/Gero/vms`
+Project root: the checkout directory itself (this one is `~/vmhub`); vmhub
+finds it by walking up to `blueprints/` + `vmctl`, or from `$VMHUB_HOME`.
 
 ```bash
-cd ~/vms
+cd ~/vmhub
 ./vmhub                 # GTK4 desktop app
 ./vmctl <command>       # CLI
 ./vmctl doctor          # verify the environment
@@ -112,13 +113,13 @@ index.
 internal snapshots. Never change `DISK_FMT`.
 
 **`vm.toml` holds only relative paths** so the whole tree can be relocated. The
-one exception is `media.install` / `media.drivers`, which are absolute host paths
-to ISOs and are validated at start.
+one exception is `media.install` / `media.drivers` / `media.seed`, which are
+absolute host paths to ISOs and are validated at start.
 
 ## Core operations
 
 ```bash
-./vmctl new <vm> -b debian13              # create (blueprints: alpine, debian13, win11, winserver2022)
+./vmctl new <vm> -b debian13              # create (blueprints: alpine, debian13, debian13-cloud, win11, winserver2022)
 ./vmctl ls / info <vm> / show <vm>
 ./vmctl start <vm> [<vm>...]              # accepts several
 ./vmctl stop <vm> [--mode graceful|power|force]
@@ -132,7 +133,50 @@ to ISOs and are validated at start.
 ./vmctl iso ls|attach|detach|probe <vm>
 ./vmctl set <vm> resources.cpus=8 ram=16G # edits vm.toml
 ./vmctl rdp <vm>                          # launches Remmina
+
+./vmctl provision <vm>                    # Debian cloud image + cloud-init
+./vmctl exec <vm> -- <command>            # SSH, with the remote exit code
+./vmctl serial <vm>                       # serial console, no network needed
+./vmctl images                            # cloud image catalog / cache
 ```
+
+### Cloud images and cloud-init
+
+`provision` is the no-installer path, and the one to use when an agent is asked
+to "install Debian and then install X". It converts the image **into**
+`disk/data.qcow2` — never attach a cloud image as `BOOT`, or snapshots and
+clones silently target an empty drive — builds a CIDATA seed from the user's SSH
+key, attaches it as `seed` (`/mount.iso`), boots, and blocks until cloud-init
+wrote `/var/lib/cloud/instance/boot-finished`, checked over QGA.
+
+- Use the **genericcloud** image (`debian-13-genericcloud-amd64.qcow2`), not
+  `nocloud`: Debian's nocloud variant has neither cloud-init nor sshd. A seed
+  attached to it is ignored and the guest sits in `systemd-firstboot` on the
+  serial console. The catalog therefore exposes only genericcloud as `debian13`.
+- The seed is rendered under `<vm>/seed/` (`user-data`, `meta-data`,
+  `network-config`, `seed.iso`). The built ISO is what the guest sees; editing
+  the text files later does not rebuild it. cloud-init is bootstrap only, so
+  change the machine over SSH instead of reseeding.
+- cloud-init does bootstrap only: user, SSH key, `qemu-guest-agent`. Install the
+  rest over SSH (`vmctl exec`), where failures have exit codes. The Xfce example
+  is `examples/stage2-xfce-wayland.sh`, but any script works the same way:
+
+  ```bash
+  ./vmctl exec <vm> -- sudo bash -s < script.sh
+  ```
+
+- **A graphical session needs the generic kernel.** The genericcloud image ships
+  Debian's `cloud` kernel, which has no DRM drivers. QEMU exposes virtio-gpu, but
+  without DRM logind reports `CanGraphical=no`, LightDM never starts a seat, and
+  Wayland has no render node. Install `linux-image-amd64` and remove
+  `linux-image-*cloud*`, then reboot. Headless VMs do not need this.
+- Images are cached in `~/.cache/vmhub/images` and re-verified against the
+  publisher's SHA512SUMS on every use. `VMHUB_IMAGE_CACHE` moves the cache.
+- `seed` and `drivers` share the container's one second CD-ROM, so attaching
+  one detaches the other. `validate()` refuses a spec with both.
+- `vmctl exec` shell-quotes each argument before handing the command to SSH, so
+  `-- sh -c 'a; b'` arrives intact. Shell operators are not interpreted locally;
+  put them inside `sh -c`, or pipe a script to `bash -s`.
 
 ### Clone modes
 
@@ -238,7 +282,7 @@ first — a missing notice is the real problem.
 Reach for QMP directly for anything the CLI does not expose:
 
 ```python
-import sys; sys.path.insert(0, "/home/Gero/vms/src")
+import sys; sys.path.insert(0, "src")
 from vmhub import qmp, paths
 with qmp.Qmp(paths.qmp_path("<vm>")) as c:
     print(c.query_status())
@@ -258,6 +302,8 @@ Symptoms and their usual cause:
 | Guest unreachable from the LAN | expected; use a published `127.0.0.1` port |
 | Download you did not ask for | empty disk, or an attached ISO plus `boot.iso` |
 | Blank web console | the guest has not booted; it is not a management view |
+| `provision` waits until timeout | wrong image (nocloud has no cloud-init/sshd), or the seed is not attached — read `vmctl serial <vm>` |
+| Desktop login never appears | cloud kernel has no DRM; install `linux-image-amd64`, check `loginctl show-seat seat0 -p CanGraphical` |
 
 ## Invariants to preserve
 

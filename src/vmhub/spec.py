@@ -331,6 +331,10 @@ class Shutdown:
 class Media:
     install: str = ""
     drivers: str = ""
+    # A cloud-init seed (CIDATA) ISO. The container exposes exactly one
+    # second CD-ROM, so this and `drivers` are mutually exclusive; validate()
+    # says so rather than letting one silently shadow the other.
+    seed: str = ""
     rdp_user: str = ""
     rdp_password: str = ""
     # A folder mapped into this VM's RDP session, overriding the app-wide
@@ -343,6 +347,8 @@ class Media:
             return self.install
         if slot == "drivers":
             return self.drivers
+        if slot == "seed":
+            return self.seed
         raise SpecError(f"unknown media slot: {slot}")
 
 
@@ -353,6 +359,11 @@ class Features:
     guest_agent: bool = field(default=True, metadata={PERSIST_WHEN_FALSY: True})
     tpm: bool = False
     host_share: str = ""
+    # Expose QEMU's serial port as a unix socket inside /storage, so the host
+    # can read kernel and cloud-init output without the web console. Off by
+    # default: the container's own default (mon:stdio) is what every existing
+    # VM already has, and turning this on rewrites the container.
+    serial: bool = False
     extra_env: dict[str, str] = field(default_factory=dict)
 
 
@@ -360,6 +371,9 @@ class Features:
 class VmSpec:
     name: str
     blueprint: str = ""
+    # The account `vmctl ssh`/`exec` logs in as. Empty means "ask the
+    # blueprint"; set it when provisioning created a different account.
+    ssh_user: str = ""
     image: Image = field(default_factory=Image)
     boot: Boot = field(default_factory=Boot)
     resources: Resources = field(default_factory=Resources)
@@ -426,6 +440,11 @@ class VmSpec:
                 seen_hosts[port.host] = port.label
         if self.display.protected and not self.display.password:
             raise SpecError("display.protected requires display.password")
+        if self.media.seed and self.media.drivers:
+            raise SpecError(
+                "media.seed and media.drivers both want the container's one "
+                "second CD-ROM; detach one (vmctl iso detach <vm> seed|drivers)"
+            )
         if not 0 <= int(self.shutdown.timeout) <= 600:
             raise SpecError("shutdown.timeout must be between 0 and 600 seconds")
         return self
@@ -470,6 +489,12 @@ class VmSpec:
             "ALLOCATE": "N",
         }
         env["BOOT"] = self.boot.iso
+        if self.features.serial:
+            # The container normalises a bare socket path into
+            # unix:<path>,server=on,wait=off. /storage is bind-mounted, so
+            # the host reaches it at <vm>/storage/serial.sock with no
+            # published port and no change to the container image.
+            env["SERIAL"] = f"/storage/{paths.SERIAL_SOCKET}"
         if self.boot.media_type:
             env["MEDIA_TYPE"] = self.boot.media_type
         if self.network.ip:
@@ -641,7 +666,7 @@ def spec_from_dict(data: dict, *, name: str | None = None) -> VmSpec:
         **{
             k: v
             for k, v in (data.get("media") or {}).items()
-            if k in {"install", "drivers", "rdp_user", "rdp_password", "share_path"}
+            if k in {"install", "drivers", "seed", "rdp_user", "rdp_password", "share_path"}
         }
     )
     shutdown = Shutdown(
@@ -655,12 +680,13 @@ def spec_from_dict(data: dict, *, name: str | None = None) -> VmSpec:
         **{
             k: v
             for k, v in (data.get("features") or {}).items()
-            if k in {"hv", "ballooning", "guest_agent", "tpm", "host_share", "extra_env"}
+            if k in {"hv", "ballooning", "guest_agent", "tpm", "host_share", "serial", "extra_env"}
         }
     )
     return VmSpec(
         name=name,
         blueprint=blueprint,
+        ssh_user=str(data.get("ssh_user") or ""),
         image=image,
         boot=boot,
         resources=resources,

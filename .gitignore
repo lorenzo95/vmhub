@@ -19,6 +19,8 @@
 !/selftest
 !/guicheck
 !/.gitignore
+# Worked examples, e.g. the stage-2 desktop script.
+!/examples/
 # The unit suite and its config are project files, not VM data.
 !/tests/
 !/pytest.ini

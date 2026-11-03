@@ -9,6 +9,7 @@ The split is by what a command is about:
 
     output.py    the Out class and the colours it paints with
     vms.py       the VMs themselves: list, create, start, stop, clone...
+    cloud.py     provisioning from cloud images, and the image cache
     media.py     install media, export, import, libvirt
     network.py   the published ports and how to move them
     env.py       the environment: doctor, config, blueprints, prune
@@ -24,6 +25,8 @@ so `python3 -m vmhub.cli` runs `cli/__main__.py`.
 """
 
 from __future__ import annotations
+
+from .cloud import cmd_images, cmd_provision
 
 from .env import (
     cmd_autostart,
@@ -57,6 +60,7 @@ from .parser import build_parser
 from .vms import (
     cmd_clone,
     cmd_console,
+    cmd_exec,
     cmd_finish_install,
     cmd_flatten,
     cmd_guest,
@@ -70,6 +74,7 @@ from .vms import (
     cmd_restore,
     cmd_revert,
     cmd_rm,
+    cmd_serial,
     cmd_set,
     cmd_show,
     cmd_snapshot,

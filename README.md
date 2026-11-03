@@ -88,6 +88,9 @@ The GUI needs all four Python/GTK packages. The CLI works without them.
 - Hardware virtualisation enabled in BIOS/UEFI (Intel VT-x / AMD-V).
 - `subuid`/`subgid` ranges for your user, which `uidmap`'s packaging normally
   sets up. Verify: `grep "$USER" /etc/subuid /etc/subgid`.
+- For `vmctl provision` only: an ISO builder for the cloud-init seed —
+  `cloud-localds` (from `cloud-image-utils`) or `genisoimage` / `xorriso`.
+  `vmctl doctor` reports which one it found.
 
 Nothing else is needed — the QEMU container ships its own QEMU 11, OVMF
 firmware, SeaBIOS and noVNC.
@@ -152,6 +155,7 @@ A blueprint is a declarative starting point in `~/vmhub/blueprints/*.toml`.
 |---|---|
 | `alpine` | 60 MB. Fastest way to try everything. |
 | `debian13` | 4 vCPU / 8 GB / 64 GB. Good template base. |
+| `debian13-cloud` | Debian 13 genericcloud + cloud-init; use with `vmctl provision`. |
 | `win11` | Installs on IDE, then switches to virtio-scsi. |
 | `winserver2022` | Same flow, steadier under virtualization. |
 
@@ -159,6 +163,54 @@ A blueprint is a declarative starting point in `~/vmhub/blueprints/*.toml`.
 ./vmctl blueprints                    # list them
 ./vmctl new myvm -b debian13 --cpus 8 --ram 16G
 ```
+
+### Cloud images, without an installer
+
+`vmctl provision` skips the graphical installer. It fetches a cloud image,
+converts it **into** the VM's own `disk/data.qcow2` (so snapshots, clones and
+export all operate on the right disk), attaches a CIDATA seed built from your
+SSH key, boots once, and waits for cloud-init to finish before returning.
+
+```bash
+./vmctl images                        # the catalog, and what is already cached
+./vmctl provision web-01              # Debian 13, 4 vCPU / 8 GB / 40 GB
+./vmctl exec web-01 -- id             # SSH, with the remote exit code
+```
+
+It uses `debian-13-genericcloud-amd64.qcow2`, the Debian variant that carries
+cloud-init and openssh-server. The similarly named `nocloud` image has neither:
+a seed attached to it is ignored and the guest drops into an interactive
+`systemd-firstboot` prompt, so it is not offered here.
+
+The seed is kept at `<vm>/seed/` — `user-data`, `meta-data`, `network-config`
+and the built `seed.iso` — so the thing you want to read or change is a text
+file. `--seed FILE` supplies your own user-data instead of the default, and
+`--user NAME` changes the account (default `debian`). The seed is bootstrap
+only: the attached ISO is what the guest sees, and editing the text files
+afterward does not rebuild it. Images are cached in `~/.cache/vmhub/images` and
+verified against the publisher's SHA512SUMS on every use.
+
+**Stage two is just SSH.** Anything the machine is actually for is installed
+afterward:
+
+```bash
+./vmctl exec web-01 -- sudo apt-get update
+./vmctl exec web-01 -- sudo apt-get install -y nginx
+./vmctl exec web-01 -- sudo bash -s < myscript.sh
+```
+
+`examples/stage2-xfce-wayland.sh` is one worked example — Xfce on Wayland with
+a Mint-ish theme — not a special path. It is a plain, re-runnable script. Note
+that a *graphical* session needs the generic kernel: the genericcloud image
+ships Debian's `cloud` kernel, which has no DRM drivers, so logind reports
+`CanGraphical=no`, LightDM never starts a seat, and a Wayland compositor has
+nothing to render to. The example script installs `linux-image-amd64` and drops
+the cloud flavour; a headless VM does not need this.
+
+If SSH never comes up, `vmctl serial web-01` reads the kernel and console from
+the same socket, with no published port involved. The blueprint sets
+`features.serial=true`; `vmctl serial web-01 --print` prints the socket and a
+`socat` command instead of relaying interactively.
 
 ### Attaching an ISO
 
@@ -173,12 +225,16 @@ Nothing is copied, so a 5 GB Windows ISO costs no extra disk.
 ./vmctl start myvm
 ```
 
-Two slots exist:
+Three slots exist:
 
 | Slot | Mounted as | Purpose |
 |---|---|---|
 | `install` | `/start.iso` | The installer. Boots first, so remove it when done. |
 | `drivers` | `/drivers.iso` | A second CD-ROM for virtio and other drivers. |
+| `seed` | `/mount.iso` | A cloud-init CIDATA seed. `vmctl provision` attaches this for you. |
+
+The container exposes exactly one second CD-ROM, so `seed` and `drivers` are
+mutually exclusive: attaching one detaches the other.
 
 `install` boots before the disk every time, so detach it once the OS is
 installed or the VM will boot the ISO again:
@@ -500,6 +556,10 @@ container's ACPI signal, so a graceful stop always waits out the timeout and
 then SIGKILLs (exit 137) — see the stop table above. Install the agent in the
 guest (`qemu-guest-agent`, usually one package) and this becomes a real shutdown.
 
+`vmctl provision` puts `qemu-guest-agent` in the seed and waits on it to learn
+when cloud-init has finished. That check runs over the virtio-serial socket, so
+it works before the network — and therefore SSH — is up.
+
 There is a **Query guest agent** button in the Hardware tab. It is on demand
 rather than part of the status poll, because a guest without the agent would
 otherwise cost a socket timeout on every refresh.
@@ -727,6 +787,12 @@ vmctl bundles                     list bundles
 vmctl resize <vm> <size>          grow a disk
 
 vmctl guest <vm>                  query the guest agent (ip/hostname/os)
+vmctl provision <vm>              Debian cloud image + cloud-init, no installer
+                                  (--image KEY --ssh-key F --seed F --user U
+                                  --no-wait --timeout S --json)
+vmctl images                      list cloud images and what is cached
+vmctl exec <vm> -- CMD...         run over SSH; returns the remote exit code
+vmctl serial <vm> [--print]       serial console (features.serial=true)
 vmctl libvirt ls|import <name>    list or import libvirt domains
 vmctl export-all [names] [--include-running]
 vmctl iso ls|attach|detach <vm>   manage install media
@@ -834,6 +900,7 @@ offers a **Fix** button next to **Close** when a start fails over a port.
 │   ├── cli/                           the vmctl commands
 │   │   ├── output.py                  the Out class and its colours
 │   │   ├── vms.py                     the VMs: list, create, start, stop
+│   │   ├── cloud.py                   cloud images and provisioning
 │   │   ├── media.py                   install media, export, import, libvirt
 │   │   ├── network.py                 the published host ports
 │   │   ├── env.py                     doctor, config, blueprints, prune
@@ -848,8 +915,11 @@ offers a **Fix** button next to **Close** when a start fails over a port.
     ├── vm.toml                   declarative spec, relative paths only
     ├── meta.json                 uuid, mac, template flags
     ├── disk/data.qcow2           the disk, owned by vmhub
+    ├── image.json                cloud image provenance (url, sha512)
+    ├── seed/                     cloud-init user-data, meta-data, seed.iso
     └── storage/                  bind-mounted to /storage
-        ├── qmp.sock, monitor.sock
+        ├── qmp.sock, qga.sock, monitor.sock
+        ├── serial.sock           when features.serial=true
         ├── start.iso             cached boot image, written by the container
         └── <os>/                 NVRAM, written by the container
 ```

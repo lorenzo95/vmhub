@@ -8,12 +8,18 @@ from .errors import DiskError, NotFound
 SLOTS = {
     "install": "/start.iso",
     "drivers": "/drivers.iso",
+    # upstream's second CD-ROM looks at /mount.iso first, then /drivers.iso;
+    # a CIDATA seed only needs to be *a* CD-ROM the guest can see, and
+    # cloud-init identifies it by volume label rather than device name.
+    "seed": "/mount.iso",
 }
 INSTALL_SLOT = "install"
 DRIVERS_SLOT = "drivers"
+SEED_SLOT = "seed"
 SLOT_LABELS = {
     "install": "Install media (boots first)",
     "drivers": "Drivers (virtio etc.)",
+    "seed": "Cloud-init seed (CIDATA)",
 }
 
 SECTOR = 2048

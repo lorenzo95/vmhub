@@ -23,6 +23,10 @@ MONITOR_SOCKET = "monitor.sock"
 NVRAM_STEM = "uefi"
 DRIVERS_ISO = "drivers.iso"
 START_ISO = "start.iso"
+SERIAL_SOCKET = "serial.sock"
+SEED_ISO = "seed.iso"
+SEED_SUBDIR = "seed"
+IMAGE_CACHE_ENV = "VMHUB_IMAGE_CACHE"
 
 # Detection is by content, not by directory name: both markers are tracked in
 # git, so a fresh clone resolves. The empty systemd/ and sysvinit/ directories
@@ -104,6 +108,32 @@ def disk_path(vm: str) -> Path:
 
 def qmp_path(vm: str) -> Path:
     return storage_dir(vm) / QMP_SOCKET
+
+
+def serial_path(vm: str) -> Path:
+    return storage_dir(vm) / SERIAL_SOCKET
+
+
+def seed_dir(vm: str) -> Path:
+    return vm_dir(vm) / SEED_SUBDIR
+
+
+def image_cache_dir() -> Path:
+    """Where downloaded cloud images live.
+
+    Outside the checkout on purpose: a Debian cloud image is ~400 MB, and
+    several of them next to the VMs would be copied into every `git status`
+    and every backup of the project tree. VMHUB_IMAGE_CACHE exists for the
+    test suite and for people who keep a big cache on another filesystem.
+    """
+    override = os.environ.get(IMAGE_CACHE_ENV)
+    if override:
+        path = Path(override).expanduser()
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or "~/.cache"
+        path = Path(base).expanduser() / "vmhub" / "images"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def blueprints_dir() -> Path:

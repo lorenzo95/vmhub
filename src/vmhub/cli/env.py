@@ -8,7 +8,7 @@ import json
 import os
 import shutil
 
-from .. import autostart, blueprints, desktop, disk, lifecycle, paths, podman, ports, registry, settings, spec
+from .. import autostart, blueprints, desktop, disk, lifecycle, paths, podman, ports, registry, seed, settings, spec
 from ..errors import ProjectRootError, VmhubError
 from .output import Out, confirm
 
@@ -156,6 +156,7 @@ def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
         default_image_state = "not pulled"
     rootless = podman.is_rootless()
     has_kvm = podman.host_has_kvm()
+    seed_tool = seed.iso_tool()
     checks = [
         ("project root", "NOT FOUND: " + root_problem if root_problem else str(root), root is not None),
         ("podman", podman.version() if has_podman else "NOT FOUND", has_podman),
@@ -166,6 +167,7 @@ def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
         ("qemu-img", qemu_img, qemu_img_ok),
         ("host /dev/kvm", "readable" if has_kvm else "NOT ACCESSIBLE", has_kvm),
         ("qemu image", f"{default_image}  ({default_image_state})", True),
+        ("cloud seed iso", os.path.basename(seed_tool) if seed_tool else "none (only provision needs one)", True),
         ("python gi/gtk", "importable" if not gui_missing else f"MISSING: {', '.join(gui_missing)}", not gui_missing),
         ("free space", spec.format_size(os.statvfs(root).f_bavail * os.statvfs(root).f_frsize) if root else "", True),
         ("init system", autostart.detect_init(), True),

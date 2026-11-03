@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 
+from .cloud import cmd_images, cmd_provision
 from .env import (
     cmd_autostart,
     cmd_blueprints,
@@ -28,6 +29,7 @@ from .network import cmd_ports, cmd_repair_ports
 from .vms import (
     cmd_clone,
     cmd_console,
+    cmd_exec,
     cmd_finish_install,
     cmd_flatten,
     cmd_guest,
@@ -41,6 +43,7 @@ from .vms import (
     cmd_restore,
     cmd_revert,
     cmd_rm,
+    cmd_serial,
     cmd_set,
     cmd_show,
     cmd_snapshot,
@@ -53,7 +56,7 @@ from .vms import (
     cmd_template,
 )
 
-from .. import autostart, blueprints, desktop, disk, export, iso as isomod, lifecycle, podman, ports, rdp, settings, spec
+from .. import autostart, blueprints, cloudinit, desktop, disk, export, iso as isomod, lifecycle, podman, ports, rdp, seed, settings, spec
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -270,6 +273,72 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.add_argument("--print", action="store_true")
     p.set_defaults(func=cmd_ssh)
+
+    p = sub.add_parser(
+        "exec",
+        help="run a command in a VM over SSH, with its real exit code",
+    )
+    p.add_argument("name")
+    p.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="the command, after -- (e.g. vmctl exec web -- apt-get update)",
+    )
+    p.set_defaults(func=cmd_exec)
+
+    p = sub.add_parser(
+        "serial",
+        help="open a VM's serial console (needs features.serial=true)",
+    )
+    p.add_argument("name")
+    p.add_argument("--print", action="store_true", help="print the socket and socat command")
+    p.set_defaults(func=cmd_serial)
+
+    p = sub.add_parser(
+        "images",
+        help="list cloud images and what is already cached",
+    )
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_images)
+
+    p = sub.add_parser(
+        "provision",
+        help="create a Linux VM from a cloud image + cloud-init seed (no installer)",
+    )
+    p.add_argument("name")
+    p.add_argument(
+        "--blueprint", "-b", default="debian13-cloud",
+        help="blueprint to start from (default: debian13-cloud)",
+    )
+    p.add_argument(
+        "--image", default="debian13",
+        help="cloud image key; see `vmctl images` (default: debian13)",
+    )
+    p.add_argument(
+        "--seed",
+        help="cloud-init user-data file (overrides --ssh-key/--user); it must "
+        "install qemu-guest-agent, or pass --no-wait",
+    )
+    p.add_argument(
+        "--ssh-key", action="append", default=[],
+        help="public key file to authorise (repeatable; default: ~/.ssh/id_*.pub)",
+    )
+    p.add_argument("--user", default=seed.DEFAULT_USER, help="guest account to create")
+    p.add_argument("--cpus", type=int)
+    p.add_argument("--ram")
+    p.add_argument("--disk")
+    p.add_argument("--disk-type")
+    p.add_argument(
+        "--sha512", default="",
+        help="pin the image digest instead of reading the publisher's SHA512SUMS",
+    )
+    p.add_argument(
+        "--timeout", type=float, default=cloudinit.DEFAULT_TIMEOUT,
+        help="seconds to wait for cloud-init (default: %(default)s)",
+    )
+    p.add_argument("--no-wait", action="store_true", help="return as soon as the VM starts")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_provision)
 
     p = sub.add_parser("rdp", help="connect to a Windows VM over RDP via Remmina or FreeRDP")
     p.add_argument("name")

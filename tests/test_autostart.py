@@ -250,6 +250,9 @@ def test_install_enables_lingering_instead_of_only_hinting_at_it(monkeypatch) ->
         lambda *a, **k: (calls.append(list(a[0])) or SimpleNamespace(returncode=0, stdout="Linger=yes", stderr="")),
     )
     monkeypatch.setattr(autostart, "_systemd_unit_path", lambda: Path(autostart.__file__))
+    # The owner comes from the environment, so pin it to the name this test
+    # says on the tin rather than to whoever happens to run the suite.
+    monkeypatch.setattr(autostart, "_vm_owner", lambda: "admin")
 
     line = autostart._enable_linger()
     assert ["loginctl", "enable-linger", "admin"] in calls, calls

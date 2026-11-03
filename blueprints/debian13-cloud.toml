@@ -1,0 +1,47 @@
+title = "Debian 13 (cloud image)"
+description = "Debian 13 from the genericcloud image, configured by cloud-init. No installer."
+icon = "linux"
+os = "linux"
+ssh_user = "debian"
+notes = """
+No installer runs. The trixie genericcloud image (the one that carries
+cloud-init and openssh-server) is converted into this VM's disk, a CIDATA
+seed is attached as the second CD-ROM, and cloud-init creates the account
+and starts the guest agent.
+
+    vmctl provision web-01 --ssh-key ~/.ssh/id_ed25519.pub
+
+Then install whatever the machine is for over SSH, where commands have
+exit codes and can be retried:
+
+    vmctl exec web-01 -- sudo apt-get update
+    vmctl exec web-01 -- sudo apt-get install -y nginx
+
+The rendered seed is kept under the VM's seed/ directory for reading.
+cloud-init runs once per instance-id. The desktop, services, or packages the
+machine is actually for belong over SSH (`vmctl exec`), where failures have
+exit codes and can be retried.
+"""
+
+[spec.resources]
+cpus = 4
+ram = "8G"
+disk = "40G"
+disk_type = "scsi"
+
+[spec.network]
+mode = "user"
+guest_ports = [22]
+bind = "127.0.0.1"
+
+[spec.boot]
+# The container inspects the converted disk and picks BIOS or UEFI itself.
+# Naming a mode here would guess, and the cloud images differ by variant.
+mode = "auto"
+iso = ""
+
+[spec.features]
+guest_agent = true
+# QEMU's serial port as <vm>/storage/serial.sock. Kernel and cloud-init
+# output survive a broken network, which is when you need them most.
+serial = true

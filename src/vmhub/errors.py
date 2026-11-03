@@ -22,6 +22,14 @@ class DiskError(VmhubError):
     pass
 
 
+class ImageError(VmhubError):
+    pass
+
+
+class CloudError(VmhubError):
+    pass
+
+
 class LifecycleError(VmhubError):
     pass
 

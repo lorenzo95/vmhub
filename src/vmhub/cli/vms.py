@@ -5,10 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import select
+import shlex
 import shutil
+import socket
 import subprocess
 import sys
+import termios
 import time
+import tty
 
 from .. import blueprints, disk, lifecycle, paths, podman, ports, rdp, registry, spec
 from ..errors import VmhubError
@@ -487,21 +492,125 @@ def cmd_console(args: argparse.Namespace, out: Out) -> int:
     return open_url(url)
 
 
-def cmd_ssh(args: argparse.Namespace, out: Out) -> int:
-    vm_spec = registry.load_spec(args.name)
+def _ssh_argv(
+    vm: str, command: list[str] | None = None, *, batch: bool = False
+) -> list[str]:
+    """The ssh invocation for a VM, with the user and port it actually has.
+
+    Both used to be reconstructed separately: `ssh_target` printed the
+    blueprint's user, while the interactive path never passed it, so
+    `vmctl ssh` logged in as whoever ran vmhub. One builder, used by both.
+
+    `batch` turns off password prompts; it is right for `exec`, where a
+    prompt would hang an unattended caller, and wrong for an interactive
+    login.
+    """
+    vm_spec = registry.load_spec(vm)
     host_ssh = vm_spec.network.host_for("ssh")
     if not host_ssh:
+        raise VmhubError(f"{vm} has no published SSH port")
+    host = vm_spec.network.bind or "127.0.0.1"
+    user = lifecycle.spec_user_hint(vm)
+    argv = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=10",
+    ]
+    if batch:
+        argv.extend(["-o", "BatchMode=yes"])
+    argv.extend(["-p", str(host_ssh), f"{user}@{host}"])
+    if command:
+        # ssh joins its arguments with single spaces and lets the remote
+        # shell re-parse the result. Passing `sh -c <script>` through as
+        # separate words therefore loses the script's grouping -- the remote
+        # shell runs `sh -c` with the first word and executes the rest as its
+        # own commands. Quote each word so the command arrives intact; use
+        # `sh -c` for pipelines, since shell operators are not interpreted
+        # locally either.
+        argv.append(shlex.join(command))
+    return argv
+
+
+def cmd_ssh(args: argparse.Namespace, out: Out) -> int:
+    target = lifecycle.ssh_target(args.name)
+    if not target:
         print(out.bad(f"{args.name} has no published SSH port"))
         return 1
-    target = lifecycle.ssh_target(args.name)
     if args.print:
         out.say(f"ssh {target}")
         return 0
     if not shutil.which("ssh"):
         out.say(f"ssh {target}")
         return 0
-    return subprocess.run(["ssh", "-p", str(host_ssh),
-                           vm_spec.network.bind or "127.0.0.1"]).returncode
+    return subprocess.run(_ssh_argv(args.name)).returncode
+
+
+def cmd_exec(args: argparse.Namespace, out: Out) -> int:
+    command = list(args.command or [])
+    if command and command[0] == "--":
+        command = command[1:]
+    if not shutil.which("ssh"):
+        print(out.bad("ssh is not installed on this host"))
+        return 1
+    try:
+        argv = _ssh_argv(args.name, command or None, batch=True)
+    except VmhubError as exc:
+        print(out.bad(str(exc)))
+        return 1
+    return subprocess.run(argv).returncode
+
+
+def cmd_serial(args: argparse.Namespace, out: Out) -> int:
+    vm_spec = registry.load_spec(args.name)
+    path = paths.serial_path(args.name)
+    if not vm_spec.features.serial:
+        print(out.bad(f"{args.name} has no serial console enabled"))
+        out.say(
+            f"  enable it with: vmctl set {args.name} features.serial=true"
+            f"   (applies on next start)"
+        )
+        return 1
+    if args.print:
+        out.say(str(path))
+        out.say(f"socat - UNIX-CONNECT:{path}")
+        return 0
+    if not path.exists():
+        print(out.bad(f"no serial socket at {path}"))
+        out.say("  the VM must be running, and features.serial=true in its spec")
+        return 1
+    if not sys.stdin.isatty():
+        # Nothing to relay when stdin is a pipe; a caller that wants the
+        # stream should use --print with socat, or this with a tty.
+        print(out.bad("serial needs a terminal on stdin (or use --print)"))
+        return 1
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(str(path))
+    except OSError as exc:
+        print(out.bad(f"cannot connect to {path}: {exc}"))
+        sock.close()
+        return 1
+    attrs = termios.tcgetattr(sys.stdin.fileno())
+    try:
+        tty.setraw(sys.stdin.fileno())
+        while True:
+            readable, _, _ = select.select([sys.stdin, sock], [], [])
+            if sys.stdin in readable:
+                chunk = os.read(sys.stdin.fileno(), 4096)
+                if not chunk:
+                    break
+                sock.sendall(chunk)
+            if sock in readable:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                os.write(sys.stdout.fileno(), chunk)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, attrs)
+        sock.close()
+    return 0
 
 
 def cmd_rdp(args: argparse.Namespace, out: Out) -> int:

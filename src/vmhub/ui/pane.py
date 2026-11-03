@@ -303,7 +303,7 @@ class VmPane(Gtk.Box):
         box.append(self.notice_box)
 
         self.iso_rows: dict[str, dict[str, object]] = {}
-        for slot in (isomod.INSTALL_SLOT, isomod.DRIVERS_SLOT):
+        for slot in (isomod.INSTALL_SLOT, isomod.DRIVERS_SLOT, isomod.SEED_SLOT):
             box.append(self._build_iso_row(slot))
 
         self._add_tab("Console", widgets.scroll(box))

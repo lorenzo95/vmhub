@@ -49,12 +49,35 @@ def attach_iso(
             f"{source.name} will boot before the disk ({info.describe()}). "
             f"Detach it once installation is finished, or the VM will boot the ISO again."
         )
+    elif slot == iso.SEED_SLOT:
+        # The container exposes one second CD-ROM. Attaching a seed has to
+        # displace a drivers ISO rather than let mount order decide which one
+        # the guest actually sees.
+        displaced = vm_spec.media.drivers
+        vm_spec.media.drivers = ""
+        vm_spec.media.seed = str(source.resolve())
+        note = (
+            f"{source.name} is attached as the cloud-init seed CD-ROM "
+            f"({info.describe()})."
+        )
+        if displaced:
+            note += (
+                f" Detached the drivers ISO ({Path(displaced).name}); only one "
+                f"second CD-ROM exists. Re-attach it once cloud-init has run."
+            )
     else:
+        displaced = vm_spec.media.seed
         vm_spec.media.drivers = str(source.resolve())
+        vm_spec.media.seed = ""
         note = (
             f"{source.name} is attached as a second CD-ROM ({info.describe()}). "
             f"Use it in the guest to install drivers such as virtio."
         )
+        if displaced:
+            note += (
+                f" Detached the cloud-init seed ({Path(displaced).name}); only "
+                f"one second CD-ROM exists."
+            )
     registry.save_spec(vm_spec)
     progress(f"Attached to {vm}: {source.name}")
     progress(note)
@@ -71,6 +94,8 @@ def detach_iso(vm: str, slot: str, *, progress: Progress = _noop) -> bool:
         return False
     if slot == iso.INSTALL_SLOT:
         vm_spec.media.install = ""
+    elif slot == iso.SEED_SLOT:
+        vm_spec.media.seed = ""
     else:
         vm_spec.media.drivers = ""
     registry.save_spec(vm_spec)
