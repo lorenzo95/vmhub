@@ -19,6 +19,75 @@ from .lifecycle import Progress, _noop
 FORMAT = "vmhub-bundle/1"
 NVRAM_SUFFIXES = (".rom", ".vars", ".tpm")
 
+# The checksum of a finished bundle lives beside it, in its own file.
+#
+# The manifest inside the bundle already carries the disk's checksum, but the
+# manifest is *inside* the thing that can be truncated, so it cannot report on
+# its own integrity. This sidecar is written only after the bundle is complete
+# and renamed into place, so its presence means "this archive was finished",
+# and its hash is over the compressed bytes -- which is what the filesystem
+# actually stores. A bundle with no sidecar is one that was never finished.
+SIDECAR_SUFFIX = ".sha256"
+# A bundle being written. It never gets the final name, so a half-written
+# archive can never be mistaken for a backup.
+PARTIAL_SUFFIX = ".partial"
+
+
+def _sidecar_path(archive: Path) -> Path:
+    return archive.with_name(archive.name + SIDECAR_SUFFIX)
+
+
+def _read_sidecar(archive: Path) -> str:
+    """The checksum recorded for this bundle, or "" when there is none."""
+    try:
+        text = _sidecar_path(archive).read_text()
+    except OSError:
+        return ""
+    return text.split()[0] if text.split() else ""
+
+
+def _write_sidecar(archive: Path, digest: str) -> None:
+    """Record the bundle's checksum, atomically, beside the bundle itself."""
+    sidecar = _sidecar_path(archive)
+    tmp = sidecar.with_name(sidecar.name + PARTIAL_SUFFIX)
+    try:
+        tmp.write_text(f"{digest}  {archive.name}\n")
+        os.replace(tmp, sidecar)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _free_bytes(directory: Path) -> int:
+    st = os.statvfs(directory)
+    return int(st.f_bavail) * int(st.f_frsize)
+
+
+def _ensure_space(directory: Path, needed: int, what: str) -> None:
+    """Refuse a copy that cannot finish, before it starts.
+
+    A full disk does not fail politely. The copy dies part-way and leaves a
+    truncated archive behind that looks exactly like a good one -- which is
+    the failure this check exists to prevent.
+    """
+    free = _free_bytes(directory)
+    if needed > free:
+        raise DiskError(
+            f"not enough space to {what}: {spec.format_size(needed)} needed, "
+            f"{spec.format_size(free)} free in {directory}"
+        )
+
+
+def _storage_bytes(storage: Path) -> int:
+    """How much room the NVRAM and the rest of the storage dir need."""
+    total = 0
+    try:
+        for entry in storage.iterdir():
+            if entry.is_file():
+                total += entry.stat().st_size
+    except OSError:
+        return 0
+    return total
+
 
 def _sha256(path: Path, *, chunk: int = 1 << 22) -> str:
     digest = hashlib.sha256()
@@ -88,6 +157,16 @@ def export_vm(
 
         chain = disk.backing_chain(disk_file)
         exported = staging / "disk" / paths.DISK_NAME
+
+        # The copy below needs room for the disk as it is allocated on disk,
+        # plus the NVRAM beside it. Checked first, so a disk that is nearly
+        # full says so now instead of leaving a truncated bundle behind.
+        _ensure_space(
+            target,
+            disk.actual_size(disk_file) + _storage_bytes(paths.storage_dir(vm)),
+            f"export {vm}",
+        )
+
         if len(chain) > 1:
             # qemu-img convert resolves the chain as it writes, so the exported
             # disk is standalone. Copying the overlay file instead would carry a
@@ -186,7 +265,22 @@ def export_vm(
 
         archive = target / _archive_name(vm)
         progress("Writing archive...")
-        _build_tar(staging, archive)
+        # Written to a partial name and renamed into place only once it is
+        # whole. A bundle that is cut short -- by a full disk, by a killed
+        # job, by anything -- therefore never appears under the name a backup
+        # is looked up by. Before this, the archive was written straight to
+        # its final path, so a failure left a truncated file that `vmctl
+        # bundles` listed like any other backup.
+        partial = target / (archive.name + PARTIAL_SUFFIX)
+        try:
+            _build_tar(staging, partial)
+            digest = _sha256(partial)
+            os.replace(partial, archive)
+        finally:
+            partial.unlink(missing_ok=True)
+        # Written after the bundle is in place, so a sidecar exists only for
+        # a bundle that was finished.
+        _write_sidecar(archive, digest)
     finally:
         shutil.rmtree(tmpname, ignore_errors=True)
 
@@ -322,17 +416,45 @@ def backup(vm: str, *, dest_dir: Path | None = None, progress: Progress = _noop)
     return export_vm(vm, dest_dir=dest_dir, progress=progress)
 
 
-def list_bundles(dest_dir: Path | None = None) -> list[dict[str, Any]]:
+def list_bundles(
+    dest_dir: Path | None = None, *, verify: bool = False
+) -> list[dict[str, Any]]:
     target = Path(dest_dir) if dest_dir else paths.backup_dir()
     if not target.is_dir():
         return []
     out: list[dict[str, Any]] = []
     for archive in sorted(target.glob("*.vmhub.tar.*")):
+        # The sidecar and the half-written file live beside the bundles and
+        # match the same glob. Neither is a bundle, and listing them as one
+        # would have the health check reporting a backup that is not there.
+        if archive.name.endswith((SIDECAR_SUFFIX, PARTIAL_SUFFIX)):
+            continue
         entry: dict[str, Any] = {"path": str(archive), "size": archive.stat().st_size}
+        expected = _read_sidecar(archive)
+        entry["checksum"] = expected
+        if expected:
+            if verify:
+                actual = _sha256(archive)
+                entry["verified"] = actual == expected
+                if actual != expected:
+                    entry["error"] = (
+                        "checksum mismatch: the bundle is damaged "
+                        f"(expected {expected[:16]}…, got {actual[:16]}…)"
+                    )
+            else:
+                # Not hashed yet. The sidecar is there, so the bundle was
+                # finished; only the comparison is outstanding.
+                entry["verified"] = None
+        else:
+            # No sidecar. A bundle only ever gets its final name once it is
+            # whole, so this is a bundle made before the checksum existed --
+            # unverifiable, not damaged.
+            entry["verified"] = False
+            entry["note"] = "no checksum recorded: this bundle predates checksums"
         try:
             manifest = read_manifest(archive)
         except Exception as exc:
-            entry["error"] = str(exc)
+            entry.setdefault("error", str(exc))
         else:
             entry.update(
                 {

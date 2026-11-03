@@ -138,7 +138,18 @@ def cmd_export_all(args: argparse.Namespace, out: Out) -> int:
         was_running = status.powered
         try:
             if was_running:
-                lifecycle.stop(status.name, mode=args.mode, progress=out.step)
+                # preserve_run_state, so the record of what was running
+                # survives the stop. Without it the stop writes
+                # last_run_state=stopped, and if the export or the restart
+                # below then fails, the VM is not in the boot restore set
+                # either -- so one failed backup takes the VM out of service
+                # until somebody notices and starts it by hand.
+                lifecycle.stop(
+                    status.name,
+                    mode=args.mode,
+                    preserve_run_state=True,
+                    progress=out.step,
+                )
             archive = export.export_vm(status.name, dest_dir=dest, progress=out.step)
             exported.append(status.name)
             out.say(out.good(f"  {status.name} -> {archive.name}"))
@@ -157,15 +168,26 @@ def cmd_export_all(args: argparse.Namespace, out: Out) -> int:
     out.say(
         f"  exported {len(exported)}, skipped {len(skipped)}"
         + (f" (running: {', '.join(skipped)})" if skipped else "")
-        + (f", failed {len(failed)}" if failed else "")
+        + f", failed {len(failed)}"
     )
     if skipped:
-        out.say(out.dim("  pass --include-running to stop and restart them around the export"))
-    return 1 if failed else 0
+        out.say(out.dim("  skipped VMs were NOT backed up"))
+        out.say(
+            out.dim(
+                "  pass --include-running to stop and restart them around the export"
+            )
+        )
+    # A skipped VM is a VM that was not backed up. Exiting 0 for it is what
+    # made a nightly job report success while producing nothing at all:
+    # cron sees the exit code and nothing else.
+    return 1 if failed or skipped else 0
 
 
 def cmd_bundles(args: argparse.Namespace, out: Out) -> int:
-    entries = export.list_bundles(Path(args.dest) if args.dest else None)
+    entries = export.list_bundles(
+        Path(args.dest) if args.dest else None,
+        verify=getattr(args, "verify", False),
+    )
     if not entries:
         out.say(out.dim("no bundles"))
         return 0
@@ -173,9 +195,18 @@ def cmd_bundles(args: argparse.Namespace, out: Out) -> int:
         if "error" in entry:
             out.say(f"  {out.bad('!')} {Path(entry['path']).name}: {entry['error']}")
             continue
+        verified = entry.get("verified")
+        if verified is True:
+            mark = out.good("ok")
+        elif verified is False:
+            mark = out.warn("??")
+        else:
+            mark = out.dim("--")
         out.say(
-            f"  {entry['name']:20s} {entry.get('created_iso',''):26s} "
+            f"  {entry.get('name') or '?':20s} {entry.get('created_iso','') or '':26s} "
             f"{spec.format_size(entry.get('virtual_size',0)):>7s} virtual  "
-            f"{out.dim(str(Path(entry['path']).name))}"
+            f"{mark} {out.dim(str(Path(entry['path']).name))}"
         )
-    return 0
+        if entry.get("note"):
+            out.say(out.dim(f"      {entry['note']}"))
+    return 1 if any("error" in entry for entry in entries) else 0

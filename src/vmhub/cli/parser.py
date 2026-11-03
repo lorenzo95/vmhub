@@ -238,6 +238,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("bundles", help="list exported bundles")
     p.add_argument("--dest")
+    p.add_argument(
+        "--verify",
+        action="store_true",
+        help="re-hash every bundle and compare it with the checksum recorded "
+             "when it was written; a mismatch means the backup is damaged",
+    )
+
     p.set_defaults(func=cmd_bundles)
 
     p = sub.add_parser("backup", help="alias for export")
