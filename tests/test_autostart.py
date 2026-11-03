@@ -342,7 +342,15 @@ def test_restore_reports_failure_so_the_hook_can_retry(monkeypatch) -> None:
         return []
 
     monkeypatch.setattr(lifecycle, "restore_run_state", fake_restore)
-    out = SimpleNamespace(step=lambda *_a, **_k: None, say=lambda *_a, **_k: None)
+    # The boot wait is not what this test is about, and it is host-dependent:
+    # on a host whose /dev/kvm is not usable it waits out its timeout and
+    # reports a problem, which is a different code path entirely.
+    monkeypatch.setattr(lifecycle, "wait_until_podman_can_run", lambda: [])
+    out = SimpleNamespace(
+        step=lambda *_a, **_k: None,
+        say=lambda *_a, **_k: None,
+        warn=lambda *_a, **_k: None,
+    )
     args = SimpleNamespace(quiet=True)
 
     assert cli.cmd_restore(args, out) == 1
