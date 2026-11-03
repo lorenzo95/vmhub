@@ -90,6 +90,51 @@ is the only one, so do not write docs that promise otherwise.
 Note `podman.rm()` takes a **VM** name and adds the `vmhub-` prefix itself;
 passing a container name silently double-prefixes and removes nothing.
 
+## Running vmhub unattended
+
+A scheduled job sees the exit code and nothing else, so these are the rules
+that make an exit code worth reading.
+
+**A backup that skipped a VM is not a backup.** `export-all` skips a running VM
+unless `--include-running` is given, and it exits non-zero when anything was
+skipped or failed. `export-all --include-running` stops each running VM around
+the export and preserves its run state, so a failed export leaves the VM in the
+set the boot hook restores — one failed backup does not take a VM out of
+service for good.
+
+**A bundle only gets its name once it is whole.** The archive is written to a
+`.partial` file and renamed into place when it is finished, so a truncated
+bundle never appears under the name a backup is looked up by. A `.sha256`
+sidecar beside a bundle holds the checksum of the compressed archive; its
+presence means the bundle was finished. `vmctl bundles --verify` re-hashes
+them and exits non-zero on a damaged one.
+
+**Stopping a VM cancels its place in the boot restore.** `vmctl stop` writes
+`last_run_state=stopped`, and `vmctl restore` only brings back the VMs marked
+`running`. A maintenance job that stops a VM to patch it wants
+`--preserve-run-state`; without it the stop says nothing about the
+consequence and the VM simply does not come back at the next boot.
+
+**The autostart install reports whether it will work at boot.** It exits
+non-zero when the unit was not enabled or when `loginctl enable-linger`
+failed — a unit that is enabled and healthy still does nothing at boot
+without lingering. A cron job has neither `SUDO_USER` nor `USER`, so it has to
+say who owns the VMs: `--owner <user>`. An owner of `root` is refused, because
+rootless podman's store lives under the owner's home.
+
+**The generated systemd unit deliberately has no timeout.** `TimeoutStartSec=0`
+and `TimeoutStopSec=0` are not placeholders: systemd's default is 90 seconds,
+a restore starts the VMs one at a time with a 90 second wait each, and with
+the default in place systemd killed the unit part-way through the fleet. Do
+not remove them.
+
+**A CLI command must not read a flag straight off the namespace.** The
+commands are called directly, with a namespace built by hand — selftest does
+it, and it is how a caller outside the parser would do it. Read an optional
+flag with `getattr(args, "name", default)`, never `args.name`: a new flag
+that raises AttributeError for the callers that predate it is a crash, not a
+feature.
+
 ## Mental model
 
 Read this before changing anything. Several facts are counter-intuitive and

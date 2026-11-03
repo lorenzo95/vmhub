@@ -621,7 +621,22 @@ That split is why export time scales with the chain, not just the disk: the
 first case is a file copy, the second is a read and rewrite of everything the
 chain actually holds.
 
-Exit status is non-zero if any VM failed, so a backup job can detect it.
+Exit status is non-zero if any VM failed **or was skipped**, so a backup job
+can detect it. A skipped VM is a VM that was not backed up, and reporting that
+as success is how a nightly job ends up backing up nothing at all.
+
+A bundle is written to a temporary name and renamed into place only once it is
+whole, so a bundle that was cut short never appears under the name a backup is
+looked up by. Each finished bundle gets a `.sha256` file beside it holding the
+checksum of the archive:
+
+```bash
+./vmctl bundles --verify        # re-hash them; non-zero if one is damaged
+```
+
+`--include-running` preserves each VM's place in the boot restore while it
+stops it, so a failed export leaves the VM in the set `vmctl restore` brings
+back — one failed backup does not take a VM out of service for good.
 
 ## Autostart
 
@@ -649,6 +664,21 @@ The generated script runs the restore as **your** user, not root, and with
 `XDG_RUNTIME_DIR` set — rootless podman keeps its containers under your home, so
 running as root at boot would start nothing. Installed with `sudo` it uses
 `$SUDO_USER` to work out who that is.
+
+Say who owns the VMs with `--owner` when the environment cannot:
+
+```bash
+./vmctl autostart install --owner "$USER"
+```
+
+A cron job has neither `SUDO_USER` nor `USER`, so without `--owner` the
+install would land on root — whose rootless podman store holds no containers,
+so nothing would come back at boot. An owner of `root` is refused outright.
+
+The install exits non-zero when it cannot work at boot: the unit was not
+enabled, or `loginctl enable-linger` failed. A unit that is enabled and
+healthy still does nothing at boot without lingering, and that shows up days
+later and nowhere near the install.
 
 No root? Install a session autostart entry instead, which starts the GUI with
 your desktop session:
@@ -766,7 +796,8 @@ vmctl new <vm> [-b BP] [options]  create (--cpus --ram --disk --disk-type --iso
                                   --image --no-start --mark-template)
 vmctl start <vm> [--console]      start, optionally open the viewer
 vmctl stop <vm>... [--mode M]     stop (guest|graceful|power|force; --force = force)
-vmctl stop-all                    stop everything
+                                  (--preserve-run-state: keep it in the boot restore)
+vmctl stop-all [--preserve-run-state]  stop everything
 vmctl restore                     restart what was running at last shutdown
 vmctl rm <vm> [-y] [--keep-disk]  delete a VM (--keep-disk: keep it, drop the container)
 
@@ -783,7 +814,7 @@ vmctl rebase <template>           repoint all clones
 
 vmctl export|backup <vm>          write a portable bundle
 vmctl import <bundle> [--name N]  import one
-vmctl bundles                     list bundles
+vmctl bundles [--verify]          list bundles (--verify: re-hash them)
 vmctl resize <vm> <size>          grow a disk
 
 vmctl guest <vm>                  query the guest agent (ip/hostname/os)
@@ -815,7 +846,7 @@ vmctl ports <vm> add GUEST        publish a guest port (--name N --as ROLE
 vmctl ports <vm> rm ROLE|HOST     stop publishing a port
 vmctl ports <vm> set ROLE|HOST    change it (--host H --guest G --bind B)
 vmctl config show|set|path        app-wide defaults, without hand-editing TOML
-vmctl autostart status|install|uninstall
+vmctl autostart status|install|uninstall (--owner USER)
 vmctl desktop status|install|uninstall
 ```
 
