@@ -420,7 +420,15 @@ def cmd_flatten(args: argparse.Namespace, out: Out) -> int:
 
 def cmd_rebase(args: argparse.Namespace, out: Out) -> int:
     updated = lifecycle.rebase_all(args.template, progress=out.step)
-    out.say(out.good(f"rebased {len(updated)} clone(s) onto {args.template}"))
+    if updated:
+        out.say(
+            out.good(
+                f"repaired the backing path of {len(updated)} clone(s) "
+                f"for {args.template}"
+            )
+        )
+    else:
+        out.say(f"every clone of {args.template} already points at its disk")
     return 0
 
 

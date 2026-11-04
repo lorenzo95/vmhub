@@ -1355,6 +1355,38 @@ class VmPane(Gtk.Box):
         self.clone_hint.set_xalign(0.0)
         box.append(self.clone_hint)
 
+        # Flatten and path repair are the two ways out of the sharing
+        # relationship above: flatten makes one clone standalone, and repair
+        # rewrites clone headers after the template's disk has moved. They sit
+        # below the explanation they act on, and each is shown only when it
+        # applies.
+        self.flatten_button = Gtk.Button(label="Flatten…")
+        self.flatten_button.set_tooltip_text(
+            "Copy this clone's used blocks into a standalone disk"
+        )
+        self.flatten_button.connect("clicked", self._on_flatten)
+        self.repair_button = Gtk.Button(label="Repair clone paths…")
+        self.repair_button.set_tooltip_text(
+            "Rewrite clones whose backing path no longer matches this template's disk"
+        )
+        self.repair_button.connect("clicked", self._on_repair_paths)
+        lineage_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        lineage_row.append(self.flatten_button)
+        lineage_row.append(self.repair_button)
+        lineage_row.set_halign(Gtk.Align.START)
+        box.append(lineage_row)
+
+        self.lineage_hint = Gtk.Label()
+        self.lineage_hint.add_css_class("hint")
+        self.lineage_hint.set_wrap(True)
+        self.lineage_hint.set_xalign(0.0)
+        box.append(self.lineage_hint)
+
+        # Nothing to act on until a status says this VM is a clone or a
+        # template with dependents.
+        self.flatten_button.set_visible(False)
+        self.repair_button.set_visible(False)
+
         self._add_tab("Snapshots", widgets.scroll(box))
 
     def _build_logs_tab(self) -> None:
@@ -1471,6 +1503,9 @@ class VmPane(Gtk.Box):
         _replace_grid(self.details_grid, [])
         self._clear_box(self.roles_box)
         self._clear_box(self.ports_box)
+        self.flatten_button.set_visible(False)
+        self.repair_button.set_visible(False)
+        self.lineage_hint.set_text("")
 
     def _update_details(self, status: lifecycle.VmStatus) -> None:
         parts = [status.summary, f"{status.cpus} vCPU", status.ram, status.disk_size]
@@ -1741,8 +1776,88 @@ class VmPane(Gtk.Box):
                     "run while one does."
                 )
 
+        self.flatten_button.set_visible(bool(status.template_source))
+        self.flatten_button.set_sensitive(not running and status.has_disk)
+        if running:
+            flatten_tip = "Stop the VM first — flattening reads and rewrites its disk"
+        elif not status.has_disk:
+            flatten_tip = "This VM has no disk to flatten"
+        else:
+            flatten_tip = "Copy this clone's used blocks into a standalone disk"
+        self.flatten_button.set_tooltip_text(flatten_tip)
+
+        stale = (
+            self._clones_with_stale_backing(status)
+            if status.is_template and status.has_disk
+            else []
+        )
+        self.repair_button.set_visible(bool(stale))
+        self.repair_button.set_sensitive(not running)
+        # A template's pane only knows its own power state, so the clones'
+        # states come from the same snapshot the window just rendered. No
+        # podman call belongs on this path; this runs every refresh.
+        all_statuses = getattr(self.window, "statuses", {})
+        running_clones = [
+            clone
+            for clone in stale
+            if getattr(all_statuses.get(clone), "powered", False)
+        ]
+        if running:
+            repair_tip = (
+                "Stop this VM first — repairing clone paths needs its disk free"
+            )
+        elif running_clones:
+            repair_tip = (
+                f"Repair {len(stale)} clone path(s); these clones are running and "
+                "will be stopped first: " + ", ".join(running_clones)
+            )
+        else:
+            repair_tip = (
+                f"Rewrite the backing path in {len(stale)} clone(s) whose header no "
+                "longer matches this template's disk"
+            )
+        self.repair_button.set_tooltip_text(repair_tip)
+
+        if status.template_source:
+            self.lineage_hint.set_text(
+                f"Flatten copies the blocks this clone uses into a disk of its own, so "
+                f"it no longer depends on {status.template_source}. It needs the VM "
+                "stopped and copies real data."
+            )
+        elif stale:
+            self.lineage_hint.set_text(
+                f"{len(stale)} clone(s) record a backing path that no longer matches "
+                "this template's disk. Repair rewrites their headers to the current "
+                "path; it copies no data."
+            )
+        else:
+            self.lineage_hint.set_text("")
+
         self.error_label.set_text("  ".join(status.errors))
         self.error_label.set_visible(bool(status.errors))
+
+    def _clones_with_stale_backing(self, status: lifecycle.VmStatus) -> list[str]:
+        """Clones whose qcow2 header points somewhere other than this template's disk.
+
+        A linked clone records its backing path as an absolute path when it is
+        created. Moving the project, or the template, leaves that header
+        pointing at the old location -- and rewriting it is the only thing
+        rebase repairs. Clones whose path already matches are not worth a
+        button, so this is what decides whether the action is offered at all.
+        """
+        expected = paths.disk_path(status.name).resolve()
+        all_statuses = getattr(self.window, "statuses", {})
+        stale: list[str] = []
+        for clone in status.dependents:
+            clone_status = all_statuses.get(clone)
+            recorded = getattr(clone_status, "backing", None)
+            if not recorded:
+                continue
+            if not disk.backing_points_at(
+                recorded, paths.disk_path(clone), expected
+            ):
+                stale.append(clone)
+        return stale
 
     def _rebuild_snapshot_list(self, status: lifecycle.VmStatus) -> None:
         child = self.snapshot_list.get_first_child()
@@ -2033,6 +2148,120 @@ class VmPane(Gtk.Box):
                 return True
 
             widgets.run_task(self.window, mark, label="Marking as template")
+
+        dialog.choose(self.window, None, on_choice)
+
+    def _on_flatten(self, _button: object = None) -> None:
+        status = self.status
+        if status is None or not status.template_source:
+            return
+        source = status.template_source
+        dialog = Gtk.AlertDialog(
+            message=f"Flatten {self.vm}?",
+            detail=(
+                f"This copies the blocks {self.vm} uses, plus the template data it "
+                f"references, into a standalone disk, so it no longer depends on "
+                f"{source}. It needs the VM stopped and can take a while. This cannot "
+                "be undone. Afterwards this VM can be marked as a template in its own "
+                "right."
+            ),
+            buttons=["Cancel", "Flatten"],
+            cancel_button=0,
+            default_button=1,
+        )
+
+        def on_choice(_d, result) -> None:
+            try:
+                if dialog.choose_finish(result) != 1:
+                    return
+            except Exception:
+                return
+            widgets.run_task(
+                self.window,
+                lambda progress: lifecycle.flatten(self.vm, progress=progress),
+                label=f"Flattening {self.vm}",
+                on_done=lambda _r: self.window.report(
+                    f"{self.vm} is now standalone; it can be marked as a template"
+                ),
+            )
+
+        dialog.choose(self.window, None, on_choice)
+
+    def _on_repair_paths(self, _button: object = None) -> None:
+        status = self.status
+        if (
+            status is None
+            or not status.is_template
+            or not status.dependents
+            or not status.has_disk
+        ):
+            return
+        stale = self._clones_with_stale_backing(status)
+        if not stale:
+            return
+        all_statuses = getattr(self.window, "statuses", {})
+        # Only the clones this action repairs need stopping; a running clone
+        # whose path is already right is none of its business.
+        running = [
+            clone
+            for clone in stale
+            if getattr(all_statuses.get(clone), "powered", False)
+        ]
+        template_disk = paths.disk_path(self.vm).resolve()
+        detail = (
+            f"{len(stale)} clone(s) record a backing path that no longer matches "
+            f"{self.vm}'s disk at {template_disk}.\n\n"
+            "This rewrites the backing path in their qcow2 headers. It copies no data "
+            "and does not change their contents. Only do this after moving the project "
+            "or the template disk: pointing them at an unrelated image can corrupt "
+            "the clones.\n\n"
+            f"Clones to repair: {', '.join(stale)}."
+        )
+        if running:
+            detail += f"\n\nRunning and must be stopped first: {', '.join(running)}."
+        dialog = Gtk.AlertDialog(
+            message=f"Repair clone paths for {self.vm}?",
+            detail=detail,
+            buttons=[
+                "Cancel",
+                "Stop clones and repair" if running else "Repair paths",
+            ],
+            cancel_button=0,
+            default_button=1,
+        )
+
+        def on_choice(_d, result) -> None:
+            try:
+                if dialog.choose_finish(result) != 1:
+                    return
+            except Exception:
+                return
+
+            def work(progress):
+                # Only the clones that were running when the dialog opened: the
+                # button promised to stop those, not whatever started since.
+                for clone in running:
+                    if podman.is_running(clone):
+                        lifecycle.stop(clone, progress=progress)
+                return lifecycle.rebase_all(self.vm, progress=progress)
+
+            def done(updated):
+                if updated:
+                    self.window.report(
+                        f"Repaired the backing path of {len(updated)} clone(s) "
+                        f"for {self.vm}"
+                    )
+                else:
+                    self.window.report(
+                        f"Every clone of {self.vm} already points at its disk"
+                    )
+
+            widgets.run_task(
+                self.window,
+                work,
+                label=f"Repairing clone paths for {self.vm}",
+                on_done=done,
+            )
 
         dialog.choose(self.window, None, on_choice)
 

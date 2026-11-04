@@ -173,7 +173,7 @@ absolute host paths to ISOs and are validated at start.
 ./vmctl template mark <vm>                # then clone from it
 ./vmctl clone <vm> <template> [--mode linked|full]
 ./vmctl flatten <vm>                      # linked clone -> standalone
-./vmctl rebase <template>                 # repoint all clones at a new template disk
+./vmctl rebase <template>                 # repair clone backing paths after a move
 ./vmctl export <vm> / import <bundle>     # portable bundle
 ./vmctl iso ls|attach|detach|probe <vm>
 ./vmctl set <vm> resources.cpus=8 ram=16G # edits vm.toml

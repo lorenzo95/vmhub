@@ -71,6 +71,26 @@ def backing_file(path: Path, *, data: dict[str, Any] | None = None) -> str | Non
     return (data or info(path)).get("backing-filename")
 
 
+def backing_points_at(
+    recorded: str | None, overlay: Path, expected: Path
+) -> bool:
+    """Whether a recorded backing filename resolves to ``expected``.
+
+    qemu-img stores a relative backing path relative to the overlay's own
+    directory, not to the process cwd. A missing backing file still reports
+    its recorded path, which is exactly the state this is meant to detect.
+    """
+    if not recorded:
+        return False
+    backing = Path(recorded)
+    if not backing.is_absolute():
+        backing = Path(overlay).parent / backing
+    try:
+        return backing.resolve() == Path(expected).resolve()
+    except OSError:
+        return False
+
+
 def backing_chain(path: Path) -> list[str]:
     proc = run(["info", "--backing-chain", "--output=json", "-f", "qcow2", "--", str(path)])
     chain = json.loads(proc.stdout)

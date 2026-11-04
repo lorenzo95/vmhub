@@ -25,7 +25,7 @@ python3 -m pytest # 317-test suite for the pure logic, no display needed
 | **Revert** | Restores the disk to a snapshot and discards everything after it. |
 | **Templates** | Mark any VM as a template. Clones are instant and cost almost no disk. |
 | **Clone** | `qemu-img` backing-file overlay. 196 KB instead of a full copy. |
-| **Rebase** | Push every clone onto an updated template without copying data. |
+| **Rebase** | Repair clone backing paths after the project or template disk moves. |
 | **Flatten** | Resolve a clone's backing chain so it stands alone. |
 | **Export / import** | Self-contained bundle with manifest and checksums, portable to another machine. |
 | **Backup / restore** | `export` and `import`, so a backup is just a bundle. |
@@ -410,12 +410,27 @@ To break the dependency:
 ./vmctl template mark debian-b  # now debian-b can be a template in its own right
 ```
 
-To update a template and keep its clones cheap:
+To update a template and keep its clones cheap, just update it with the clones
+stopped. The overlays read unwritten blocks through to the template, so they see
+the new data without any extra step:
 
 ```bash
 ./vmctl stop debian-b debian-c
 # ... update debian-a ...
-./vmctl rebase debian-a          # repoint all clones at the new disk
+./vmctl start debian-b debian-c
+```
+
+That changes the base underneath the clones, so update a template deliberately;
+it is not a way to swap in an unrelated disk.
+
+`vmctl rebase` is not needed for that. It rewrites the absolute backing path
+recorded in each clone's header, which is what breaks if the project or the
+template's disk moves:
+
+```bash
+mv ~/vmhub /srv/vmhub
+cd /srv/vmhub
+./vmctl rebase debian-a          # repair the clones' recorded backing path
 ```
 
 ## Portability
@@ -725,12 +740,14 @@ Left: every VM with a live state dot, resources and badges. Right: six tabs.
   disagree.
 - **Details** — the rest of what used to be on the Info tab: templates, clones,
   snapshots summary, and the copyable paths.
-- **Snapshots** — take, revert, delete.
+- **Snapshots** — take, revert, delete. The same tab holds the copies block:
+  clone, mark as template, export, flatten a linked clone, and repair clone
+  paths after a move.
 - **Logs** — streaming container output.
 
-There is no Actions tab. Marking a template, cloning, rebasing, exporting and
-flattening are all buttons or sidebar actions, and deleting sits next to the VM
-it deletes rather than in a list somewhere else.
+There is no Actions tab. Marking a template, cloning, repairing clone paths,
+exporting and flattening are all buttons or sidebar actions, and deleting sits
+next to the VM it deletes rather than in a list somewhere else.
 
 Long operations run on worker threads and report progress in the status bar, so
 the UI never blocks. The bar shows the newest message with the last few kept in
@@ -810,7 +827,7 @@ vmctl template ls|mark|unmark     manage templates
 vmctl clone <new> <source>        --mode linked|full (linked needs a template source;
                                   full copies any stopped VM)
 vmctl flatten <vm>                resolve the backing chain
-vmctl rebase <template>           repoint all clones
+vmctl rebase <template>           repair clone backing paths after a move
 
 vmctl export|backup <vm>          write a portable bundle
 vmctl import <bundle> [--name N]  import one
@@ -976,7 +993,8 @@ These are inherent to running QEMU in rootless podman, not bugs:
   *"macvtap is not supported when using Podman, only when using Docker."*
   Reach guests through the published `127.0.0.1` ports.
 - **Revert is offline** (see above).
-- **Export and flatten need the VM stopped**, and copy real data.
+- **Export and flatten need the VM stopped**, and copy real data. **Repairing
+  clone paths (rebase) needs the template and every clone stopped.**
 - **`restart: always` does nothing** without systemd, so vmhub owns VM
   lifecycle. Nothing resurrects a VM you killed by hand, which is the point.
 - **Windows reactivation** on a moved VM.

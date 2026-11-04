@@ -7,6 +7,7 @@ Run with a display available, e.g. under Xvfb:
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import os
 import re
@@ -1043,6 +1044,8 @@ def _probe(app) -> None:
     for label, widget in (
         ("Mark as template", pane.template_button),
         ("the template explanation", pane.template_hint),
+        ("Flatten…", pane.flatten_button),
+        ("Repair clone paths…", pane.repair_button),
     ):
         if not descends(widget, pages["Snapshots"]):
             problems.append(f"{label} is not on the Snapshots tab")
@@ -1056,6 +1059,168 @@ def _probe(app) -> None:
         "  \033[32mPASS\033[0m  Ports and Details are separate tabs, "
         "the copies block moved whole"
     )
+
+    # ---- flatten and path repair are offered only where they apply ----
+    # A real template/clone pair would prove the same thing but leaves storage
+    # behind if the sweep fails halfway, so drive update() with stand-in
+    # statuses: the question here is which control the pane offers.
+    real_status = window.statuses[VM]
+    template_disk = str(paths.disk_path(VM).resolve())
+
+    def _stand_in(**changes):
+        return dataclasses.replace(real_status, **changes)
+
+    saved_statuses = dict(window.statuses)
+    try:
+        pane.update(
+            _stand_in(
+                template_source="some-template",
+                is_template=False,
+                dependents=[],
+                powered=False,
+                has_disk=True,
+            )
+        )
+        flatten_alone = (
+            pane.flatten_button.get_visible()
+            and pane.flatten_button.get_sensitive()
+            and not pane.repair_button.get_visible()
+        )
+        pane.update(
+            _stand_in(
+                template_source="some-template",
+                is_template=False,
+                dependents=[],
+                powered=True,
+                has_disk=True,
+            )
+        )
+        flatten_running = (
+            pane.flatten_button.get_visible()
+            and not pane.flatten_button.get_sensitive()
+        )
+
+        # The clone's header already points at this template's disk, which is
+        # the normal case. There is nothing to repair, so no button.
+        window.statuses["clone-a"] = _stand_in(
+            name="clone-a",
+            template_source=VM,
+            backing=template_disk,
+            is_template=False,
+            dependents=[],
+            powered=False,
+        )
+        pane.update(
+            _stand_in(
+                template_source=None,
+                is_template=True,
+                dependents=["clone-a"],
+                powered=False,
+            )
+        )
+        repair_current = not pane.repair_button.get_visible()
+
+        # The header points somewhere else: that is what rebase repairs.
+        window.statuses["clone-a"] = _stand_in(
+            name="clone-a",
+            template_source=VM,
+            backing=f"/old/vmhub/{VM}/disk/data.qcow2",
+            is_template=False,
+            dependents=[],
+            powered=False,
+        )
+        pane.update(
+            _stand_in(
+                template_source=None,
+                is_template=True,
+                dependents=["clone-a"],
+                powered=False,
+            )
+        )
+        repair_stale = (
+            pane.repair_button.get_visible()
+            and pane.repair_button.get_sensitive()
+            and not pane.flatten_button.get_visible()
+        )
+
+        pane.update(
+            _stand_in(
+                template_source=None,
+                is_template=True,
+                dependents=["clone-a"],
+                powered=True,
+            )
+        )
+        repair_template_running = (
+            pane.repair_button.get_visible()
+            and not pane.repair_button.get_sensitive()
+        )
+
+        # A running clone is stopped by the dialog, so the action stays offered
+        # rather than being greyed out with no way forward.
+        window.statuses["clone-a"] = _stand_in(
+            name="clone-a",
+            template_source=VM,
+            backing=f"/old/vmhub/{VM}/disk/data.qcow2",
+            is_template=False,
+            dependents=[],
+            powered=True,
+        )
+        pane.update(
+            _stand_in(
+                template_source=None,
+                is_template=True,
+                dependents=["clone-a"],
+                powered=False,
+            )
+        )
+        repair_clone_running = (
+            pane.repair_button.get_visible()
+            and pane.repair_button.get_sensitive()
+        )
+    finally:
+        window.statuses.clear()
+        window.statuses.update(saved_statuses)
+        pane.update(real_status)
+
+    for ok, label, detail in (
+        (
+            flatten_alone,
+            "Flatten is offered on a stopped linked clone",
+            "Flatten is missing or disabled on a clone, or Repair is showing too",
+        ),
+        (
+            flatten_running,
+            "Flatten is disabled while its clone runs",
+            "Flatten was enabled on a running clone",
+        ),
+        (
+            repair_current,
+            "Repair is hidden when a clone's backing path already matches",
+            "Repair was offered although the clone points at the template's disk",
+        ),
+        (
+            repair_stale,
+            "Repair is offered when a clone's backing path is stale",
+            "Repair is missing or disabled although the clone points elsewhere",
+        ),
+        (
+            repair_template_running,
+            "Repair is disabled while the template runs",
+            "Repair was enabled on a running template",
+        ),
+        (
+            repair_clone_running,
+            "Repair stays offered when a clone runs, so it can be stopped",
+            "Repair was disabled instead of offering to stop the running clone",
+        ),
+    ):
+        if ok:
+            exercised.append(label)
+            print(f"  \033[32mPASS\033[0m  {label}")
+        else:
+            failures.append((label, detail))
+            print(f"  \033[31mFAIL\033[0m  {detail}")
 
     # ---- a refresh must not overwrite a field while it is being typed in ----
     # The poll used to write into these fields regardless of focus, and

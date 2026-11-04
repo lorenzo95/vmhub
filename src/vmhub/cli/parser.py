@@ -199,7 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.set_defaults(func=cmd_flatten)
 
-    p = sub.add_parser("rebase", help="repoint all clones of a template at a new disk")
+    p = sub.add_parser("rebase", help="repair clone backing paths after a move")
     p.add_argument("template")
     p.set_defaults(func=cmd_rebase)
 

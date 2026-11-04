@@ -176,6 +176,13 @@ def flatten(vm: str, *, progress: Progress = _noop) -> None:
 
 
 def rebase_all(template: str, *, progress: Progress = _noop) -> list[str]:
+    """Rewrite each clone's backing path to the template's current disk.
+
+    A clone records its backing path as an absolute path when it is created,
+    so this is a no-op unless the project or the template disk has moved.
+    Clones that already point at the right disk are left alone, and only the
+    ones actually rewritten are returned.
+    """
     progress = progress or _noop
     dependents = registry.dependents_of(template)
     if not dependents:
@@ -188,7 +195,14 @@ def rebase_all(template: str, *, progress: Progress = _noop) -> list[str]:
     for clone_name in dependents:
         if podman.is_running(clone_name):
             raise TemplateInUse(f"stop clone {clone_name} before rebasing")
+    updated: list[str] = []
     for clone_name in dependents:
-        progress(f"Rebasing {clone_name} onto {template}...")
-        disk.rebase(paths.disk_path(clone_name), source_disk)
-    return dependents
+        clone_disk = paths.disk_path(clone_name)
+        if disk.backing_points_at(
+            disk.backing_file(clone_disk), clone_disk, source_disk
+        ):
+            continue
+        progress(f"Repairing {clone_name}'s backing path onto {template}...")
+        disk.rebase(clone_disk, source_disk)
+        updated.append(clone_name)
+    return updated
