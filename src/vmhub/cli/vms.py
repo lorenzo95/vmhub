@@ -261,6 +261,16 @@ def cmd_stop(args: argparse.Namespace, out: Out) -> int:
     return 1 if failed else 0
 
 
+def cmd_reset(args: argparse.Namespace, out: Out) -> int:
+    try:
+        lifecycle.reset(args.name, progress=None if args.quiet else out.step)
+    except VmhubError as exc:
+        print(out.bad(str(exc)))
+        return 1
+    out.say(out.good(f"{args.name} reset (guest rebooted, container and ports kept)"))
+    return 0
+
+
 def cmd_stop_all(args: argparse.Namespace, out: Out) -> int:
     failed = 0
     cancelled: list[str] = []

@@ -6,10 +6,13 @@ import os
 import platform
 import shutil
 import socket
+import subprocess
 import tarfile
 import tempfile
+import threading
 import time
-from pathlib import Path
+from contextlib import contextmanager
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from . import disk, lifecycle, paths, podman, registry, spec, toml_io
@@ -31,6 +34,14 @@ SIDECAR_SUFFIX = ".sha256"
 # A bundle being written. It never gets the final name, so a half-written
 # archive can never be mistaken for a backup.
 PARTIAL_SUFFIX = ".partial"
+
+# zstd frame magic. Bundles are sniffed by content, not by extension, so a
+# renamed file still opens with the right decompressor.
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def _zstd_binary() -> str | None:
+    return shutil.which("zstd")
 
 
 def _sidecar_path(archive: Path) -> Path:
@@ -102,28 +113,112 @@ def _sha256(path: Path, *, chunk: int = 1 << 22) -> str:
 
 def _archive_name(vm: str) -> str:
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return f"{vm}-{stamp}.vmhub.tar.gz"
+    ext = "tar.zst" if _zstd_binary() else "tar.gz"
+    return f"{vm}-{stamp}.vmhub.{ext}"
 
 
-def _build_tar(staging: Path, dest: Path) -> Path:
-    with tarfile.open(dest, "w:gz") as tar:
-        # Add the manifest first, with a bare arcname. read_manifest() on the
-        # import side streams the gzip members and short-circuits on the first
-        # manifest.json it sees -- so a name-collision check on import can run
-        # before the multi-GB disk block has even been decompressed. Without
-        # this, every import pays the full cost of decoding past the disk
-        # just to find the manifest near the end of the archive.
-        manifest = staging / "manifest.json"
-        if manifest.is_file():
-            tar.add(manifest, arcname="manifest.json")
-        tar.add(
-            staging, arcname=".",
-            # The recursive add below would re-add manifest.json as
-            # "./manifest.json"; skip it so it stays a single, bare-named
-            # member at the start of the archive.
-            filter=lambda ti: None if ti.name == "./manifest.json" else ti,
-        )
-    return dest
+class _HashingWriter:
+    """A file wrapper that hashes every byte written through it.
+
+    The sidecar checksum used to cost a full extra read of the finished
+    archive. Hashing the compressed bytes as they land removes that pass
+    without changing what the checksum covers.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._handle = open(path, "wb")
+        self.digest = hashlib.sha256()
+
+    def write(self, data: bytes) -> int:
+        self.digest.update(data)
+        return self._handle.write(data)
+
+    def flush(self) -> None:
+        self._handle.flush()
+
+    def close(self) -> None:
+        self._handle.close()
+
+
+def _add_members(tar: tarfile.TarFile, staging: Path) -> None:
+    # Add the manifest first, with a bare arcname. read_manifest() on the
+    # import side streams the members and short-circuits on the first
+    # manifest.json it sees -- so a name-collision check on import can run
+    # before the multi-GB disk block has even been decompressed. Without
+    # this, every import pays the full cost of decoding past the disk
+    # just to find the manifest near the end of the archive.
+    manifest = staging / "manifest.json"
+    if manifest.is_file():
+        tar.add(manifest, arcname="manifest.json")
+    tar.add(
+        staging, arcname=".",
+        # The recursive add below would re-add manifest.json as
+        # "./manifest.json"; skip it so it stays a single, bare-named
+        # member at the start of the archive.
+        filter=lambda ti: None if ti.name == "./manifest.json" else ti,
+    )
+
+
+def _build_tar(staging: Path, dest: Path) -> str:
+    """Write the bundle; return the sha256 of the compressed bytes.
+
+    zstd when the binary is present: tens of times faster than gzip at a
+    better ratio, and -T0 uses every core. The payload is still a plain
+    tar inside a standard zstd frame. Without zstd the fallback is gzip
+    at level 1 -- the old level 9 spent ~9x the CPU for ~3% smaller
+    archives, which is a bad trade for a backup.
+    """
+    zstd = _zstd_binary()
+    out = _HashingWriter(dest)
+    try:
+        if zstd:
+            proc = subprocess.Popen(
+                [zstd, "-q", "-3", "-T0", "-c"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+            )
+            # Drain zstd's output while tar is still writing its input.
+            # Waiting until the tar is finished deadlocks on any real
+            # disk: the compressed output fills the 64 KB pipe buffer,
+            # zstd blocks on stdout, and tar blocks on stdin.
+            errors: list[BaseException] = []
+
+            def _drain() -> None:
+                try:
+                    while True:
+                        block = proc.stdout.read(1 << 22)
+                        if not block:
+                            break
+                        out.write(block)
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    proc.kill()  # unblock the tar writer
+
+            drainer = threading.Thread(target=_drain, name="vmhub-bundle-hash", daemon=True)
+            drainer.start()
+            tar_error: BaseException | None = None
+            try:
+                with tarfile.open(fileobj=proc.stdin, mode="w|") as tar:
+                    _add_members(tar, staging)
+                proc.stdin.close()
+            except BaseException as exc:  # noqa: BLE001
+                tar_error = exc
+                proc.kill()
+            drainer.join()
+            proc.stdout.close()
+            proc.wait()
+            if errors:
+                raise errors[0]
+            if tar_error is not None:
+                raise tar_error
+            if proc.returncode != 0:
+                raise DiskError("zstd failed while writing the bundle")
+        else:
+            with tarfile.open(fileobj=out, mode="w|gz", compresslevel=1) as tar:
+                _add_members(tar, staging)
+    finally:
+        out.close()
+    return out.digest.hexdigest()
 
 
 def export_vm(
@@ -178,16 +273,20 @@ def export_vm(
                 f"data, so this copies far more than the clone alone:"
             )
             disk.convert(disk_file, exported, "qcow2")
+            disk_sha = _sha256(exported)
         else:
             # Standalone disk: copy it. Convert was used here too, and it
             # dropped the disk's internal snapshots -- the bundle came back
             # with nothing to revert to. This used to say "Copying disk
             # (sparse-aware)" while converting anyway.
             progress("Copying disk (sparse-aware)...")
+            # The copy is byte-for-byte, so hash the source now instead of
+            # re-reading the staged copy afterwards: one full pass saved.
+            disk_sha = _sha256(disk_file)
             disk.copy_sparse(disk_file, exported)
         disk_entry = {
             "file": paths.DISK_NAME,
-            "sha256": _sha256(exported),
+            "sha256": disk_sha,
             "virtual_size": disk.virtual_size(disk_file),
             "actual_size": disk.actual_size(exported),
             "format": disk.format_of(exported),
@@ -264,7 +363,11 @@ def export_vm(
         (staging / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
         archive = target / _archive_name(vm)
-        progress("Writing archive...")
+        progress(
+            "Writing archive (zstd, all cores)..."
+            if _zstd_binary()
+            else "Writing archive (gzip fallback; install zstd for much faster backups)..."
+        )
         # Written to a partial name and renamed into place only once it is
         # whole. A bundle that is cut short -- by a full disk, by a killed
         # job, by anything -- therefore never appears under the name a backup
@@ -273,8 +376,7 @@ def export_vm(
         # bundles` listed like any other backup.
         partial = target / (archive.name + PARTIAL_SUFFIX)
         try:
-            _build_tar(staging, partial)
-            digest = _sha256(partial)
+            digest = _build_tar(staging, partial)
             os.replace(partial, archive)
         finally:
             partial.unlink(missing_ok=True)
@@ -288,6 +390,55 @@ def export_vm(
     return archive
 
 
+@contextmanager
+def _open_tar(archive: Path):
+    """Open a bundle for reading, whatever it is compressed with.
+
+    zstd is sniffed by magic and piped through the zstd binary: Python
+    3.13's tarfile cannot read zstd itself. Everything else goes through
+    tarfile's auto-detection, which keeps every older gzip bundle
+    readable. The stream is one-pass, so callers must iterate members in
+    order (both read_manifest and import_bundle do).
+    """
+    with open(archive, "rb") as probe:
+        magic = probe.read(4)
+    if magic == ZSTD_MAGIC:
+        zstd = _zstd_binary()
+        if not zstd:
+            raise DiskError(
+                f"{Path(archive).name} is zstd-compressed; install zstd to read it"
+            )
+        proc = subprocess.Popen(
+            [zstd, "-d", "-c", "--", str(archive)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            with tarfile.open(fileobj=proc.stdout, mode="r|") as tar:
+                yield tar
+            proc.stdout.close()
+            # The consumer may have stopped early -- read_manifest only
+            # needs the first member. A zstd that is still running would
+            # then die on the closed pipe, which is not a bundle error;
+            # only a zstd that finished on its own can report one.
+            rc = proc.poll()
+            if rc is None:
+                proc.kill()
+                proc.wait()
+            else:
+                proc.wait()
+                if rc != 0:
+                    detail = proc.stderr.read().decode(errors="replace").strip()
+                    raise DiskError(f"decompressing {Path(archive).name} failed: {detail}")
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+    else:
+        with tarfile.open(archive, "r:*") as tar:
+            yield tar
+
+
 def read_manifest(archive: Path) -> dict[str, Any]:
     # Stream the gzip archive header-by-header via tar.next() instead of
     # getmembers(), which decodes the entire archive up front. Bundles built
@@ -297,16 +448,26 @@ def read_manifest(archive: Path) -> dict[str, Any]:
     # Older bundles (manifest near the end) still work -- the loop walks the
     # whole archive, but the import flow only pays that cost when the name is
     # actually free.
-    with tarfile.open(archive, "r:*") as tar:
-        while True:
-            member = tar.next()
-            if member is None:
-                break
-            if member.name.endswith("manifest.json"):
-                handle = tar.extractfile(member)
-                if handle is None:
+    try:
+        with _open_tar(archive) as tar:
+            while True:
+                member = tar.next()
+                if member is None:
                     break
-                return json.loads(handle.read().decode())
+                if member.name.endswith("manifest.json"):
+                    handle = tar.extractfile(member)
+                    if handle is None:
+                        break
+                    try:
+                        return json.loads(handle.read().decode())
+                    except (ValueError, UnicodeDecodeError) as exc:
+                        raise DiskError(
+                            f"manifest in {Path(archive).name} is damaged: {exc}"
+                        ) from exc
+    except tarfile.TarError as exc:
+        # A damaged archive must fail as a vmhub error the CLI can report,
+        # not as a raw tarfile traceback.
+        raise DiskError(f"cannot read {Path(archive).name}: {exc}") from exc
     raise NotFound(f"no manifest.json inside {archive}")
 
 
@@ -337,17 +498,44 @@ def import_bundle(
     tmpname = tempfile.mkdtemp(prefix=f"vmhub-import-{target_name}-", dir=paths.backup_dir())
     try:
         tmp = Path(tmpname)
-        with tarfile.open(archive, "r:*") as tar:
-            for member in tar.getmembers():
+        disk_name = manifest.get("disk", {}).get("file", paths.DISK_NAME)
+        disk_digest: str | None = None
+        with _open_tar(archive) as tar:
+            # One pass: check each member's path and extract it in the same
+            # step. A streaming zstd pipe cannot be rewound for a second
+            # scan, and the disk is hashed while it is extracted so the
+            # verification below costs no extra read.
+            for member in tar:
                 target = (tmp / member.name).resolve()
                 if not str(target).startswith(str(tmp.resolve())):
                     raise DiskError(f"unsafe path in archive: {member.name}")
-            tar.extractall(tmp, filter="data")
+                parts = PurePosixPath(member.name).parts
+                is_disk = (
+                    member.isfile()
+                    and len(parts) >= 2
+                    and parts[-1] == disk_name
+                    and parts[-2] in ("disk", "storage")
+                )
+                if is_disk:
+                    handle = tar.extractfile(member)
+                    if handle is None:
+                        raise DiskError(f"cannot read {member.name} from the bundle")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    digest = hashlib.sha256()
+                    with open(target, "wb") as out:
+                        while True:
+                            block = handle.read(1 << 22)
+                            if not block:
+                                break
+                            digest.update(block)
+                            out.write(block)
+                    disk_digest = digest.hexdigest()
+                else:
+                    tar.extract(member, tmp, filter="data")
         bundle_root = tmp / "bundle" if (tmp / "bundle" / "manifest.json").is_file() else tmp
         if not (bundle_root / "manifest.json").is_file():
             raise DiskError("archive does not contain a bundle root")
 
-        disk_name = manifest.get("disk", {}).get("file", paths.DISK_NAME)
         src_disk = bundle_root / "disk" / disk_name
         if not src_disk.is_file():
             legacy = bundle_root / "storage" / disk_name
@@ -359,7 +547,7 @@ def import_bundle(
         expected = manifest.get("disk", {}).get("sha256")
         if expected:
             progress("Verifying checksum...")
-            actual = _sha256(src_disk)
+            actual = disk_digest if disk_digest is not None else _sha256(src_disk)
             if actual != expected:
                 raise DiskError(
                     f"checksum mismatch for {disk_name}: expected {expected[:16]}…, got {actual[:16]}…"

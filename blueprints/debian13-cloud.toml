@@ -3,6 +3,10 @@ description = "Debian 13 from the genericcloud image, configured by cloud-init. 
 icon = "linux"
 os = "linux"
 ssh_user = "debian"
+# Cloud-image key: this blueprint is provisioned (cloud image + cloud-init
+# seed), not installed. `vmctl provision` and the GUI's Create both take
+# that path when this is set.
+image = "debian13"
 notes = """
 No installer runs. The trixie genericcloud image (the one that carries
 cloud-init and openssh-server) is converted into this VM's disk, a CIDATA

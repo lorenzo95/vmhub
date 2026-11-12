@@ -1,17 +1,54 @@
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gio, GLib, Gtk, Pango  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 from .. import export, lifecycle, ports, registry  # noqa: E402
 from ..errors import AlreadyExists  # noqa: E402
 from . import widgets, workers  # noqa: E402
 from .pane import VmPane  # noqa: E402
 
+# Both bundle formats the importer reads. The chooser once listed only
+# *.vmhub.tar.gz, so after the switch to zstd it showed an empty folder
+# full of valid backups.
+BUNDLE_PATTERNS = ["*.vmhub.tar.zst", "*.vmhub.tar.gz"]
+
+
+@dataclass
+class TaskRecord:
+    """One run_task invocation, from begin to finish."""
+
+    id: int
+    label: str
+    message: str
+    started: float
+    state: str = "running"  # running | done | failed
+    finished: float = 0.0
+    error: str = ""
+
+
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    return f"{seconds // 60}m {seconds % 60:02d}s"
+
 
 class StatusStrip(Gtk.Box):
+    """Newest message + spinner, and a click-through list of every task.
+
+    push/pop/set_idle stay the low-level surface. begin/update/finish add
+    a record per task on top, so three concurrent backups each keep their
+    own progress line and outcome in the popover instead of overwriting
+    one another in the single label.
+    """
+
+    FINISHED_KEEP = 10
+
     def __init__(self) -> None:
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.label = Gtk.Label()
@@ -20,12 +57,25 @@ class StatusStrip(Gtk.Box):
         self.label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         self.label.set_tooltip_text("")
         self.label.add_css_class("dim")
+        self.count_label = Gtk.Label()
+        self.count_label.add_css_class("dim")
+        self.count_label.set_visible(False)
         self.spinner = Gtk.Spinner()
         self.spinner.set_visible(False)
         self.append(self.label)
+        self.append(self.count_label)
         self.append(self.spinner)
         self._active = 0
         self._history: list[str] = []
+        self.tasks: list[TaskRecord] = []
+        self._next_task_id = 1
+        self._tick_tag = 0
+        self._build_popover()
+        click = Gtk.GestureClick()
+        click.connect("released", lambda *_a: self._toggle_popover())
+        self.add_controller(click)
+
+    # -- low-level surface -------------------------------------------------
 
     def push(self, message: str, *, transient: bool = False) -> None:
         """Show the newest message, and keep a short scrollback on the tooltip.
@@ -47,6 +97,7 @@ class StatusStrip(Gtk.Box):
         self._active += 1
         self.spinner.set_visible(True)
         self.spinner.start()
+        self._update_count()
 
     def pop(self) -> None:
         self._active = max(0, self._active - 1)
@@ -55,6 +106,178 @@ class StatusStrip(Gtk.Box):
             self.spinner.set_visible(False)
             self._history.clear()
             self.label.set_tooltip_text("")
+        self._update_count()
+
+    def _update_count(self) -> None:
+        self.count_label.set_visible(self._active > 1)
+        self.count_label.set_text(f"{self._active} tasks")
+
+    # -- per-task tracking -------------------------------------------------
+
+    def begin(self, label: str) -> int:
+        task = TaskRecord(
+            id=self._next_task_id, label=label, message=label,
+            started=time.monotonic(),
+        )
+        self._next_task_id += 1
+        self.tasks.append(task)
+        self.push(label)
+        self._tasks_changed()
+        return task.id
+
+    def update(self, task_id: int, message: str) -> None:
+        task = self._task(task_id)
+        if task is not None:
+            task.message = message
+        self.push(message, transient=True)
+        self._tasks_changed()
+
+    def finish(self, task_id: int, *, ok: bool = True, error: str = "") -> None:
+        task = self._task(task_id)
+        if task is not None:
+            task.state = "done" if ok else "failed"
+            task.finished = time.monotonic()
+            task.error = error
+        self.pop()
+        finished = [t for t in self.tasks if t.state != "running"]
+        for old in finished[: -self.FINISHED_KEEP]:
+            self.tasks.remove(old)
+        self._tasks_changed()
+
+    def clear_finished(self) -> None:
+        self.tasks = [t for t in self.tasks if t.state == "running"]
+        self._tasks_changed()
+
+    def _task(self, task_id: int) -> TaskRecord | None:
+        return next((t for t in self.tasks if t.id == task_id), None)
+
+    # -- the task popover --------------------------------------------------
+
+    def _build_popover(self) -> None:
+        self.popover = Gtk.Popover()
+        # A readable fixed width: with no request the popover collapsed to
+        # the labels' minimum and every task name came out as "exporti...".
+        self.popover.set_size_request(460, -1)
+        self.popover.set_parent(self)
+        # Open above the strip. RIGHT placement centered the bubble on
+        # the strip's height, which sits at the window's bottom edge, so
+        # half the bubble hung out below the app. TOP is guaranteed to
+        # fit vertically; the horizontal shift below keeps it inside the
+        # left edge.
+        self.popover.set_position(Gtk.PositionType.TOP)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(10)
+        self.task_list = Gtk.ListBox()
+        self.task_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_max_content_height(320)
+        scroll.set_propagate_natural_height(True)
+        scroll.set_child(self.task_list)
+        self.clear_button = Gtk.Button(label="Clear finished")
+        self.clear_button.connect("clicked", lambda _b: self.clear_finished())
+        box.append(scroll)
+        box.append(self.clear_button)
+        self.popover.set_child(box)
+        self.popover.connect("show", self._on_popover_show)
+        self.popover.connect("closed", self._on_popover_closed)
+
+    def _toggle_popover(self) -> None:
+        if self.popover.get_visible():
+            self.popover.popdown()
+        else:
+            # TOP centers the bubble on the anchor point, so anchor at the
+            # strip's left edge and shift the bubble right by half its
+            # width (the 460px request). The arrow lands at the bubble's
+            # bottom-left corner and the whole popover stays in the window.
+            # No height measurement: an unrealized popover reports the
+            # wrong natural height, which is why the previous attempt did
+            # nothing.
+            self.popover.set_pointing_to(
+                Gdk.Rectangle(x=0, y=0, width=1, height=max(1, self.get_allocated_height()))
+            )
+            self.popover.set_offset(230, 0)
+            self.popover.popup()
+
+    def _on_popover_show(self, _popover) -> None:
+        self._rebuild_task_rows()
+        if not self._tick_tag:
+            self._tick_tag = GLib.timeout_add_seconds(1, self._tick)
+
+    def _on_popover_closed(self, _popover) -> None:
+        if self._tick_tag:
+            GLib.source_remove(self._tick_tag)
+            self._tick_tag = 0
+
+    def _tick(self) -> bool:
+        self._rebuild_task_rows()
+        return True
+
+    def _tasks_changed(self) -> None:
+        if self.popover.get_visible():
+            self._rebuild_task_rows()
+
+    def _rebuild_task_rows(self) -> None:
+        while True:
+            row = self.task_list.get_row_at_index(0)
+            if row is None:
+                break
+            self.task_list.remove(row)
+        running = [t for t in self.tasks if t.state == "running"]
+        finished = [t for t in self.tasks if t.state != "running"]
+        finished.reverse()  # newest first
+        now = time.monotonic()
+        for task in running + finished:
+            self.task_list.append(self._task_row(task, now))
+        if not self.tasks:
+            empty = Gtk.Label(label="No tasks yet")
+            empty.add_css_class("dim")
+            empty.set_margin_top(6)
+            empty.set_margin_bottom(6)
+            self.task_list.append(empty)
+        self.clear_button.set_visible(bool(finished))
+
+    def _task_row(self, task: TaskRecord, now: float) -> Gtk.Box:
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(row, f"set_margin_{side}")(4)
+        if task.state == "running":
+            mark = Gtk.Spinner()
+            mark.start()
+            detail = task.message
+            when = _format_elapsed(now - task.started)
+        else:
+            mark = Gtk.Label(label="✓" if task.state == "done" else "✗")
+            if task.state == "failed":
+                mark.add_css_class("errrow")
+            detail = (
+                task.error if task.state == "failed" and task.error
+                else "finished" if task.state == "done"
+                else "failed"
+            )
+            when = _format_elapsed(task.finished - task.started)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        text.set_hexpand(True)
+        title = Gtk.Label(label=task.label)
+        title.set_xalign(0.0)
+        title.set_wrap(True)
+        title.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        title.set_max_width_chars(48)
+        line = Gtk.Label(label=detail)
+        line.set_xalign(0.0)
+        line.set_wrap(True)
+        line.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        line.set_max_width_chars(48)
+        line.add_css_class("dim")
+        text.append(title)
+        text.append(line)
+        clock = Gtk.Label(label=when)
+        clock.add_css_class("dim")
+        row.append(mark)
+        row.append(text)
+        row.append(clock)
+        return row
 
     def set_idle(self, text: str) -> None:
         if self._active == 0:
@@ -558,7 +781,7 @@ class VmhubWindow(Gtk.ApplicationWindow):
         chooser = Gtk.FileDialog()
         chooser.set_title("Import a vmhub bundle")
         chooser.set_filters(
-            widgets.filter_store("vmhub bundles", ["*.vmhub.tar.gz"])
+            widgets.filter_store("vmhub bundles", BUNDLE_PATTERNS)
         )
 
         def on_open(source, result) -> None:
@@ -598,7 +821,7 @@ class VmhubWindow(Gtk.ApplicationWindow):
             lambda progress: export.import_bundle(
                 archive_path, name=name, progress=progress
             ),
-            label="Importing bundle",
+            label=f"Importing {archive_path.rsplit('/', 1)[-1]}",
             on_done=lambda vm: self.select_vm(vm),
             on_error=on_error,
         )

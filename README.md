@@ -50,6 +50,7 @@ sudo apt-get install -y \
     uidmap \
     passt \
     qemu-utils \
+    zstd \
     python3-gi \
     python3-gi-cairo \
     gir1.2-gtk-4.0
@@ -64,6 +65,7 @@ What each one is for, so you can tell what is optional:
 | `uidmap` | provides the setuid `newuidmap`/`newgidmap` helpers that rootless podman needs to map subuids |
 | `passt` | user-mode networking for rootless containers. podman 5.x uses `pasta` from this package. `slirp4netns` also works |
 | `qemu-utils` | `qemu-img` — every disk operation: create, resize, snapshot, convert, and the backing-file clones |
+| `zstd` | backup compression — fast, small bundles using all cores. Without it, export falls back to fast gzip; import reads both formats |
 | `python3-gi`, `python3-gi-cairo` | PyGObject, for the GUI |
 | `gir1.2-gtk-4.0` | GTK 4, which the GUI requires |
 
@@ -438,11 +440,11 @@ cd /srv/vmhub
 Every VM's disk can be made self-contained and moved to another machine.
 
 ```bash
-./vmctl export debian-a                     # -> backups/debian-a-<date>.vmhub.tar.gz
-scp backups/debian-a-*.tar.gz otherhost:~/vmhub/backups/
+./vmctl export debian-a                     # -> backups/debian-a-<date>.vmhub.tar.zst
+scp backups/debian-a-*.tar.zst otherhost:~/vmhub/backups/
 
-# on the other host
-./vmctl import ~/vmhub/backups/debian-a-*.tar.gz
+# on the other host (needs zstd; older .tar.gz bundles import without it)
+./vmctl import ~/vmhub/backups/debian-a-*.tar.zst
 ./vmctl start debian-a
 ```
 

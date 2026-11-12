@@ -1935,13 +1935,13 @@ def main() -> int:
         lifecycle.remove(name)
     check("all test VMs removed", not registry.exists(VM))
     stale = [
-        b for b in paths.backup_dir().glob("*.vmhub.tar.gz")
+        b for b in paths.backup_dir().glob("*.vmhub.tar.*")
         if b.name.startswith(VM) or b.name.startswith("sweepvm")
     ]
     for bundle in stale:
         bundle.unlink(missing_ok=True)
     check("test bundles cleaned up",
-          not [b for b in paths.backup_dir().glob("*.vmhub.tar.gz")
+          not [b for b in paths.backup_dir().glob("*.vmhub.tar.*")
                if b.name.startswith(VM) or b.name.startswith("sweepvm")],
           str([b.name for b in stale]))
     leftovers = [m.name for m in registry.iter_metas() if m.name.startswith("vmhub-selftest")]

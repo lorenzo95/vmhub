@@ -52,6 +52,7 @@ from .vms import (
     cmd_ssh,
     cmd_start,
     cmd_stop,
+    cmd_reset,
     cmd_stop_all,
     cmd_template,
 )
@@ -127,6 +128,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("reset", help="reset a running VM instantly (guest reboot, container keeps running)")
+    p.add_argument("name")
+    p.add_argument("--quiet", "-q", action="store_true", help="suppress progress output")
+    p.set_defaults(func=cmd_reset)
 
     p = sub.add_parser("stop-all", help="stop every running VM")
     p.add_argument("--mode", choices=list(lifecycle.STOP_MODES))

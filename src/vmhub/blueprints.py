@@ -7,7 +7,7 @@ from typing import Any
 from . import paths, spec, toml_io
 from .errors import NotFound, SpecError
 
-RESERVED = {"name", "title", "description", "icon", "os", "spec", "notes", "ssh_user", "rdp_user"}
+RESERVED = {"name", "title", "description", "icon", "os", "spec", "notes", "ssh_user", "rdp_user", "image"}
 
 
 @dataclass
@@ -20,6 +20,10 @@ class Blueprint:
     notes: str = ""
     ssh_user: str = "user"
     rdp_user: str = ""
+    # Cloud-image key (see `vmctl images`). Non-empty means this blueprint
+    # is provisioned -- cloud image + cloud-init seed -- not installed:
+    # `vmctl provision` and the GUI's Create both take that path.
+    image: str = ""
     overrides: dict[str, Any] = field(default_factory=dict)
 
     def base_spec(self, name: str) -> spec.VmSpec:
@@ -36,6 +40,7 @@ class Blueprint:
             "notes": self.notes,
             "ssh_user": self.ssh_user,
             "rdp_user": self.rdp_user,
+            "image": self.image,
             "spec": self.overrides,
         }
 
@@ -53,6 +58,7 @@ def _from_dict(name: str, data: dict) -> Blueprint:
         notes=data.get("notes", ""),
         ssh_user=data.get("ssh_user", "user"),
         rdp_user=data.get("rdp_user", ""),
+        image=data.get("image", ""),
         overrides=data.get("spec", {}) or {},
     )
 

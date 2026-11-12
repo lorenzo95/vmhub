@@ -67,7 +67,7 @@ exercised: list[str] = []
 # here would start and stop the user's real machines, which is how this sweep
 # was silently mutating state it had no business touching. Their logic is
 # covered by the backend selftest against throwaway VMs.
-DESTRUCTIVE = {"_on_start_all", "_on_stop_all", "_on_restore", "_on_prune"}
+DESTRUCTIVE = {"_on_start_all", "_on_stop_all", "_on_restore", "_on_prune", "_on_reset"}
 
 # Handlers that wreck the window itself rather than a VM. Swept in name order,
 # _on_close stops every pane's log timer and latches window._closing, which
@@ -185,7 +185,7 @@ def _cleanup() -> None:
         except Exception:
             pass
         shutil.rmtree(paths.vm_dir(meta.name), ignore_errors=True)
-    for bundle in paths.backup_dir().glob("*.vmhub.tar.gz"):
+    for bundle in paths.backup_dir().glob("*.vmhub.tar.*"):
         if bundle.name.startswith(HARNESS_PREFIXES):
             bundle.unlink(missing_ok=True)
 
@@ -252,6 +252,14 @@ def _probe(app) -> None:
 
     status = window.statuses[VM]
     check("filter_store", lambda: widgets.filter_store("x", ["*.iso"]))
+    # The import chooser once filtered only *.vmhub.tar.gz, so a folder
+    # full of new zstd backups looked empty. Pin both formats.
+    from vmhub.ui import window as window_mod
+    check(
+        "the import chooser lists zstd and gzip bundles",
+        lambda: "*.vmhub.tar.zst" in window_mod.BUNDLE_PATTERNS
+        and "*.vmhub.tar.gz" in window_mod.BUNDLE_PATTERNS,
+    )
     check("key_value_grid", lambda: widgets.key_value_grid([("a", "b")]))
     check("section", lambda: widgets.section("h"))
     check("copy_row", lambda: widgets.copy_row("text"))
@@ -993,6 +1001,79 @@ def _probe(app) -> None:
     finally:
         del_pane.close()
 
+    # ---- Reset: two clicks to fire, one click must never reboot ----
+    # The button arms on the first click and fires on the second; arming
+    # expires on its own, and a stopped VM must not offer it at all.
+    reset_pane = VmPane(window, VM)
+    try:
+        reset_calls: list = []
+        captured_reset: dict = {}
+        real_lifecycle_reset = lifecycle.reset
+        real_run_task = widgets.run_task
+
+        def fake_reset(name, **kw):
+            reset_calls.append(name)
+
+        def fake_run_task(_parent, work, **kw):
+            captured_reset["work"] = work
+            captured_reset["label"] = kw.get("label", "")
+
+        lifecycle.reset = fake_reset
+        widgets.run_task = fake_run_task
+        try:
+            reset_pane.update(lifecycle.VmStatus(name=VM, powered=True))
+            shown_when_running = reset_pane.reset_button.get_visible()
+            reset_pane._on_reset(None)  # first click: arm only
+            armed_label = reset_pane.reset_button.get_label()
+            armed_no_fire = not reset_calls and "work" not in captured_reset
+            reset_pane._on_reset(None)  # second click: fire
+            if "work" in captured_reset:
+                captured_reset["work"](lambda _m: None)
+            fired_once = reset_calls == [VM]
+            disarmed_after = (
+                not reset_pane._reset_armed
+                and reset_pane.reset_button.get_label() == "Reset"
+            )
+            reset_pane._on_reset(None)
+            reset_pane._reset_timeout()
+            expired = not reset_pane._reset_armed and reset_calls == [VM]
+            reset_pane._on_reset(None)
+            reset_pane.update(lifecycle.VmStatus(name=VM, powered=False))
+            hidden_when_stopped = not reset_pane.reset_button.get_visible()
+            stopped_disarmed = not reset_pane._reset_armed
+        finally:
+            lifecycle.reset = real_lifecycle_reset
+            widgets.run_task = real_run_task
+        problems = []
+        if not shown_when_running:
+            problems.append("Reset is hidden while the VM runs")
+        if not armed_no_fire:
+            problems.append("the first click fired instead of arming")
+        if "again" not in armed_label.lower():
+            problems.append(f"the armed label is unclear: {armed_label!r}")
+        if not fired_once:
+            problems.append(f"the second click did not reset exactly once: {reset_calls}")
+        if not disarmed_after:
+            problems.append("the button stayed armed after firing")
+        if not expired:
+            problems.append("arming did not expire on its own")
+        if not hidden_when_stopped:
+            problems.append("Reset is visible on a stopped VM")
+        if not stopped_disarmed:
+            problems.append("a stopped VM kept an armed Reset")
+        if problems:
+            raise AssertionError("; ".join(problems))
+        exercised.append("Reset needs two clicks, expires, and only shows while running")
+        print(
+            "  \033[32mPASS\033[0m  Reset needs two clicks, expires, "
+            "and only shows while running"
+        )
+    except AssertionError as exc:
+        failures.append(("reset button", str(exc)))
+        print(f"  \033[31mFAIL\033[0m  reset button: {exc}")
+    finally:
+        reset_pane.close()
+
     # ---- Ports and Details are separate tabs; Clone lives with Snapshots ----
     # Measured by walking the real widget tree, because tab names alone would
     # pass even if everything still lived on one page.
@@ -1382,6 +1463,77 @@ def _probe(app) -> None:
             f"selected {blank._blueprint_name()!r}, hint said {blank_hint!r}",
         ))
         print("  \033[31mFAIL\033[0m  the default blueprint option is not usable")
+
+    # ---- a cloud blueprint must provision, not install ----
+    # debian13-cloud from the GUI used to run lifecycle.create alone: an
+    # empty disk, no cloud image, no seed -- a VM with nothing to boot.
+    cloud = newvm.NewVmDialog(window)
+    cloud_names = [r[0] for r in cloud._rows]
+    cloud_index = cloud_names.index("debian13-cloud")
+    cloud.blueprint_drop.set_selected(cloud_index)
+    settle_dialog()
+    cloud_hint = cloud.blueprint_desc.get_text()
+    cloud.close()
+    if "cloud-init" in cloud_hint and "no installer" in cloud_hint:
+        exercised.append("a cloud blueprint says it provisions")
+        print("  \033[32mPASS\033[0m  a cloud blueprint says it provisions")
+    else:
+        failures.append(("cloud blueprint hint", f"hint said {cloud_hint!r}"))
+        print("  \033[31mFAIL\033[0m  a cloud blueprint does not announce provisioning")
+
+    routed: dict = {}
+    captured: dict = {}
+    real = (
+        (newvm.provision, "provision", newvm.provision.provision),
+        (newvm.lifecycle, "create", newvm.lifecycle.create),
+        (newvm.widgets, "run_task", newvm.widgets.run_task),
+        (newvm.seed, "discover_ssh_keys", newvm.seed.discover_ssh_keys),
+    )
+
+    def fake_provision(name, **kw):
+        routed["name"] = name
+        routed.update(kw)
+        return {"name": name}
+
+    def fake_create(*a, **kw):
+        routed["create_called"] = True
+
+    def fake_run_task(_parent, work, **kw):
+        captured["work"] = work
+        captured["label"] = kw.get("label", "")
+
+    newvm.provision.provision = fake_provision
+    newvm.lifecycle.create = fake_create
+    newvm.widgets.run_task = fake_run_task
+    newvm.seed.discover_ssh_keys = lambda: ["ssh-ed25519 AAAA guicheck"]
+    try:
+        dlg = newvm.NewVmDialog(window)
+        dlg.blueprint_drop.set_selected(cloud_index)
+        settle_dialog()
+        dlg.name_entry.set_text("guicheck-cloud")
+        settle_dialog()
+        dlg._on_create(None)
+        if "work" in captured:
+            captured["work"](lambda _m: None)
+    finally:
+        for obj, attr, value in real:
+            setattr(obj, attr, value)
+    route_ok = (
+        routed.get("name") == "guicheck-cloud"
+        and routed.get("image") == "debian13"
+        and routed.get("blueprint") == "debian13-cloud"
+        and not routed.get("create_called")
+        and captured.get("label", "").startswith("Provisioning")
+    )
+    if route_ok:
+        exercised.append("Create on a cloud blueprint takes the provision path")
+        print("  \033[32mPASS\033[0m  Create on a cloud blueprint takes the provision path")
+    else:
+        failures.append((
+            "cloud provision routing",
+            f"routed={routed!r}, captured label={captured.get('label')!r}",
+        ))
+        print("  \033[31mFAIL\033[0m  Create on a cloud blueprint does not provision")
 
     # ---- Delete has to be reachable, and right-click has to not be fatal ----
     # Right-clicking a VM row popped up a menu that had no parent widget.
@@ -1779,6 +1931,90 @@ def _probe(app) -> None:
     else:
         exercised.append("run_task progress reaches the status strip")
         print("  \033[32mPASS\033[0m  run_task progress reaches the status strip")
+
+    # ---- concurrent tasks must each keep their own line and outcome ----
+    # The strip used to be a single label: three backups overwrote each
+    # other and only the last message was visible. Now every run_task
+    # gets a record, and the popover lists them all.
+    captured: list = []
+    real_run_async = workers.run_async
+
+    def fake_work(progress):
+        return None
+    fake_work.guicheck_task = True
+
+    def capture_async(work, *, on_progress=None, on_done=None, on_error=None):
+        if getattr(work, "guicheck_task", False):
+            captured.append({"progress": on_progress, "done": on_done, "error": on_error})
+        else:
+            # The window's own refresh also goes through run_async; let
+            # it run for real so later refresh checks stay meaningful.
+            real_run_async(work, on_progress=on_progress, on_done=on_done, on_error=on_error)
+
+    workers.run_async = capture_async
+    # Earlier checks can leave tasks still running (their workers are real)
+    # and finished records behind; drain both before counting.
+    pump_until(lambda: not [t for t in strip.tasks if t.state == "running"])
+    strip.clear_finished()
+    custom_errors: list = []
+    rows = 0
+    try:
+        widgets.run_task(window, fake_work, label="guicheck backup A")
+        widgets.run_task(
+            window, fake_work, label="guicheck backup B",
+            on_error=lambda exc: custom_errors.append(exc) or False,
+        )
+        running = [t for t in strip.tasks if t.state == "running"]
+        two_tracked = len(running) == 2 and strip._active == 2
+        badge_ok = strip.count_label.get_visible() and "2" in strip.count_label.get_text()
+        readable_width = strip.popover.get_size_request()[0] >= 400
+        captured[0]["progress"]("A: halfway")
+        task_a = next(t for t in strip.tasks if t.label == "guicheck backup A")
+        task_b = next(t for t in strip.tasks if t.label == "guicheck backup B")
+        own_lines = task_a.message == "A: halfway" and task_b.message == "guicheck backup B"
+        captured[0]["done"](None)
+        captured[1]["error"](RuntimeError("disk full"))
+        outcomes = (
+            task_a.state == "done"
+            and task_b.state == "failed"
+            and task_b.error == "disk full"
+            and len(custom_errors) == 1
+        )
+        settled = strip._active == 0 and not strip.spinner.get_visible()
+        strip.popover.popup()
+        settle()
+        while strip.task_list.get_row_at_index(rows) is not None:
+            rows += 1
+        popover_rows = rows == 2
+        strip.clear_finished()
+        cleared = not [t for t in strip.tasks if t.state != "running"]
+        strip.popover.popdown()
+        settle()
+    finally:
+        workers.run_async = real_run_async
+    problems = []
+    if not two_tracked:
+        problems.append("two concurrent tasks were not both tracked")
+    if not badge_ok:
+        problems.append("the task count badge did not show 2 tasks")
+    if not own_lines:
+        problems.append("a progress message crossed into another task's line")
+    if not readable_width:
+        problems.append("the popover is too narrow to read task names")
+    if not outcomes:
+        problems.append("done/failed outcomes were not recorded per task")
+    if not settled:
+        problems.append("the strip did not return to idle after both tasks")
+    if not popover_rows:
+        problems.append(f"the popover showed {rows} rows for 2 tasks")
+    if not cleared:
+        problems.append("Clear finished left finished tasks behind")
+    if problems:
+        failures.append(("task tracker", "; ".join(problems)))
+        print(f"  \033[31mFAIL\033[0m  task tracker: {'; '.join(problems)}")
+    else:
+        exercised.append("concurrent tasks keep their own progress and outcome")
+        print("  \033[32mPASS\033[0m  concurrent tasks keep their own progress and outcome")
 
     # ---- refresh must not block the main loop ----
     started = time.time()

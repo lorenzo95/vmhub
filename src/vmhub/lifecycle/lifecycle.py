@@ -530,6 +530,27 @@ def _mark_stopped(vm: str, *, preserve_run_state: bool = False) -> None:
         registry.save_meta(meta)
 
 
+def reset(vm: str, *, progress: Progress = _noop) -> None:
+    """Reset a running guest instantly, like pressing the reset button.
+
+    QMP system_reset: the guest reboots on the spot while the container,
+    the QEMU process and every published port stay up -- no stop/start
+    cycle, no port reallocation. No shutdown is attempted, so unsaved
+    guest state is lost, exactly as with a hardware reset.
+    """
+    progress = progress or _noop
+    if not podman.exists(vm) or not podman.is_running(vm):
+        raise LifecycleError(
+            f"{vm} is not running; reset needs a live guest (start it first)"
+        )
+    progress(f"Resetting {vm} (no guest shutdown)...")
+    try:
+        with qmp.Qmp(paths.qmp_path(vm)) as client:
+            client.system_reset()
+    except (QmpError, NotFound, OSError) as exc:
+        raise LifecycleError(f"{vm}: reset failed ({exc})") from exc
+
+
 def stop(
     vm: str,
     *,

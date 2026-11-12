@@ -83,6 +83,7 @@ from .vms import (
     cmd_ssh,
     cmd_start,
     cmd_stop,
+    cmd_reset,
     cmd_stop_all,
     cmd_template,
     error_text,

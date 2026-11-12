@@ -1,0 +1,49 @@
+title = "ISO test (live)"
+description = "Minimal live-boot VM for quickly testing a Linux ISO. No install, nothing persisted."
+icon = "linux"
+os = "linux"
+notes = """
+Boot any Linux ISO in live mode and look at it in the web console.
+Nothing is installed; the guest runs entirely from the ISO and RAM.
+
+    ./vmctl new tryit -b isotest --no-start
+    ./vmctl iso attach tryit install /path/to/linux.iso
+    ./vmctl start tryit
+
+The install slot boots first, so the ISO comes straight up. When done:
+
+    ./vmctl rm tryit
+
+About the disk: vmhub requires one (the container would otherwise create
+its own), so this blueprint carries a 1G qcow2 placeholder. It is sparse
+(~200 KB on the host) and a live session never writes to it.
+
+Tweaks per ISO, before starting:
+
+  - Old BIOS-only ISOs:   ./vmctl set tryit boot.mode=legacy
+  - Heavy desktop ISOs:   ./vmctl set tryit resources.ram=4G
+  - No auto-download: boot.iso is empty on purpose; the only media is
+    the ISO you attach yourself.
+
+Most live ISOs have no SSH server and no guest agent, so expect the
+console to be the only way in. Port 22 is forwarded in case the ISO
+does start sshd.
+"""
+ssh_user = "root"
+
+[spec.resources]
+cpus = 2
+ram = "2G"
+disk = "1G"
+disk_type = "scsi"
+
+[spec.network]
+mode = "user"
+guest_ports = [22]
+
+[spec.boot]
+mode = "uefi"
+iso = ""
+
+[spec.features]
+guest_agent = false

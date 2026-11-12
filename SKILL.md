@@ -79,6 +79,13 @@ that file, so the disk would become invisible to vmhub with no way back.
 `export` resolves any backing chain via `qemu-img convert` while it copies, so
 bundles are always standalone. It stages beside the destination, never in /tmp.
 
+Bundles are `.vmhub.tar.zst` (zstd, all cores) when the `zstd` binary is
+present, otherwise `.vmhub.tar.gz` at gzip level 1. Import sniffs the magic
+bytes and reads both; a zstd bundle on a host without zstd fails with an
+"install zstd" error. The disk is hashed before the sparse copy and the
+archive checksum is hashed while it is written, so a backup makes two reads
+and one write of the data, not four passes.
+
 Import rebuilds `meta.json` from identity alone — uuid, mac, blueprint, the
 template flag — so `snapshot_power` and `dependents` are dropped even though
 `manifest["meta"]` carries them. Confirmed by round trip: a VM exported with

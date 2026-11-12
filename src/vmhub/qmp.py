@@ -115,6 +115,15 @@ class Qmp:
         except QmpError:
             pass
 
+    def system_reset(self) -> None:
+        """Reset the guest like the reset button on a physical machine.
+
+        QEMU reboots immediately; the process, the container and the
+        published ports all stay up. No shutdown is attempted, so unsaved
+        guest state is lost -- exactly what a hardware reset does.
+        """
+        self.execute("system_reset")
+
     def take_snapshot(self, device: str, name: str) -> None:
         self.execute("blockdev-snapshot-internal-sync", device=device, name=name)
 

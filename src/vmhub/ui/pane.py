@@ -116,6 +116,20 @@ class VmPane(Gtk.Box):
         self.power_button.add_css_class("suggested-action")
         self.power_button.connect("clicked", self._on_power)
 
+        # Reset is a two-click button: the first click arms it (it turns
+        # red and says so), the second fires. A single click must never
+        # reboot a guest, but a confirmation dialog would be too slow for
+        # the hung-VM case this exists for. Arming expires on its own.
+        self.reset_button = Gtk.Button(label="Reset")
+        self.reset_button.set_tooltip_text(
+            "Reset the guest instantly, like the reset button on a physical machine. "
+            "The container and its ports keep running. Click once to arm, click again "
+            "to reset. No shutdown happens, so unsaved work in the guest is lost."
+        )
+        self.reset_button.connect("clicked", self._on_reset)
+        self._reset_armed = False
+        self._reset_timer = 0
+
         self.force_button = Gtk.Button(label="Force stop")
         self.force_button.add_css_class("destructive-action")
         self.force_button.set_tooltip_text(
@@ -136,6 +150,7 @@ class VmPane(Gtk.Box):
 
         bar.append(self.snapshot_button)
         bar.append(self.power_button)
+        bar.append(self.reset_button)
         bar.append(self.force_button)
         bar.append(self.delete_button)
         self.append(bar)
@@ -381,7 +396,7 @@ class VmPane(Gtk.Box):
             widgets.run_task(
                 self.window,
                 lambda progress: lifecycle.attach_iso(self.vm, slot, Path(path), progress=progress),
-                label=f"Attaching {Path(path).name}",
+                label=f"Attaching {Path(path).name} to {self.vm}",
             )
 
         chooser.open(self.window, None, on_open)
@@ -411,7 +426,7 @@ class VmPane(Gtk.Box):
             widgets.run_task(
                 self.window,
                 lambda progress: lifecycle.detach_iso(self.vm, slot, progress=progress),
-                label=f"Detaching {slot} ISO",
+                label=f"Detaching {slot} ISO from {self.vm}",
             )
 
         dialog.choose(self.window, None, on_choice)
@@ -497,11 +512,8 @@ class VmPane(Gtk.Box):
             )
 
         def failed(exc):
-            # run_task only calls one error handler, so this replaces the
-            # default one and has to take the status entry back itself.
-            status = getattr(self.window, "_vmhub_status", None)
-            if status is not None:
-                status.pop()
+            # run_task finishes the task itself before calling this; the
+            # handler only has to say what went wrong.
             # The edit stays on screen. Freezing the field on top of a failed
             # save is what left it permanently out of step with the spec.
             self.window.report(f"Could not save the RDP settings for {vm}: {exc}")
@@ -783,7 +795,7 @@ class VmPane(Gtk.Box):
             progress(f"{title} will be on host {host} after the next start")
             return True
 
-        widgets.run_task(self.window, work, label=f"Publishing {title.lower()}")
+        widgets.run_task(self.window, work, label=f"Publishing {title.lower()} on {self.vm}")
 
     def _port_dialog(
         self,
@@ -923,7 +935,7 @@ class VmPane(Gtk.Box):
             progress(f"{title} will be guest {guest} on host {host} after the next start")
             return True
 
-        widgets.run_task(self.window, work, label="Saving the port")
+        widgets.run_task(self.window, work, label=f"Saving a port on {self.vm}")
 
     def _on_remove_role(self, role: str | None = None) -> None:
         if not role:
@@ -948,7 +960,7 @@ class VmPane(Gtk.Box):
             progress(f"{title} will stop being published after the next start")
             return True
 
-        widgets.run_task(self.window, work, label="Removing a port")
+        widgets.run_task(self.window, work, label=f"Removing a port on {self.vm}")
 
     def _on_add_port(self, _button: object = None) -> None:
         def on_save(guest: int, host: int, name: str, bind: str = "") -> None:
@@ -980,7 +992,7 @@ class VmPane(Gtk.Box):
                 progress(f"guest {guest} will be on host {chosen} after the next start")
                 return True
 
-            widgets.run_task(self.window, work, label="Adding a port")
+            widgets.run_task(self.window, work, label=f"Adding a port on {self.vm}")
 
         return self._port_dialog(
             "Forward another port",
@@ -1042,7 +1054,7 @@ class VmPane(Gtk.Box):
             progress(f"guest {guest} will be on host {host} after the next start")
             return True
 
-        widgets.run_task(self.window, work, label="Saving the port")
+        widgets.run_task(self.window, work, label=f"Saving a port on {self.vm}")
 
     def _on_internet_toggled(self, button: Gtk.CheckButton) -> None:
         # A refresh setting the widget emits "toggled"; that is the
@@ -1068,7 +1080,7 @@ class VmPane(Gtk.Box):
                 progress("guest will be on the isolated network after the next start")
             return True
 
-        widgets.run_task(self.window, work, label="Saving the network mode")
+        widgets.run_task(self.window, work, label=f"Saving the network mode on {self.vm}")
 
     def _on_remove_port(self, port: spec.Port | None = None) -> None:
         if port is None:
@@ -1089,7 +1101,7 @@ class VmPane(Gtk.Box):
             progress(f"guest {guest} will stop being reachable after the next start")
             return True
 
-        widgets.run_task(self.window, work, label="Removing a port")
+        widgets.run_task(self.window, work, label=f"Removing a port on {self.vm}")
 
     @staticmethod
     def _find_port(net: spec.Network, guest: int, host: int, name: str) -> spec.Port | None:
@@ -1483,6 +1495,8 @@ class VmPane(Gtk.Box):
             self.error_label.set_visible(True)
             self.state_label.set_text("unreadable")
             self.force_button.set_visible(False)
+            self.reset_button.set_visible(False)
+            self._disarm_reset()
             self.snapshot_button.set_sensitive(False)
             self.power_button.set_sensitive(False)
             self._clear_details()
@@ -1527,6 +1541,9 @@ class VmPane(Gtk.Box):
         self.power_button.remove_css_class("destructive-action")
         self.power_button.add_css_class("destructive-action" if running else "suggested-action")
         self.force_button.set_visible(running)
+        self.reset_button.set_visible(running)
+        if not running:
+            self._disarm_reset()
         # Cloning reads the source disk, which a running VM holds locked.
         self.clone_button.set_sensitive(not running)
         self.clone_button.set_tooltip_text(
@@ -1913,9 +1930,6 @@ class VmPane(Gtk.Box):
         by moving the port, and a button that does that is a better
         answer than a line telling the user which command to type.
         """
-        status = getattr(self.window, "_vmhub_status", None)
-        if status is not None:
-            status.pop()
         if not isinstance(exc, PortConflict):
             widgets.report_error(self.window, exc)
             return
@@ -1950,6 +1964,45 @@ class VmPane(Gtk.Box):
             label=f"Fixing {self.vm}",
             on_done=done,
         )
+
+    # How long an armed Reset stays armed. Long enough to click twice on
+    # purpose, short enough that a stray click is forgotten by the time
+    # the next one lands.
+    RESET_ARM_SECONDS = 3
+
+    def _on_reset(self, _button) -> None:
+        if not self._reset_armed:
+            self._arm_reset()
+            return
+        self._disarm_reset()
+        widgets.run_task(
+            self.window,
+            lambda progress: lifecycle.reset(self.vm, progress=progress),
+            label=f"Resetting {self.vm}",
+        )
+
+    def _arm_reset(self) -> None:
+        self._reset_armed = True
+        self.reset_button.set_label("Click again to reset")
+        self.reset_button.add_css_class("destructive-action")
+        if self._reset_timer:
+            GLib.source_remove(self._reset_timer)
+        self._reset_timer = GLib.timeout_add_seconds(
+            self.RESET_ARM_SECONDS, self._reset_timeout
+        )
+
+    def _reset_timeout(self) -> bool:
+        self._reset_timer = 0
+        self._disarm_reset()
+        return False
+
+    def _disarm_reset(self) -> None:
+        self._reset_armed = False
+        if self._reset_timer:
+            GLib.source_remove(self._reset_timer)
+            self._reset_timer = 0
+        self.reset_button.set_label("Reset")
+        self.reset_button.remove_css_class("destructive-action")
 
     def _on_force_stop(self, _button: object = None) -> None:
         dialog = Gtk.AlertDialog(
@@ -1994,7 +2047,7 @@ class VmPane(Gtk.Box):
             widgets.run_task(
                 self.window,
                 lambda progress: lifecycle.take_snapshot(self.vm, name, progress=progress),
-                label=f"Snapshot {name}",
+                label=f"Snapshot {name} on {self.vm}",
             )
 
         widgets.prompt_text(
@@ -2023,7 +2076,7 @@ class VmPane(Gtk.Box):
                     widgets.run_task(
                         self.window,
                         lambda progress: lifecycle.revert(self.vm, name, progress=progress),
-                        label=f"Reverting to {name}",
+                        label=f"Reverting {self.vm} to {name}",
                     )
             except Exception:
                 pass
@@ -2034,7 +2087,7 @@ class VmPane(Gtk.Box):
         widgets.run_task(
             self.window,
             lambda progress: lifecycle.delete_snapshot(self.vm, name, progress=progress),
-            label=f"Deleting snapshot {name}",
+            label=f"Deleting snapshot {name} on {self.vm}",
         )
 
     def _on_query_guest(self, _button: object = None) -> None:
@@ -2046,7 +2099,7 @@ class VmPane(Gtk.Box):
             self.guest_label.set_visible(True)
             return False
 
-        widgets.run_task(self.window, work, on_done=done, label="Querying guest agent")
+        widgets.run_task(self.window, work, on_done=done, label=f"Querying guest agent on {self.vm}")
 
     def _on_hardware_changed(self, *_args: object) -> None:
         if not self._loading:
@@ -2147,7 +2200,7 @@ class VmPane(Gtk.Box):
                 lifecycle.mark_template(self.vm, progress=progress)
                 return True
 
-            widgets.run_task(self.window, mark, label="Marking as template")
+            widgets.run_task(self.window, mark, label=f"Marking {self.vm} as template")
 
         dialog.choose(self.window, None, on_choice)
 
@@ -2346,7 +2399,7 @@ class VmPane(Gtk.Box):
         widgets.run_task(
             self.window,
             lambda progress: export.export_vm(self.vm, progress=progress),
-            label="Exporting bundle",
+            label=f"Exporting {self.vm}",
             on_done=lambda path: self.window.report(f"Exported to {path}"),
         )
 

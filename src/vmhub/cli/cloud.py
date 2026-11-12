@@ -8,10 +8,8 @@ from pathlib import Path
 
 from .. import (
     blueprints,
-    cloudinit,
     images,
-    iso as isomod,
-    lifecycle,
+    provision,
     registry,
     seed,
     spec,
@@ -79,83 +77,40 @@ def cmd_provision(args: argparse.Namespace, out: Out) -> int:
             print(out.bad(str(exc)))
             return 2
 
-    # Fetch before creating anything, so a 400 MB download that fails does
-    # not leave a half-made VM behind.
+    # The whole flow -- fetch, create, convert, seed, start, wait -- is
+    # shared with the GUI's Create button; see vmhub.provision.
     try:
-        source, digest = images.fetch(
-            args.image, expect_sha512=args.sha512, progress=out.step
-        )
-    except VmhubError as exc:
-        print(out.bad(str(exc)))
-        return 1
-
-    try:
-        lifecycle.create(
+        payload = provision.provision(
             name,
             blueprint=blueprint,
+            image=args.image,
+            user_data=user_data,
+            # A custom seed may create any account; only the default seed
+            # knows the user it made, so only then record it.
+            user=None if args.seed else args.user,
             cpus=args.cpus,
             ram=args.ram,
-            disk_size=args.disk,
+            disk=args.disk,
             disk_type=args.disk_type,
-            boot_iso="",
+            sha512=args.sha512,
+            wait=not args.no_wait,
+            timeout=args.timeout,
             progress=out.step,
         )
-        created = registry.load_spec(name)
-        if not args.seed:
-            # `--user` changes the guest account, so record it: the
-            # blueprint's ssh_user is only the default and exec/ssh would
-            # otherwise log in as the wrong person.
-            created.ssh_user = args.user
-        registry.save_spec(created)
     except VmhubError as exc:
         print(error_text(exc))
+        if registry.exists(name):
+            out.say(
+                f"  the VM exists but is not fully provisioned; "
+                f"remove it with: vmctl rm -y {name}"
+            )
         return 1
 
-    try:
-        record = images.install(
-            name, source, progress=out.step, key=args.image, digest=digest
-        )
-        iso_path = seed.build(name, user_data=user_data, progress=out.step)
-        lifecycle.attach_iso(name, isomod.SEED_SLOT, iso_path, progress=out.step)
-    except VmhubError as exc:
-        print(out.bad(f"provisioning {name} failed: {exc}"))
-        out.say(
-            f"  the VM exists but is not fully provisioned; "
-            f"remove it with: vmctl rm -y {name}"
-        )
-        return 1
-
-    try:
-        lifecycle.start(name, progress=out.step)
-    except VmhubError as exc:
-        print(error_text(exc))
-        return 1
-
-    if not args.no_wait:
-        try:
-            cloudinit.wait(name, timeout=args.timeout, progress=out.step)
-        except VmhubError as exc:
-            print(out.bad(str(exc)))
-            return 1
-
-    vm_spec = registry.load_spec(name)
-    port = vm_spec.network.host_for("ssh")
-    host = vm_spec.network.bind or "127.0.0.1"
-    user = lifecycle.spec_user_hint(name)
-    payload = {
-        "name": name,
-        "state": "running",
-        "image": record.get("image", Path(source).name),
-        "sha512": digest,
-        "console": lifecycle.console_url(name),
-        "ssh": f"{user}@{host}",
-        "port": port,
-        "cloud_init": "done" if not args.no_wait else "not waited for",
-        "seed": str(iso_path),
-    }
     if args.json:
         print(json.dumps(payload, indent=2))
         return 0
+    port = payload["port"]
+    user, _, host = payload["ssh"].partition("@")
     out.say()
     out.say(out.good(f"{name} is up"))
     if port:

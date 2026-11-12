@@ -15,9 +15,12 @@ path that is not in the bundle.
 
 from __future__ import annotations
 
+import tarfile
+
 import pytest
 
-from vmhub import disk, export, lifecycle, paths
+from vmhub import disk, export, lifecycle, paths, registry
+from vmhub.errors import DiskError
 
 
 def _make_vm(root, name: str, *, snapshot: str | None = None) -> None:
@@ -123,3 +126,62 @@ def test_copy_sparse_does_not_explode_a_sparse_image(project_home, tmp_path) -> 
     assert destination.stat().st_size < 64 * 1024 * 1024, (
         f"copied {destination.stat().st_size} bytes for a 1 GiB empty disk"
     )
+
+
+def test_a_bundle_uses_zstd_when_available_and_round_trips(
+    project_home, tmp_path
+) -> None:
+    _make_vm(project_home, "plain")
+    bundle = export.export_vm("plain", dest_dir=tmp_path / "out")
+    if export._zstd_binary():
+        assert bundle.name.endswith(".vmhub.tar.zst")
+        assert bundle.read_bytes()[:4] == export.ZSTD_MAGIC
+    else:
+        assert bundle.name.endswith(".vmhub.tar.gz")
+    export.import_bundle(bundle, name="restored-format")
+    assert paths.disk_path("restored-format").is_file()
+
+
+def test_the_sidecar_matches_the_bytes_on_disk(project_home, tmp_path) -> None:
+    """The checksum is hashed while the archive is written now; it must
+    still cover exactly the bytes that landed in the file."""
+    _make_vm(project_home, "plain")
+    bundle = export.export_vm("plain", dest_dir=tmp_path / "out")
+    assert export._read_sidecar(bundle) == export._sha256(bundle)
+
+
+def test_the_gzip_fallback_round_trips(
+    project_home, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(export, "_zstd_binary", lambda: None)
+    _make_vm(project_home, "plain")
+    bundle = export.export_vm("plain", dest_dir=tmp_path / "out")
+    assert bundle.name.endswith(".vmhub.tar.gz")
+    assert bundle.read_bytes()[:2] == b"\x1f\x8b"
+    export.import_bundle(bundle, name="restored-gz")
+    assert paths.disk_path("restored-gz").is_file()
+
+
+def test_a_zstd_bundle_without_zstd_says_install_it(
+    project_home, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not export._zstd_binary():
+        pytest.skip("zstd not installed")
+    _make_vm(project_home, "plain")
+    bundle = export.export_vm("plain", dest_dir=tmp_path / "out")
+    monkeypatch.setattr(export, "_zstd_binary", lambda: None)
+    with pytest.raises(DiskError, match="install zstd"):
+        export.read_manifest(bundle)
+
+
+def test_a_corrupted_bundle_fails_the_import(project_home, tmp_path) -> None:
+    """A flipped byte mid-archive must fail loudly, not import a damaged
+    disk: either the decompressor or the disk checksum has to catch it."""
+    _make_vm(project_home, "plain")
+    bundle = export.export_vm("plain", dest_dir=tmp_path / "out")
+    data = bytearray(bundle.read_bytes())
+    data[len(data) // 2] ^= 0xFF
+    bundle.write_bytes(bytes(data))
+    with pytest.raises((DiskError, tarfile.ReadError)):
+        export.import_bundle(bundle, name="broken")
+    assert not registry.exists("broken")

@@ -321,3 +321,114 @@ def test_attach_seed_displaces_a_drivers_iso(
     saved = registry.load_spec(vm)
     assert saved.media.seed == "/tmp/seed.iso"
     assert saved.media.drivers == ""
+
+
+def test_a_blueprint_can_carry_a_cloud_image_key(project_home) -> None:
+    """The `image` key is what marks a blueprint as provisioned, and it
+    must survive the save/load round trip the GUI and CLI both use."""
+    from vmhub import blueprints
+
+    blueprints.save(blueprints.Blueprint(name="cloudy", title="Cloudy", image="debian13"))
+    assert blueprints.load("cloudy").image == "debian13"
+    assert blueprints.Blueprint(name="plain").image == ""
+
+
+def test_the_shipped_cloud_blueprint_is_marked_for_provisioning() -> None:
+    from vmhub import toml_io
+
+    path = Path(__file__).resolve().parent.parent / "blueprints" / "debian13-cloud.toml"
+    assert toml_io.loads(path.read_text())["image"] == "debian13"
+
+
+def test_provision_runs_the_whole_flow_in_order(
+    make_vm, minimal_spec_data: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The GUI and `vmctl provision` share this flow: fetch before create,
+    image into the VM's own disk, seed on the second CD-ROM, start, wait."""
+    from vmhub import lifecycle, provision
+
+    vm = "web-01"
+    make_vm(vm, meta={"uuid": "u", "mac": "m"}, spec_data=minimal_spec_data)
+    calls: list[tuple] = []
+    source = Path("/tmp/debian.qcow2")
+    monkeypatch.setattr(
+        provision.images, "fetch",
+        lambda key, **kw: calls.append(("fetch", key)) or (source, "d" * 128),
+    )
+    monkeypatch.setattr(
+        provision.lifecycle, "create",
+        lambda name, **kw: calls.append(("create", name, kw.get("boot_iso"))),
+    )
+    monkeypatch.setattr(
+        provision.images, "install",
+        lambda name, src, **kw: calls.append(("install", name)) or {"image": src.name},
+    )
+    monkeypatch.setattr(
+        provision.seed, "build",
+        lambda name, **kw: calls.append(("seed", name)) or Path(f"/tmp/{name}-seed.iso"),
+    )
+    monkeypatch.setattr(
+        provision.lifecycle, "attach_iso",
+        lambda name, slot, path, **kw: calls.append(("attach", slot)),
+    )
+    monkeypatch.setattr(
+        provision.lifecycle, "start", lambda name, **kw: calls.append(("start", name))
+    )
+    monkeypatch.setattr(
+        provision.cloudinit, "wait",
+        lambda name, **kw: calls.append(("wait", name)) or True,
+    )
+    monkeypatch.setattr(provision.lifecycle, "console_url", lambda name: "http://console")
+
+    payload = provision.provision(
+        vm, user_data="#cloud-config\n", user="alice", image="debian13"
+    )
+
+    assert [c[0] for c in calls] == [
+        "fetch", "create", "install", "seed", "attach", "start", "wait",
+    ]
+    assert calls[1][2] == ""  # boot_iso cleared: the disk is the boot device
+    assert calls[4][1] == iso.SEED_SLOT
+    assert registry.load_spec(vm).ssh_user == "alice"
+    assert payload["ssh"] == "alice@127.0.0.1"
+    assert payload["cloud_init"] == "done"
+    assert payload["sha512"] == "d" * 128
+
+
+def test_provision_with_a_custom_seed_keeps_the_blueprints_user(
+    make_vm, minimal_spec_data: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vmhub import provision
+
+    vm = "web-01"
+    make_vm(vm, meta={"uuid": "u", "mac": "m"}, spec_data=dict(minimal_spec_data, ssh_user="debian"))
+    for target, name in (
+        (provision.images, "fetch"), (provision.images, "install"),
+        (provision.lifecycle, "create"), (provision.lifecycle, "attach_iso"),
+        (provision.lifecycle, "start"), (provision.cloudinit, "wait"),
+    ):
+        if name == "fetch":
+            monkeypatch.setattr(target, name, lambda *a, **kw: (Path("/tmp/i.qcow2"), "d"))
+        elif name == "install":
+            monkeypatch.setattr(target, name, lambda *a, **kw: {})
+        else:
+            monkeypatch.setattr(target, name, lambda *a, **kw: None)
+    monkeypatch.setattr(provision.seed, "build", lambda *a, **kw: Path("/tmp/seed.iso"))
+    monkeypatch.setattr(provision.lifecycle, "console_url", lambda name: "")
+
+    provision.provision(vm, user_data="#cloud-config\n", user=None, image="debian13")
+    assert registry.load_spec(vm).ssh_user == "debian"
+
+
+def test_provision_fetch_failure_leaves_no_half_made_vm(
+    project_home, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vmhub import provision
+
+    def boom(key, **kw):
+        raise ImageError("download failed")
+
+    monkeypatch.setattr(provision.images, "fetch", boom)
+    with pytest.raises(ImageError, match="download failed"):
+        provision.provision("never-made", user_data="#cloud-config\n", image="debian13")
+    assert not registry.exists("never-made")

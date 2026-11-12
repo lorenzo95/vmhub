@@ -414,18 +414,22 @@ def run_task(
     on_error=None,
 ) -> None:
     status = getattr(parent, "_vmhub_status", None)
-    if status is not None and label:
-        status.push(label)
+    task_id = status.begin(label or "Task") if status is not None else None
 
     def handle_error(exc: BaseException) -> bool:
-        if status is not None:
-            status.pop()
+        # Finish the task here, before any custom handler runs. Handlers
+        # used to pop the strip themselves, and the ones that forgot (the
+        # import dialog) left the spinner turning forever.
+        if status is not None and task_id is not None:
+            status.finish(task_id, ok=False, error=str(exc))
+        if on_error is not None:
+            return on_error(exc)
         report_error(parent, exc)
         return False
 
     def handle_done(result) -> bool:
-        if status is not None:
-            status.pop()
+        if status is not None and task_id is not None:
+            status.finish(task_id)
         if on_done is not None:
             on_done(result)
         refresh = getattr(parent, "refresh", None)
@@ -435,9 +439,9 @@ def run_task(
 
     workers.run_async(
         work,
-        on_progress=(lambda m: status.push(m, transient=True)) if status is not None else None,
+        on_progress=(lambda m: status.update(task_id, m)) if status is not None else None,
         on_done=handle_done,
-        on_error=handle_error if on_error is None else on_error,
+        on_error=handle_error,
     )
 
 
